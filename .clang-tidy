@@ -1,0 +1,3 @@
+# Only report findings from the repository sources; AUTOMOC output under build/
+# is generated code and its warnings are not actionable here.
+HeaderFilterRegex: '(^|/)(src|tests)/'
