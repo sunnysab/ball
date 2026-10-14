@@ -17,6 +17,7 @@ add_library(ball_daemon STATIC
     src/daemon/traffic.cpp
     src/daemon/processes.cpp
     src/daemon/socktrail.cpp
+    src/daemon/service.cpp
 )
 target_include_directories(ball_daemon PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_compile_options(ball_daemon PRIVATE -Wall -Wextra -Wpedantic)
@@ -42,6 +43,17 @@ if(BUILD_TESTING)
     qt_add_executable(ball_socktrail_test tests/socktrail.cpp)
     target_link_libraries(ball_socktrail_test PRIVATE Qt6::Test ball_daemon)
 
+    qt_add_executable(ball_service_test tests/service.cpp)
+    target_link_libraries(ball_service_test PRIVATE Qt6::Test ball_daemon)
+    # The fake collector is a separate process, exactly like the real external
+    # socktrail binary; the test only needs its path.
+    add_executable(ball_fake_collector tests/fake_collector.cpp)
+    target_link_libraries(ball_fake_collector PRIVATE Qt6::Core Qt6::Network)
+    target_compile_options(ball_fake_collector PRIVATE -Wall -Wextra -Wpedantic)
+    target_compile_definitions(ball_service_test PRIVATE
+        BALL_FAKE_COLLECTOR_BINARY="$<TARGET_FILE:ball_fake_collector>")
+    add_dependencies(ball_service_test ball_fake_collector)
+
     add_test(NAME ball_version COMMAND ball --version)
     set_tests_properties(ball_version PROPERTIES PASS_REGULAR_EXPRESSION "ball ${PROJECT_VERSION}")
 
@@ -54,4 +66,8 @@ if(BUILD_TESTING)
 
     add_test(NAME ball_socktrail COMMAND ball_socktrail_test)
     set_tests_properties(ball_socktrail PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
+    add_test(NAME ball_service COMMAND ball_service_test)
+    set_tests_properties(ball_service PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
+        TIMEOUT 120)
 endif()

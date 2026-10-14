@@ -18,9 +18,12 @@
   的收发字节，语义与网卡累计一致，另外处理后端采集会话重启与进程缺席后重现。
 - `src/daemon/socktrail`：异步订阅外部 `socktrail --socket` 的 Unix socket NDJSON 流，把
   周期性 `stats` 帧喂给 `Processes`。只使用 `stats` 的全量 `process_io` 表，不从 `flow` 帧求和。
+- `src/daemon/service`：统一采样网卡、管理采集子进程、订阅进程数据，并通过受限权限的
+  本地 socket 发布完整快照。GUI 断开不影响采集；慢客户端会被断开；停止服务清理自己的子进程。
+  运行目录由部署层创建，快照字段见 [本地协议](docs/protocol.md)。
 
-尚未实现：daemon 模式、GUI 数据展示与进程 / 网卡选择、打包。`Processes` / `Traffic` /
-`Socktrail` 目前只由单元测试驱动，尚未接入运行中的程序。
+尚未接入程序入口：daemon 模式、GUI 数据展示与进程 / 网卡选择、安装配置。
+统计、订阅和服务组件已有独立测试，`main` 仍是最小窗口。
 
 统计契约：
 
@@ -60,9 +63,9 @@ socktrail 订阅契约（`Socktrail`）：
 - 一个字节计数若超出可精确表示的 `qint64` 范围也拒绝整帧，不跳过单行：部分接受会删掉
   进程的旧基线，反而制造一次假重启；
 - 断线或拒绝帧会关闭连接并重连，错误是短 ASCII 文本；累计值在断线时保留，不清零；
-- 每次连接必须先收到合法 `hello` 才接受 `stats`。`available()` 仅在一次完整 `stats` 之后
-  为 true，连接建立本身不算；断线、后端重启、质量丢失或超过 `kStatsTimeoutMs` 都会把它
-  置回 false；
+- 每次连接必须先收到合法 `hello` 才接受 `stats`。`available()` 在一次完整 `stats` 之后
+  为 true，连接建立本身不算；实时展示必须同时检查 `available()` 与 `!stale()`，
+  质量丢失由独立的 `incomplete()` 标记说明；
 - `stale()` 由单调定时器判定：约 5 秒没有 `stats` 即 stale，`flow` 帧不刷新新鲜度，
   stale 时给出明确原因；
 - `incomplete()` 表示观测历史存在无法弥补的缺口：尚未收到 `stats`、断线、后端重启、
