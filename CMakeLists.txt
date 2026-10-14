@@ -11,6 +11,7 @@ find_package(LayerShellQt REQUIRED)
 add_library(ball_daemon STATIC
     src/daemon/interfaces.cpp
     src/daemon/traffic.cpp
+    src/daemon/processes.cpp
 )
 target_include_directories(ball_daemon PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_compile_options(ball_daemon PRIVATE -Wall -Wextra -Wpedantic)
@@ -32,10 +33,16 @@ if(BUILD_TESTING)
     qt_add_executable(ball_traffic_test tests/traffic.cpp)
     target_link_libraries(ball_traffic_test PRIVATE Qt6::Test ball_daemon)
 
+    qt_add_executable(ball_processes_test tests/processes.cpp)
+    target_link_libraries(ball_processes_test PRIVATE Qt6::Test ball_daemon)
+
     add_test(NAME ball_version COMMAND ball --version)
     set_tests_properties(ball_version PROPERTIES PASS_REGULAR_EXPRESSION "ball ${PROJECT_VERSION}")
 
     add_test(NAME ball_traffic COMMAND ball_traffic_test)
     # The core is GUI-free; keep the test runnable without a desktop session.
     set_tests_properties(ball_traffic PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
+    add_test(NAME ball_processes COMMAND ball_processes_test)
+    set_tests_properties(ball_processes PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 endif()
