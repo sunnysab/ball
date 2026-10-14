@@ -1,0 +1,8 @@
+BasedOnStyle: LLVM
+Language: Cpp
+Standard: c++23
+ColumnLimit: 100
+IndentWidth: 4
+AccessModifierOffset: -4
+AlwaysBreakTemplateDeclarations: Yes
+PointerAlignment: Left
