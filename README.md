@@ -16,9 +16,11 @@
   速率用调用方提供的单调时间戳（如 `QElapsedTimer::elapsed`）计算，墙钟只用于监测起点与日期。
 - `src/daemon/processes`：在内存中按进程（`pid` + socktrail `start_ns`）累计「今日」与「本次监测」
   的收发字节，语义与网卡累计一致，另外处理后端采集会话重启与进程缺席后重现。
+- `src/daemon/socktrail`：异步订阅外部 `socktrail --socket` 的 Unix socket NDJSON 流，把
+  周期性 `stats` 帧喂给 `Processes`。只使用 `stats` 的全量 `process_io` 表，不从 `flow` 帧求和。
 
-尚未实现：订阅 `socktrail` 的客户端（socket 协议与采集循环）、daemon 模式、GUI 数据展示与
-进程 / 网卡选择、打包。`Processes` / `Traffic` 目前只由单元测试驱动，尚未接入运行中的程序。
+尚未实现：daemon 模式、GUI 数据展示与进程 / 网卡选择、打包。`Processes` / `Traffic` /
+`Socktrail` 目前只由单元测试驱动，尚未接入运行中的程序。
 
 统计契约：
 
@@ -46,6 +48,34 @@
 - 本地日期变化只清 today，session 不变；无效墙钟 / 单调样本被拒且不污染状态；
 - 输出 `ProcessTraffic{pid, startNs, name, present, today, session, rate}`，一般 QMap 行；
 - 同样只在内存中，不落盘。
+
+socktrail 订阅契约（`Socktrail`）：
+
+- 协议为每行一个 JSON 对象的 NDJSON；`kind` 为 `hello` / `flow` / `stats`。客户端只读
+  `stats` 的**全量** `process_io` 累计值，**不**从 `flow` 增量求和，否则会因丢帧而少计；
+- 每帧先完整解析并校验再改动状态：`hello` 校验 `version == 1` 与 `started`（带时区的
+  RFC 3339），`stats` 校验 `at`、每个进程的 `pid` / `start_ns` / `rx_bytes` / `tx_bytes`
+  以及 `probes.pid` 与未索引 / 过期字节字段。数字用 `QJsonValue::toInteger` 读取，不经
+  `double` 损失 > 2^53 的整数；负数、小数、缺字段、重复身份、非法 pid 一律拒绝整帧；
+- 一个字节计数若超出可精确表示的 `qint64` 范围也拒绝整帧，不跳过单行：部分接受会删掉
+  进程的旧基线，反而制造一次假重启；
+- 断线或拒绝帧会关闭连接并重连，错误是短 ASCII 文本；累计值在断线时保留，不清零；
+- 每次连接必须先收到合法 `hello` 才接受 `stats`。`available()` 仅在一次完整 `stats` 之后
+  为 true，连接建立本身不算；断线、后端重启、质量丢失或超过 `kStatsTimeoutMs` 都会把它
+  置回 false；
+- `stale()` 由单调定时器判定：约 5 秒没有 `stats` 即 stale，`flow` 帧不刷新新鲜度，
+  stale 时给出明确原因；
+- `incomplete()` 表示观测历史存在无法弥补的缺口：尚未收到 `stats`、断线、后端重启、
+  `stats` 帧携带 PID 丢失 / 未索引等质量问题时保持为 true。瞬时速率不伪造；
+- 同一毫秒到达的多个 `stats` 帧不能靠单调时钟区分，保留最新一帧，等出现正间隔后再计入，
+  不假造时间戳，也不会让最后一帧的累计永远丢失；
+- 墙钟只用于本地日期与监测起点（`frame.at.toLocalTime()`，不把 UTC 当本地）；单调时间
+  使用只初始化一次的 `QElapsedTimer`，因此 `Processes` 的历史在重连后仍连续；
+- `Socktrail::kMaxLineBytes`（16 MiB）是单帧长度上限，decode 前检查，包括已经带换行的
+  超长行；分块读取处理半行与一读多帧，超长即断开，避免缓冲无界增长；
+- PID 丢失 / 未索引字节只作为质量提示（`qualityNotes()`），不加入任何已知进程或网卡总和；
+- 重连约每秒一次，只有一个 timer；`stop()` 与析构都不再重连，对象归属为父子关系，
+  信号 lambda 都带 context，不使用任何阻塞事件循环的 `waitFor...` 调用。
 
 采样失败语义：
 
@@ -79,7 +109,7 @@
 ```sh
 cmake --preset dev          # Debug 配置，生成 build/dev 与 compile_commands.json
 cmake --build --preset dev
-ctest --preset dev          # ball_version、ball_traffic 与 ball_processes 单元测试
+ctest --preset dev          # ball_version、ball_traffic、ball_processes 与 ball_socktrail 单元测试
 
 # 核心测试不依赖桌面会话，可在无显示环境直接跑：
 env -u DISPLAY -u WAYLAND_DISPLAY QT_QPA_PLATFORM=offscreen ./build/dev/ball_traffic_test
@@ -107,7 +137,7 @@ clang-format -i src/daemon/*.cpp src/daemon/*.h tests/*.cpp
 clang-tidy -p build/dev --removed-arg=-mno-direct-extern-access \
     --checks='-*,bugprone-*,performance-*,clang-analyzer-*' --warnings-as-errors='*' \
     src/daemon/interfaces.cpp src/daemon/traffic.cpp src/daemon/processes.cpp \
-    tests/traffic.cpp tests/processes.cpp
+    src/daemon/socktrail.cpp tests/traffic.cpp tests/processes.cpp tests/socktrail.cpp
 echo $?   # 非 0 表示有未处理的告警
 ```
 
@@ -127,7 +157,12 @@ CMakeLists.txt        构建入口：ball_daemon 静态库、ball 可执行文�
 CMakePresets.json     dev / release 的 configure、build、test presets
 .clang-tidy           只对 src/ 与 tests/ 源码报错，忽略 AUTOMOC 生成代码
 src/main.cpp          程序入口：CLI 解析与最小 layer-shell 窗口
-src/daemon/           流量统计核心：rtnetlink 网卡读取、按网卡与按进程的内存累计
+src/daemon/           流量统计核心：rtnetlink 网卡读取、按网卡与按进程的内存累计、socktrail 订阅
+  socktrail.h/.cpp   Unix socket NDJSON 客户端：帧解析校验、重连、可用性与新鲜度状态
+  interfaces.h/.cpp  rtnetlink 网卡读取
+  traffic.h/.cpp     按网卡累计
+  processes.h/.cpp   按进程累计
 tests/traffic.cpp     QtTest（QTEST_GUILESS_MAIN）：解析器 / 累计逻辑测试与只读网卡烟测
 tests/processes.cpp   QtTest（QTEST_GUILESS_MAIN）：进程累计的基线 / 差分 / 重启 / 跨日测试
+tests/socktrail.cpp   QtTest（QTEST_GUILESS_MAIN）：帧校验与本地 QLocalServer mock 端到端测试
 ```

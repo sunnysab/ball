@@ -8,14 +8,19 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 find_package(Qt6 REQUIRED COMPONENTS Widgets Network)
 find_package(LayerShellQt REQUIRED)
 
+# Before any target: the daemon library has QObject sources, and AUTOMOC is
+# enabled per target at creation time.
+qt_standard_project_setup()
+
 add_library(ball_daemon STATIC
     src/daemon/interfaces.cpp
     src/daemon/traffic.cpp
     src/daemon/processes.cpp
+    src/daemon/socktrail.cpp
 )
 target_include_directories(ball_daemon PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_compile_options(ball_daemon PRIVATE -Wall -Wextra -Wpedantic)
-target_link_libraries(ball_daemon PUBLIC Qt6::Core)
+target_link_libraries(ball_daemon PUBLIC Qt6::Core Qt6::Network)
 
 add_executable(ball src/main.cpp)
 target_compile_definitions(ball PRIVATE BALL_VERSION="${PROJECT_VERSION}")
@@ -28,13 +33,14 @@ include(CTest)
 if(BUILD_TESTING)
     find_package(Qt6 REQUIRED COMPONENTS Test)
 
-    qt_standard_project_setup()
-
     qt_add_executable(ball_traffic_test tests/traffic.cpp)
     target_link_libraries(ball_traffic_test PRIVATE Qt6::Test ball_daemon)
 
     qt_add_executable(ball_processes_test tests/processes.cpp)
     target_link_libraries(ball_processes_test PRIVATE Qt6::Test ball_daemon)
+
+    qt_add_executable(ball_socktrail_test tests/socktrail.cpp)
+    target_link_libraries(ball_socktrail_test PRIVATE Qt6::Test ball_daemon)
 
     add_test(NAME ball_version COMMAND ball --version)
     set_tests_properties(ball_version PROPERTIES PASS_REGULAR_EXPRESSION "ball ${PROJECT_VERSION}")
@@ -45,4 +51,7 @@ if(BUILD_TESTING)
 
     add_test(NAME ball_processes COMMAND ball_processes_test)
     set_tests_properties(ball_processes PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
+    add_test(NAME ball_socktrail COMMAND ball_socktrail_test)
+    set_tests_properties(ball_socktrail PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 endif()
