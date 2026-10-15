@@ -28,14 +28,18 @@ ball 由一个后台采集守护进程和一个桌面悬浮窗组成：后台以
 
 ### 1. 准备采集器 socktrail
 
-ball 使用独立兼容补丁 `db7df63`（分支 `fix/recvmsg-four-args`），为本机 Linux 7.2
-新增四参数 `recvmsg` 探针；原检出目录的 `main` 不变。已在本地缓存准备好的 Go 1.27
-环境中验证真实 TCP/UDP 及订阅数据。可在 ball 根目录执行：
+ball 使用本地分支 `perf/wildcard-index`，其中包含两个独立补丁：
+
+- `db7df63`：为本机 Linux 7.2 新增四参数 `recvmsg` 探针。
+- `c3a6892`：每轮只索引一次通配连接候选，避免逐条扫描全部流记录。
+
+原检出目录的 `main` 不变。已在本地缓存准备好的 Go 1.27 环境中验证真实 TCP/UDP、
+订阅数据及索引优化的单元测试；新版本应用后仍需观察实际 CPU。可在 ball 根目录执行：
 
 ```sh
 BALL_DIR="$PWD"
 mkdir -p "$BALL_DIR/build"
-cd ../ball-worktrees/socktrail-compat
+cd ../ball-worktrees/socktrail-perf
 GOTOOLCHAIN=local GOPROXY=off GOSUMDB=off CGO_ENABLED=0 \
   go build -trimpath -o "$BALL_DIR/build/socktrail" .
 "$BALL_DIR/build/socktrail" --version
@@ -182,6 +186,8 @@ ball 只把统计放在内存中，不落盘、不保存历史，因此：
 - **关闭 GUI 不会丢失数据**：后台继续采样与累计，重新打开窗口后仍显示同一后台会话
   的累计值。
 - **后台重启会清零「今日」和「本次监测」**：`started` 变为新时刻，之前累计不再保留。
+- **仅重启 socktrail 子采集器不清空已有累计**：守护进程会重新建立进程计数基线。
+  重连期间会出现进程流量采样空档；网卡累计不受此影响。
 - **首次有效采样之前都是 0**：第一帧只用于建立基线，不计入任何字节。
 - 「今日」为本地日期内的累计，跨本地午夜清空；「本次监测」从后台启动后的首次有效
   采样开始累计，跨午夜不变。
@@ -223,6 +229,23 @@ journalctl -u ball@$USER.service -f      # Ctrl+C 停止跟随
 而不是后台崩溃。
 
 ## 构建与测试
+
+### 采集器热点验证
+
+`reconcileWildcards()` 的索引优化保持进程归属与歧义处理语义不变。独立微基准包含
+10,000 条流与 1,000 条通配记录，本机旧版约 88.5 ms/次，索引版约 0.83 ms/次，
+每次临时分配约增加 144 KiB。该倍率只代表目标函数，不等于整个采集器的 CPU 降幅；
+采集器重启后的连接数量也会影响实测 CPU，不能仅比较重启前后瞬时值。
+
+在上述 socktrail 补丁工作树中运行：
+
+```sh
+GOTOOLCHAIN=local GOPROXY=off go test ./...
+GOTOOLCHAIN=local GOPROXY=off go test ./internal/app -run '^$' \
+  -bench '^BenchmarkReconcileWildcardsLarge$' -benchmem -count=3
+```
+
+### ball 验证
 
 ```sh
 cmake --preset dev          # Debug + BUILD_TESTING=ON，产物在 build/dev
