@@ -193,6 +193,7 @@ private Q_SLOTS:
     void waylandContinuousMotionTracksSurfaceMovement();
     void waylandLockedClickAndDragAreDistinct();
     void waylandDragSavesRequestedPosition();
+    void waylandDragRequestsSurfaceCommit();
     void escapeCollapsesAndPinKeepsPanel();
     void remembersPositionAndOpacity();
     void contextMenuStaysCompact();
@@ -219,6 +220,13 @@ class WaylandHud : public Hud {
 public:
     using Hud::Hud;
     bool compositorOwnsPosition() const override { return true; }
+    int paintCount = 0;
+
+protected:
+    void paintEvent(QPaintEvent* event) override {
+        ++paintCount;
+        Hud::paintEvent(event);
+    }
 };
 
 } // namespace
@@ -831,6 +839,20 @@ void TestUi::waylandDragSavesRequestedPosition() {
 
     WaylandHud restored(startServer(), settings);
     QCOMPARE(restored.requestedPosition(), dragged);
+}
+
+void TestUi::waylandDragRequestsSurfaceCommit() {
+    QSettings settings(m_settingsPath, QSettings::IniFormat);
+    WaylandHud hud(startServer(), settings);
+    hud.show();
+    QVERIFY(waitFor([&hud] { return hud.isVisible() && hud.paintCount > 0; }));
+    QTest::qWait(40);
+    const int before = hud.paintCount;
+    QTest::mousePress(&hud, Qt::LeftButton, Qt::NoModifier, QPoint(20, 20));
+    QTest::mouseMove(&hud, QPoint(70, 20));
+    QCoreApplication::sendPostedEvents(nullptr, QEvent::UpdateRequest);
+    QVERIFY2(hud.paintCount > before, "placement changes must schedule a surface commit");
+    QTest::mouseRelease(&hud, Qt::LeftButton, Qt::NoModifier, QPoint(70, 20));
 }
 
 void TestUi::escapeCollapsesAndPinKeepsPanel() {

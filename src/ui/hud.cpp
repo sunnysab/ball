@@ -772,6 +772,8 @@ void Hud::applyPosition(const QPoint& globalTopLeft, bool persist) {
     // those margins, so it is never treated as the requested position.
     if (compositorOwnsPosition()) {
         updateLayerShell();
+        // Layer-shell placement is double-buffered until the next surface commit.
+        update();
     } else if (!updateLayerShell()) {
         move(m_position);
     }
@@ -873,14 +875,14 @@ void Hud::mousePressEvent(QMouseEvent* event) {
     m_dragging = false;
     // Wayland exposes no trustworthy global pointer position for a layer-shell
     // surface, so a drag is anchored at the surface-local press point.
-    m_pressLocal = event->position().toPoint();
+    m_pressLocal = event->position();
 }
 
 void Hud::mouseMoveEvent(QMouseEvent* event) {
     if (!m_pressed) {
         return;
     }
-    const QPoint delta = event->position().toPoint() - m_pressLocal;
+    const QPointF delta = event->position() - m_pressLocal;
     if (!m_dragging && delta.manhattanLength() < QApplication::startDragDistance()) {
         return; // still a click, not a drag
     }
@@ -891,7 +893,8 @@ void Hud::mouseMoveEvent(QMouseEvent* event) {
     // m_position is the authority. Adding the local pointer offset to it (not
     // to a press-time QWidget::pos()) keeps the surface under the cursor while
     // the compositor moves it, and self-corrects when the compositor lags.
-    applyPosition(m_position + delta, false);
+    // shortcut: fractional-scale release can drift slightly; use relative motion if it persists.
+    applyPosition((QPointF(m_position) + delta).toPoint(), false);
 }
 
 void Hud::mouseReleaseEvent(QMouseEvent* event) {

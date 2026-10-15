@@ -159,7 +159,7 @@ private:
     // Press position in surface-local coordinates. Wayland clients never see a
     // reliable global pointer position for a layer-shell surface, so a drag is
     // derived from this anchor and the authoritative m_position instead.
-    QPoint m_pressLocal;
+    QPointF m_pressLocal;
     bool m_pressed = false;
     bool m_dragging = false;
     bool m_expanded = false;
