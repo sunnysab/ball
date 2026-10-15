@@ -193,6 +193,7 @@ private Q_SLOTS:
     void cleanup();
     void slowClientIsDroppedWithoutBlockingSampling();
     void refusesRegularFileAndSymlink();
+    void reportsLockPermissionFailure();
     void refusesLiveSocket();
     void replacesOnlyStaleSocket();
     void stopCleansUpSocketAndCollector();
@@ -517,6 +518,24 @@ void TestService::refusesRegularFileAndSymlink() {
     QFile targetCheck(target);
     QVERIFY(targetCheck.open(QIODevice::ReadOnly));
     QCOMPARE(targetCheck.readAll(), QByteArrayLiteral("keep me"));
+}
+
+void TestService::reportsLockPermissionFailure() {
+    if (::geteuid() == 0) {
+        QSKIP("root bypasses directory write permissions");
+    }
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    QVERIFY(
+        QFile::setPermissions(directory.path(), QFileDevice::ReadOwner | QFileDevice::ExeOwner));
+    Service service;
+    ServiceOptions options{directory.filePath(u"gui.sock"_s), QString()};
+    QVERIFY(!service.start(options));
+    QVERIFY2(service.error().contains(u"permission"_s), qPrintable(service.error()));
+    QVERIFY(!service.error().contains(u"another instance"_s));
+    QVERIFY(QFile::setPermissions(directory.path(), QFileDevice::ReadOwner |
+                                                        QFileDevice::WriteOwner |
+                                                        QFileDevice::ExeOwner));
 }
 
 void TestService::refusesLiveSocket() {

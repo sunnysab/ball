@@ -128,8 +128,16 @@ bool Service::start(const ServiceOptions& options) {
     // same public socket.
     m_lock = std::make_unique<QLockFile>(m_options.socketPath + QStringLiteral(".lock"));
     if (!m_lock->tryLock(0)) {
+        const QLockFile::LockError error = m_lock->error();
         m_lock.reset();
-        m_error = QStringLiteral("another instance holds the lock");
+        if (error == QLockFile::PermissionError) {
+            m_error = QStringLiteral(
+                "permission denied creating lock; check runtime directory and daemon user");
+        } else if (error == QLockFile::LockFailedError) {
+            m_error = QStringLiteral("another instance holds the lock");
+        } else {
+            m_error = QStringLiteral("cannot create lock file; check runtime directory");
+        }
         return false;
     }
 

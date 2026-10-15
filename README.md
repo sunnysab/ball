@@ -140,7 +140,7 @@ ball              # 或从应用菜单启动「ball 流量悬浮窗」
 ```sh
 # 手动启动时先准备目录及目标组；后台不会自动创建 /run 目录
 sudo install -d -o root -g "$(id -gn)" -m 0750 "/run/ball-$USER"
-sudo -g "$(id -gn)" ./build/dev/ball --daemon \
+sudo -u root -g "$(id -gn)" ./build/dev/ball --daemon \
     --socket "/run/ball-$USER/gui.sock" \
     --socktrail-bin "$PWD/build/socktrail"
 # 前台后台用 Ctrl+C 停止；另开一个终端，以普通用户启动 GUI
@@ -150,6 +150,8 @@ sudo -g "$(id -gn)" ./build/dev/ball --daemon \
 `ball --help` 列出全部参数，`ball --version` 打印版本。daemon 模式**必须**指定
 绝对路径 `--socket`；`--socktrail-bin` 可省略，默认使用编译期安装路径。
 GUI 的 `--socket` 可省略，默认连接当前用户名对应的运行目录。
+手动运行后台时请显式指定 `sudo -u root`：只给 `sudo -g` 并不把用户提升为 root，
+可能因目录权限不足而无法创建锁文件。安装后建议由 systemd 管理后台，不重复启动同一实例。
 
 ## socket 权限与私有组
 
