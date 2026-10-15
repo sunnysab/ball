@@ -39,7 +39,7 @@ target_link_libraries(ball_ui PUBLIC Qt6::Widgets Qt6::Network LayerShellQt::Int
 add_executable(ball src/main.cpp)
 target_compile_definitions(ball PRIVATE BALL_VERSION="${PROJECT_VERSION}")
 target_compile_options(ball PRIVATE -Wall -Wextra -Wpedantic)
-target_link_libraries(ball PRIVATE Qt6::Widgets Qt6::Network LayerShellQt::Interface ball_daemon)
+target_link_libraries(ball PRIVATE ball_ui ball_daemon)
 
 install(TARGETS ball RUNTIME DESTINATION bin)
 
@@ -73,6 +73,13 @@ if(BUILD_TESTING)
     qt_add_executable(ball_ui_preview tests/ui_preview.cpp)
     target_link_libraries(ball_ui_preview PRIVATE ball_ui)
 
+    qt_add_executable(ball_cli_test tests/cli.cpp)
+    target_link_libraries(ball_cli_test PRIVATE Qt6::Test Qt6::Network)
+    target_compile_definitions(ball_cli_test PRIVATE
+        BALL_EXECUTABLE="$<TARGET_FILE:ball>"
+        BALL_FAKE_COLLECTOR_BINARY="$<TARGET_FILE:ball_fake_collector>")
+    add_dependencies(ball_cli_test ball ball_fake_collector)
+
     add_test(NAME ball_ui COMMAND ball_ui_test)
     set_tests_properties(ball_ui PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 90)
 
@@ -91,5 +98,11 @@ if(BUILD_TESTING)
 
     add_test(NAME ball_service COMMAND ball_service_test)
     set_tests_properties(ball_service PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
+        TIMEOUT 120)
+
+    # Drives the real executable over its command line, with no display and no
+    # Wayland session in the environment.
+    add_test(NAME ball_cli COMMAND ball_cli_test)
+    set_tests_properties(ball_cli PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
         TIMEOUT 120)
 endif()

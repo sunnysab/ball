@@ -21,6 +21,7 @@
 #include <QTimer>
 
 #include <cmath>
+#include <csignal>
 #include <sys/stat.h>
 #include <utility>
 
@@ -469,6 +470,14 @@ void Service::startCollector() {
     connect(m_collector, &QProcess::finished, this,
             [this](int, QProcess::ExitStatus) { onCollectorFinished(); });
 
+    // The entry point blocks SIGINT/SIGTERM/SIGHUP before Qt starts, so the
+    // child would inherit a blocked mask and ignore `terminate()`. Only
+    // async-signal-safe calls run here: resetting the mask in the child.
+    m_collector->setChildProcessModifier([] {
+        sigset_t empty{};
+        ::sigemptyset(&empty);
+        ::sigprocmask(SIG_SETMASK, &empty, nullptr);
+    });
     // No shell and no duration: argument injection stays impossible and the
     // child is only stopped by us, so a dead observer cannot end collection.
     m_collector->start(

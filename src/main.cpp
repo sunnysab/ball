@@ -1,89 +1,233 @@
 // ball: a network traffic HUD for KDE Wayland sessions.
-#include <LayerShellQt/Window>
+// Single entry point: it either runs the read-only GUI or the sampling daemon.
+#include "daemon/service.h"
+#include "ui/hud.h"
 
 #include <QApplication>
-#include <QByteArray>
+#include <QCommandLineOption>
+#include <QCommandLineParser>
+#include <QCoreApplication>
+#include <QDir>
+#include <QGuiApplication>
+#include <QSettings>
+#include <QSocketNotifier>
 #include <QString>
-#include <QWidget>
-#include <QWindow>
+#include <QStringList>
 
+#include <csignal>
 #include <cstdio>
-#include <optional>
+#include <pthread.h>
+#include <pwd.h>
+#include <sys/signalfd.h>
+#include <unistd.h>
+
+#ifndef BALL_DEFAULT_COLLECTOR_PATH
+// The packaging layer supplies the real prefix; this keeps a bare build usable.
+#define BALL_DEFAULT_COLLECTOR_PATH "/usr/local/libexec/ball/socktrail"
+#endif
 
 namespace {
 
+// Blocks the termination signals before any Qt object exists, so every Qt
+// thread inherits the mask, and turns them into readable signalfd events.
+// Restores the previous mask and closes the descriptor on scope exit.
+class SignalMask {
+public:
+    SignalMask() {
+        sigemptyset(&m_set);
+        sigaddset(&m_set, SIGINT);
+        sigaddset(&m_set, SIGTERM);
+        sigaddset(&m_set, SIGHUP);
+        if (::pthread_sigmask(SIG_BLOCK, &m_set, &m_previous) != 0) {
+            return;
+        }
+        m_blocked = true;
+        m_fd = ::signalfd(-1, &m_set, SFD_CLOEXEC | SFD_NONBLOCK);
+    }
+    ~SignalMask() {
+        if (m_fd >= 0) {
+            ::close(m_fd);
+        }
+        if (m_blocked) {
+            ::pthread_sigmask(SIG_SETMASK, &m_previous, nullptr);
+        }
+    }
+    SignalMask(const SignalMask&) = delete;
+    SignalMask& operator=(const SignalMask&) = delete;
+
+    int fd() const { return m_fd; }
+    void drain() const {
+        signalfd_siginfo info{};
+        while (m_fd >= 0 && ::read(m_fd, &info, sizeof info) > 0) {
+        }
+    }
+
+private:
+    sigset_t m_set{};
+    sigset_t m_previous{};
+    int m_fd = -1;
+    bool m_blocked = false;
+};
+
+// Quits the event loop on SIGINT/SIGTERM/SIGHUP without a signal handler
+// calling into Qt. Must run after the QCoreApplication exists. Returns false
+// when the signals could not be wired up.
+bool installQuitSignals(const SignalMask& mask, QCoreApplication& app) {
+    if (mask.fd() < 0) {
+        return false;
+    }
+    auto* notifier = new QSocketNotifier(mask.fd(), QSocketNotifier::Read, &app);
+    QObject::connect(notifier, &QSocketNotifier::activated, &app, [&mask, &app] {
+        mask.drain();
+        app.quit();
+    });
+    return true;
+}
+
+QString defaultGuiSocket() {
+    const struct passwd* user = ::getpwuid(::getuid());
+    const QString name = user != nullptr && user->pw_name != nullptr
+                             ? QString::fromLocal8Bit(user->pw_name)
+                             : QString::number(static_cast<qulonglong>(::getuid()));
+    return QStringLiteral("/run/ball-%1/gui.sock").arg(name);
+}
+
+bool isAbsolutePath(const QString& path) { return QDir::isAbsolutePath(path); }
+
 void printUsage(std::FILE* out) {
     std::fputs("Usage: ball [options]\n"
-               "\n"
-               "Options:\n"
-               "  -h, --help     show this help and exit\n"
-               "      --version  show the version and exit\n",
+               "  -h, --help              show this help and exit\n"
+               "      --version           show the version and exit\n"
+               "      --daemon            run the sampling daemon\n"
+               "      --socket <path>     snapshot socket (required with --daemon)\n"
+               "      --socktrail-bin <path>  collector binary (daemon mode only)\n",
                out);
 }
 
-// Qt aborts when no platform plugin can be loaded, so the text-only options are
-// answered before QApplication opens a Wayland connection. Returns the process
-// exit code, or std::nullopt to continue into the GUI.
-std::optional<int> handleTextOption(int argc, char* argv[]) {
-    for (int i = 1; i < argc; ++i) {
-        const QByteArray arg(argv[i]);
-        if (arg == "--help" || arg == "-h") {
-            printUsage(stdout);
-            return 0;
-        }
-        if (arg == "--version") {
-            std::fprintf(stdout, "ball %s\n", BALL_VERSION);
-            return 0;
-        }
-        if (arg.startsWith('-')) {
-            std::fprintf(stderr, "ball: unknown option '%s'\n", arg.constData());
-            printUsage(stderr);
-            return 2;
-        }
-    }
-    return std::nullopt;
+int fail(const QString& message, int code) {
+    std::fprintf(stderr, "ball: %s\n", qPrintable(message));
+    return code;
 }
 
 } // namespace
 
 int main(int argc, char* argv[]) {
-    if (const std::optional<int> code = handleTextOption(argc, argv)) {
-        return *code;
+    // Takes precedence over the platform plugin: the GUI must answer --help and
+    // --version even without a Wayland session.
+    const SignalMask signalMask;
+
+    QStringList args;
+    args.reserve(argc);
+    for (int i = 0; i < argc; ++i) {
+        args.append(QString::fromLocal8Bit(argv[i]));
     }
 
+    QCommandLineParser parser;
+    parser.setApplicationDescription(
+        QStringLiteral("ball: network traffic HUD for KDE Wayland sessions"));
+    parser.addHelpOption();
+    parser.addVersionOption();
+    parser.addOption(QCommandLineOption(
+        QStringLiteral("daemon"), QStringLiteral("run the sampling daemon instead of the GUI")));
+    parser.addOption(QCommandLineOption(QStringLiteral("socket"),
+                                        QStringLiteral("absolute path of the snapshot socket"),
+                                        QStringLiteral("path")));
+    parser.addOption(QCommandLineOption(
+        QStringLiteral("socktrail-bin"),
+        QStringLiteral("absolute path of the socktrail collector (daemon mode only)"),
+        QStringLiteral("path")));
+
+    // The explicit QStringList keeps option values from being mistaken for a
+    // mode flag; Qt never treats an argument as both an option and its value.
+    if (!parser.parse(args)) {
+        std::fprintf(stderr, "ball: %s\n", qPrintable(parser.errorText()));
+        printUsage(stderr);
+        return 2;
+    }
+    if (!parser.positionalArguments().isEmpty()) {
+        std::fprintf(stderr, "ball: unexpected argument '%s'\n",
+                     qPrintable(parser.positionalArguments().constFirst()));
+        printUsage(stderr);
+        return 2;
+    }
+
+    const bool wantsText = parser.isSet(QStringLiteral("help")) ||
+                           parser.isSet(QStringLiteral("help-all")) ||
+                           parser.isSet(QStringLiteral("version"));
+    if (wantsText) {
+        QCoreApplication app(argc, argv);
+        QCoreApplication::setApplicationName(QStringLiteral("ball"));
+        QCoreApplication::setApplicationVersion(QStringLiteral(BALL_VERSION));
+        parser.process(args);
+        return 0;
+    }
+
+    const bool daemon = parser.isSet(QStringLiteral("daemon"));
+    const bool hasSocket = parser.isSet(QStringLiteral("socket"));
+    const QString socket = parser.value(QStringLiteral("socket"));
+    const bool hasCollector = parser.isSet(QStringLiteral("socktrail-bin"));
+    const QString collector = parser.value(QStringLiteral("socktrail-bin"));
+
+    if (hasSocket && !isAbsolutePath(socket)) {
+        return fail(QStringLiteral("--socket requires an absolute path"), 2);
+    }
+    if (!daemon && hasCollector) {
+        return fail(QStringLiteral("--socktrail-bin is only valid with --daemon"), 2);
+    }
+    if (daemon && (!hasSocket || socket.isEmpty())) {
+        return fail(QStringLiteral("--daemon requires --socket <absolute-path>"), 2);
+    }
+    if (hasCollector && !isAbsolutePath(collector)) {
+        return fail(QStringLiteral("--socktrail-bin requires an absolute path"), 2);
+    }
+
+    if (daemon) {
+        QCoreApplication app(argc, argv);
+        QCoreApplication::setApplicationName(QStringLiteral("ball"));
+        QCoreApplication::setApplicationVersion(QStringLiteral(BALL_VERSION));
+        if (!installQuitSignals(signalMask, app)) {
+            return fail(QStringLiteral("could not set up signal handling"), 1);
+        }
+
+        ball::Service service;
+        ball::ServiceOptions options;
+        options.socketPath = socket;
+        options.collectorBinary =
+            hasCollector ? collector : QStringLiteral(BALL_DEFAULT_COLLECTOR_PATH);
+        if (!service.start(options)) {
+            return fail(service.error(), 1);
+        }
+        QObject::connect(&app, &QCoreApplication::aboutToQuit, &service, &ball::Service::stop);
+        return app.exec();
+    }
+
+    // GUI: only a KDE Wayland session is supported, and never as root.
+    if (::geteuid() == 0) {
+        return fail(QStringLiteral("refusing to run the GUI as root"), 1);
+    }
+    qputenv("QT_WAYLAND_SHELL_INTEGRATION", "layer-shell");
     QApplication app(argc, argv);
+    QCoreApplication::setOrganizationName(QStringLiteral("ball"));
+    QCoreApplication::setApplicationName(QStringLiteral("ball"));
+    QCoreApplication::setApplicationVersion(QStringLiteral(BALL_VERSION));
+    QGuiApplication::setDesktopFileName(QStringLiteral("ball"));
     if (app.platformName() != QStringLiteral("wayland")) {
-        std::fprintf(stderr, "ball: this build only supports Wayland, got platform '%s'\n",
-                     qPrintable(app.platformName()));
-        return 1;
+        return fail(QStringLiteral("the GUI requires a Wayland session, got platform '%1'")
+                        .arg(app.platformName()),
+                    1);
+    }
+    app.setWindowIcon(ball::ui::Hud::hudIcon());
+    // The HUD hides to the tray; the event loop must survive its window closing.
+    app.setQuitOnLastWindowClosed(false);
+    if (!installQuitSignals(signalMask, app)) {
+        return fail(QStringLiteral("could not set up signal handling"), 1);
     }
 
-    QWidget window;
-    window.setWindowFlags(Qt::FramelessWindowHint);
-    window.setAttribute(Qt::WA_TranslucentBackground);
-    window.resize(320, 120);
-    window.show();
-
-    QWindow* handle = window.windowHandle();
-    if (handle == nullptr) {
-        std::fprintf(stderr, "ball: no window handle, cannot attach a layer surface\n");
-        return 1;
-    }
-    LayerShellQt::Window* shell = LayerShellQt::Window::get(handle);
-    if (shell == nullptr) {
-        std::fprintf(stderr, "ball: the compositor does not support layer surfaces\n");
-        return 1;
-    }
-
-    shell->setScope(QStringLiteral("ball"));
-    shell->setLayer(LayerShellQt::Window::LayerTop);
-    shell->setKeyboardInteractivity(LayerShellQt::Window::KeyboardInteractivityNone);
-    shell->setExclusiveZone(0);
-    // The header does not declare operator| for this enum, so compose the flags manually.
-    LayerShellQt::Window::Anchors anchors = LayerShellQt::Window::AnchorTop;
-    anchors |= LayerShellQt::Window::AnchorLeft;
-    shell->setAnchors(anchors);
-    shell->setActivateOnShow(false);
-
+    QSettings settings;
+    ball::ui::Hud hud(socket.isEmpty() ? defaultGuiSocket() : socket, settings);
+    hud.setWindowIcon(ball::ui::Hud::hudIcon());
+    // Quitting the GUI never asks the backend to stop.
+    QObject::connect(&hud, &ball::ui::Hud::exitRequested, &app, &QCoreApplication::quit);
+    hud.show();
     return app.exec();
 }
