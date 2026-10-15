@@ -742,8 +742,11 @@ void Hud::applyPosition(const QPoint& globalTopLeft, bool persist) {
     const QRect clamped = clampRectInto(QRect(globalTopLeft, size()), screenRect);
     m_position = clamped.topLeft();
     // A layer-shell surface refuses free moves: the position is expressed as an
-    // anchor plus margins instead.
-    if (!updateLayerShell()) {
+    // anchor plus margins instead. On Wayland QWidget::pos() is a by-product of
+    // those margins, so it is never treated as the requested position.
+    if (compositorOwnsPosition()) {
+        updateLayerShell();
+    } else if (!updateLayerShell()) {
         move(m_position);
     }
     if (persist) {
@@ -791,8 +794,11 @@ bool Hud::updateLayerShell() {
     if (screen != nullptr) {
         shell->setScreen(const_cast<QScreen*>(screen));
     }
+    m_layerShellActive = true;
     return true;
 }
+
+bool Hud::compositorOwnsPosition() const { return m_layerShellActive; }
 
 void Hud::showEvent(QShowEvent* event) {
     QWidget::showEvent(event);
@@ -802,11 +808,15 @@ void Hud::showEvent(QShowEvent* event) {
 
 void Hud::moveEvent(QMoveEvent* event) {
     QWidget::moveEvent(event);
-    // A drag saves once on release; this catches programmatic moves too.
-    if (!m_dragging) {
-        m_position = pos();
-        savePreferences();
+    // On a layer-shell surface the compositor places the window from the
+    // anchors/margins we request, so QWidget::pos() is a layout by-product and
+    // never the requested position. Adopting it here is what made a drag snap
+    // back (or to the origin) on Wayland; m_position stays authoritative there.
+    if (compositorOwnsPosition() || m_dragging) {
+        return;
     }
+    m_position = pos();
+    savePreferences();
 }
 
 void Hud::paintEvent(QPaintEvent*) {
@@ -835,20 +845,27 @@ void Hud::mousePressEvent(QMouseEvent* event) {
     // panel is still recorded.
     m_pressed = true;
     m_dragging = false;
-    m_pressGlobal = event->globalPosition().toPoint();
-    m_dragOrigin = pos();
+    // Wayland exposes no trustworthy global pointer position for a layer-shell
+    // surface, so a drag is anchored at the surface-local press point.
+    m_pressLocal = event->position().toPoint();
 }
 
 void Hud::mouseMoveEvent(QMouseEvent* event) {
-    if (!m_pressed || m_locked) {
-        return; // a locked HUD ignores the drag, but still counts the release
+    if (!m_pressed) {
+        return;
     }
-    const QPoint delta = event->globalPosition().toPoint() - m_pressGlobal;
+    const QPoint delta = event->position().toPoint() - m_pressLocal;
     if (!m_dragging && delta.manhattanLength() < QApplication::startDragDistance()) {
         return; // still a click, not a drag
     }
     m_dragging = true;
-    applyPosition(m_dragOrigin + delta, false);
+    if (m_locked) {
+        return; // a locked HUD keeps its position, but the gesture is a drag
+    }
+    // m_position is the authority. Adding the local pointer offset to it (not
+    // to a press-time QWidget::pos()) keeps the surface under the cursor while
+    // the compositor moves it, and self-corrects when the compositor lags.
+    applyPosition(m_position + delta, false);
 }
 
 void Hud::mouseReleaseEvent(QMouseEvent* event) {
@@ -857,9 +874,15 @@ void Hud::mouseReleaseEvent(QMouseEvent* event) {
     }
     m_pressed = false;
     if (m_dragging) {
-        const QScreen* screen = currentScreen();
-        const QRect screenRect = screen != nullptr ? screen->geometry() : QRect(m_position, size());
-        applyPosition(snappedPosition(QRect(m_position, size()), screenRect, kSnapDistance), true);
+        // A locked HUD must not move on release either, but a drag is still not
+        // a click, so it never toggles the panel.
+        if (!m_locked) {
+            const QScreen* screen = currentScreen();
+            const QRect screenRect =
+                screen != nullptr ? screen->geometry() : QRect(m_position, size());
+            applyPosition(snappedPosition(QRect(m_position, size()), screenRect, kSnapDistance),
+                          true);
+        }
     } else {
         toggleExpanded();
     }

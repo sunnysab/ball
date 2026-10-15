@@ -96,6 +96,12 @@ protected:
     void keyPressEvent(QKeyEvent* event) override;
     bool event(QEvent* event) override;
 
+    // True when the compositor owns the surface position (layer-shell on
+    // Wayland), so QWidget::pos() is a stale by-product and never the
+    // requested position. Offscreen tests override this to exercise the
+    // Wayland path without a compositor.
+    virtual bool compositorOwnsPosition() const;
+
 private:
     void buildUi();
     void buildContextMenu();
@@ -150,8 +156,10 @@ private:
     QList<InterfaceSnapshot> m_knownInterfaces;
     double m_opacity = 0.9;
 
-    QPoint m_pressGlobal;
-    QPoint m_dragOrigin;
+    // Press position in surface-local coordinates. Wayland clients never see a
+    // reliable global pointer position for a layer-shell surface, so a drag is
+    // derived from this anchor and the authoritative m_position instead.
+    QPoint m_pressLocal;
     bool m_pressed = false;
     bool m_dragging = false;
     bool m_expanded = false;
@@ -159,6 +167,7 @@ private:
     bool m_pinned = false;
     bool m_hiddenByUser = false;
     bool m_layerShellApplied = false;
+    bool m_layerShellActive = false;
 };
 
 } // namespace ball::ui

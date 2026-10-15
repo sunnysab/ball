@@ -14,6 +14,7 @@
 #include <QAbstractItemModel>
 #include <QCheckBox>
 #include <QDateTime>
+#include <QGuiApplication>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -182,6 +183,10 @@ private Q_SLOTS:
     void interfaceSelectionExcludesLoopback();
     void clickTogglesExpandedAndDragDoesNot();
     void lockedPositionStillTogglesByClick();
+    void waylandDragTracksRequestedPosition();
+    void waylandContinuousMotionTracksSurfaceMovement();
+    void waylandLockedClickAndDragAreDistinct();
+    void waylandDragSavesRequestedPosition();
     void escapeCollapsesAndPinKeepsPanel();
     void remembersPositionAndOpacity();
 
@@ -196,6 +201,19 @@ private:
     QTemporaryDir m_settingsDir;
     QString m_settingsPath;
 };
+
+namespace {
+
+// A Hud that pretends the compositor owns the surface position, which is what
+// layer-shell does on Wayland. Offscreen this lets a test drive the real drag
+// math while QWidget::pos() stays unrelated to the requested position.
+class WaylandHud : public Hud {
+public:
+    using Hud::Hud;
+    bool compositorOwnsPosition() const override { return true; }
+};
+
+} // namespace
 
 void TestUi::init() {
     m_name = u"ball-ui-%1"_s.arg(QUuid::createUuid().toString(QUuid::WithoutBraces));
@@ -691,8 +709,120 @@ void TestUi::lockedPositionStillTogglesByClick() {
     QTest::mouseMove(&hud, start + QPoint(80, 80));
     QTest::mouseRelease(&hud, Qt::LeftButton, Qt::NoModifier, start + QPoint(80, 80));
     QCOMPARE(hud.pos(), lockedAt);
-    // The release was still a click, so the panel toggled back closed.
+    // A drag is not a click, even on a locked HUD, so the panel stays open; a
+    // large locked drag must never accidentally toggle it.
+    QVERIFY(hud.isExpanded());
+}
+
+void TestUi::waylandDragTracksRequestedPosition() {
+    QSettings settings(m_settingsPath, QSettings::IniFormat);
+    WaylandHud hud(startServer(), settings);
+    hud.show();
+    QVERIFY(waitFor([&hud] { return hud.isVisible(); }));
+
+    const QPoint start = hud.requestedPosition();
+    QVERIFY(!start.isNull());
+    // Offscreen there is no compositor to apply the margins, so QWidget::pos()
+    // stays at the origin: that is exactly the "requested position is nonzero
+    // while Qt pos differs" reproduction. On a real compositor the surface may
+    // follow, which is fine; the requested position is still the authority.
+    const bool offscreen = QGuiApplication::platformName() != QLatin1String("wayland");
+    if (offscreen) {
+        QCOMPARE(hud.pos(), QPoint(0, 0));
+        QVERIFY(hud.pos() != start);
+    }
+
+    const QPoint pressLocal(20, 20);
+    QTest::mousePress(&hud, Qt::LeftButton, Qt::NoModifier, pressLocal);
+    QTest::mouseMove(&hud, pressLocal + QPoint(100, 70));
+    QTest::mouseRelease(&hud, Qt::LeftButton, Qt::NoModifier, pressLocal + QPoint(100, 70));
+
+    // The drag advanced the authoritative requested position by the pointer
+    // delta. Adopting the unrelated QWidget::pos() would have snapped it back.
+    QCOMPARE(hud.requestedPosition(), start + QPoint(100, 70));
+    if (offscreen) {
+        QCOMPARE(hud.pos(), QPoint(0, 0));
+    }
+    // A drag is not a click, so the panel stayed closed.
     QVERIFY(!hud.isExpanded());
+}
+
+void TestUi::waylandContinuousMotionTracksSurfaceMovement() {
+    QSettings settings(m_settingsPath, QSettings::IniFormat);
+    WaylandHud hud(startServer(), settings);
+    hud.show();
+    QVERIFY(waitFor([&hud] { return hud.isVisible(); }));
+
+    const QPoint start = hud.requestedPosition();
+    const QPoint pressLocal(30, 10);
+    // The cursor's global path, and the surface position at the time each
+    // motion event arrives (the compositor applies the previous request one
+    // step behind). The local coordinate therefore shrinks by exactly the
+    // movement already applied, which is what a real surface reports.
+    const QPoint cursorStep(40, 0);
+    QPoint surface = start;
+
+    QTest::mousePress(&hud, Qt::LeftButton, Qt::NoModifier, pressLocal);
+    for (int step = 1; step <= 3; ++step) {
+        const QPoint global = pressLocal + step * cursorStep;
+        // Surface moved with the previous request; the cursor has advanced.
+        const QPoint local = global - (surface - start);
+        QTest::mouseMove(&hud, local);
+        surface = hud.requestedPosition();
+    }
+    QTest::mouseRelease(&hud, Qt::LeftButton, Qt::NoModifier,
+                        pressLocal + 3 * cursorStep - (surface - start));
+
+    // After three cursor steps the requested position tracked the full travel,
+    // not a single local sample: this is the "follows the hand" behaviour.
+    QCOMPARE(hud.requestedPosition(), start + 3 * cursorStep);
+}
+
+void TestUi::waylandLockedClickAndDragAreDistinct() {
+    QSettings settings(m_settingsPath, QSettings::IniFormat);
+    WaylandHud hud(startServer(), settings);
+    hud.show();
+    QVERIFY(waitFor([&hud] { return hud.isVisible(); }));
+    hud.setLocked(true);
+
+    // A click still toggles the panel while locked. Expanding resizes the
+    // surface and may clamp it into view (layout, not a drag), so the locked
+    // reference is taken once the panel is open.
+    QTest::mouseClick(&hud, Qt::LeftButton, Qt::NoModifier, QPoint(20, 20));
+    QVERIFY(hud.isExpanded());
+    const QPoint lockedAt = hud.requestedPosition();
+
+    // A press-move-release past the threshold is a drag, not a click: it must
+    // neither move the locked surface nor toggle the panel closed.
+    QTest::mousePress(&hud, Qt::LeftButton, Qt::NoModifier, QPoint(20, 20));
+    QTest::mouseMove(&hud, QPoint(120, 100));
+    QTest::mouseRelease(&hud, Qt::LeftButton, Qt::NoModifier, QPoint(120, 100));
+    QCOMPARE(hud.requestedPosition(), lockedAt);
+    QVERIFY(hud.isExpanded());
+}
+
+void TestUi::waylandDragSavesRequestedPosition() {
+    QPoint dragged;
+    {
+        QSettings settings(m_settingsPath, QSettings::IniFormat);
+        WaylandHud hud(startServer(), settings);
+        hud.show();
+        QVERIFY(waitFor([&hud] { return hud.isVisible(); }));
+        QTest::mousePress(&hud, Qt::LeftButton, Qt::NoModifier, QPoint(20, 20));
+        QTest::mouseMove(&hud, QPoint(120, 90));
+        QTest::mouseRelease(&hud, Qt::LeftButton, Qt::NoModifier, QPoint(120, 90));
+        dragged = hud.requestedPosition();
+    }
+
+    // The requested position survives a restart, even though QWidget::pos()
+    // never held it while the surface was alive.
+    QSettings settings(m_settingsPath, QSettings::IniFormat);
+    const ball::ui::Preferences saved = ball::ui::Preferences::load(settings);
+    QVERIFY(saved.hasPosition);
+    QCOMPARE(saved.position, dragged);
+
+    WaylandHud restored(startServer(), settings);
+    QCOMPARE(restored.requestedPosition(), dragged);
 }
 
 void TestUi::escapeCollapsesAndPinKeepsPanel() {
