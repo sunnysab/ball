@@ -23,6 +23,19 @@ target_include_directories(ball_daemon PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_compile_options(ball_daemon PRIVATE -Wall -Wextra -Wpedantic)
 target_link_libraries(ball_daemon PUBLIC Qt6::Core Qt6::Network)
 
+add_library(ball_ui STATIC
+    src/ui/snapshot.cpp
+    src/ui/snapshot_client.cpp
+    src/ui/format.cpp
+    src/ui/traffic_model.cpp
+    src/ui/placement.cpp
+    src/ui/preferences.cpp
+    src/ui/hud.cpp
+)
+target_include_directories(ball_ui PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_compile_options(ball_ui PRIVATE -Wall -Wextra -Wpedantic)
+target_link_libraries(ball_ui PUBLIC Qt6::Widgets Qt6::Network LayerShellQt::Interface)
+
 add_executable(ball src/main.cpp)
 target_compile_definitions(ball PRIVATE BALL_VERSION="${PROJECT_VERSION}")
 target_compile_options(ball PRIVATE -Wall -Wextra -Wpedantic)
@@ -53,6 +66,15 @@ if(BUILD_TESTING)
     target_compile_definitions(ball_service_test PRIVATE
         BALL_FAKE_COLLECTOR_BINARY="$<TARGET_FILE:ball_fake_collector>")
     add_dependencies(ball_service_test ball_fake_collector)
+
+    qt_add_executable(ball_ui_test tests/ui.cpp)
+    target_link_libraries(ball_ui_test PRIVATE Qt6::Test ball_ui)
+
+    qt_add_executable(ball_ui_preview tests/ui_preview.cpp)
+    target_link_libraries(ball_ui_preview PRIVATE ball_ui)
+
+    add_test(NAME ball_ui COMMAND ball_ui_test)
+    set_tests_properties(ball_ui PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 90)
 
     add_test(NAME ball_version COMMAND ball --version)
     set_tests_properties(ball_version PROPERTIES PASS_REGULAR_EXPRESSION "ball ${PROJECT_VERSION}")
