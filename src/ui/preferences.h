@@ -2,6 +2,9 @@
 // The only state that survives a restart; traffic history is never persisted.
 #pragma once
 
+#include "ui/appearance.h"
+
+#include <QByteArray>
 #include <QPoint>
 #include <QSettings>
 #include <QString>
@@ -9,12 +12,14 @@
 
 namespace ball::ui {
 
-// Preferences are limited on purpose: position, screen, opacity and the
-// interface selection. Snapshot values are never written to disk.
+// Only display preferences survive a restart; snapshot values never go to disk.
 struct Preferences {
     QPoint position;
     QString screenName;
-    double opacity = 0.9;
+    double opacity = 0.96;
+    Theme theme = Theme::Porcelain;
+    BarLayout barLayout = BarLayout::TwoLine;
+    QByteArray detailsGeometry;
     QStringList interfaces;
     bool hasInterfaceSelection = false;
 

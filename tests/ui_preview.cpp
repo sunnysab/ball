@@ -1,18 +1,21 @@
 // ball: a network traffic HUD for KDE Wayland sessions.
-// Renders the HUD offscreen with mock data so the layout can be reviewed
+// Renders the details and all built-in HUD presets with mock data
 // without a desktop session. It feeds the widget through the real local socket
 // protocol and writes only generated data, never user preferences or traffic.
 //
 // Usage: ball_ui_preview [output.png]
+#include "ui/details.h"
 #include "ui/hud.h"
 
 #include <QApplication>
 #include <QByteArray>
+#include <QFileInfo>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QLocalServer>
 #include <QLocalSocket>
+#include <QPainter>
 #include <QPixmap>
 #include <QSettings>
 #include <QTemporaryDir>
@@ -120,22 +123,50 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    ball::ui::Hud hud(name, settings);
-    hud.resize(460, 560);
-    hud.setExpanded(true);
-    hud.show();
-
-    QLocalSocket* peer = nullptr;
-    QTimer::singleShot(30, [&] {
-        if (server.hasPendingConnections()) {
-            peer = server.nextPendingConnection();
+    QObject::connect(&server, &QLocalServer::newConnection, &app, [&server] {
+        if (auto* peer = server.nextPendingConnection()) {
             peer->write(mockSnapshot());
             peer->write("\n");
             peer->flush();
         }
     });
-    QTimer::singleShot(150, [&] {
-        const QPixmap shot = hud.grab();
+
+    ball::ui::Hud hud(name, settings);
+    hud.showDetails();
+    hud.show();
+
+    QTimer::singleShot(500, [&] {
+        QPixmap bars(1350, 220);
+        bars.fill(QColor("#e5e7eb"));
+        QPainter painter(&bars);
+        int column = 0;
+        for (const auto theme :
+             {ball::ui::Theme::Porcelain, ball::ui::Theme::Paper, ball::ui::Theme::Graphite}) {
+            hud.setTheme(theme);
+            painter.setPen(Qt::black);
+            painter.drawText(column * 450 + 16, 24, ball::ui::themeName(theme));
+            int y = 40;
+            for (const auto layout :
+                 {ball::ui::BarLayout::TwoLine, ball::ui::BarLayout::SingleLine}) {
+                hud.setBarLayout(layout);
+                QCoreApplication::processEvents();
+                const auto shot = hud.grab();
+                painter.drawPixmap(QRect(column * 450 + 16, y, hud.width(), hud.height()), shot);
+                y += hud.height() + 16;
+            }
+            ++column;
+        }
+        painter.end();
+        const QFileInfo file(output);
+        const QString barsOutput = file.absolutePath() + QLatin1Char('/') +
+                                   file.completeBaseName() + QStringLiteral("-bars.png");
+        if (!bars.save(barsOutput)) {
+            app.exit(1);
+            return;
+        }
+        hud.setTheme(ball::ui::Theme::Porcelain);
+        QCoreApplication::processEvents();
+        const QPixmap shot = hud.detailsWindow()->grab();
         if (!shot.save(output)) {
             std::fprintf(stderr, "preview: cannot write %s\n", qPrintable(output));
             app.exit(1);

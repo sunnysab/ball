@@ -1,0 +1,418 @@
+// ball: independent traffic details, fed by the HUD's existing subscription.
+#include "ui/details.h"
+
+#include "ui/format.h"
+#include "ui/traffic_model.h"
+
+#include <QAbstractTableModel>
+#include <QCheckBox>
+#include <QComboBox>
+#include <QFrame>
+#include <QHBoxLayout>
+#include <QHeaderView>
+#include <QKeyEvent>
+#include <QLabel>
+#include <QLineEdit>
+#include <QSet>
+#include <QTabWidget>
+#include <QTableView>
+#include <QToolButton>
+#include <QVBoxLayout>
+
+#include <algorithm>
+#include <utility>
+
+namespace ball::ui {
+namespace {
+
+// Raw values live in an extra role so the model sorts on real numbers instead
+// of the formatted text; one numeric key column is enough for that.
+constexpr int kSortRole = Qt::UserRole + 1;
+
+// The placeholder shown while a value is unavailable.
+QString placeholder() { return QStringLiteral("—"); }
+
+struct TableRow {
+    QStringList texts;
+    QList<double> keys;
+    bool idle = false;
+    QString search;
+};
+
+// One table's rows plus its filter. Sorting reads the numeric keys, so
+// "9.5 KiB/s" never sorts above "10 KiB/s"; filtering hides idle rows unless
+// asked otherwise and matches process name or PID.
+class TrafficTableModel : public QAbstractTableModel {
+public:
+    TrafficTableModel(QStringList headers, QSet<int> numericColumns, QObject* parent = nullptr)
+        : QAbstractTableModel(parent), m_headers(std::move(headers)),
+          m_numericColumns(std::move(numericColumns)) {}
+
+    void setRows(QList<TableRow> rows) {
+        m_rows = std::move(rows);
+        applyForcedSort();
+        refilter();
+    }
+
+    void setFilter(const QString& needle, bool hideIdle) {
+        const QString trimmed = needle.trimmed();
+        if (m_needle == trimmed && m_hideIdle == hideIdle) {
+            return;
+        }
+        m_needle = trimmed;
+        m_hideIdle = hideIdle;
+        refilter();
+    }
+
+    int rowCount(const QModelIndex& parent = {}) const override {
+        return parent.isValid() ? 0 : int(m_visible.size());
+    }
+    int columnCount(const QModelIndex& parent = {}) const override {
+        return parent.isValid() ? 0 : int(m_headers.size());
+    }
+    QVariant data(const QModelIndex& index, int role) const override {
+        if (!index.isValid() || index.row() >= m_visible.size()) {
+            return {};
+        }
+        const TableRow& row = m_rows.at(m_visible.at(index.row()));
+        switch (role) {
+        case Qt::DisplayRole:
+            return row.texts.value(index.column());
+        case Qt::TextAlignmentRole:
+            return m_numericColumns.contains(index.column())
+                       ? QVariant(int(Qt::AlignRight | Qt::AlignVCenter))
+                       : QVariant(int(Qt::AlignLeft | Qt::AlignVCenter));
+        case Qt::FontRole:
+            return m_numericColumns.contains(index.column()) ? QVariant(numericFont()) : QVariant();
+        case kSortRole:
+            return row.keys.value(index.column());
+        default:
+            return {};
+        }
+    }
+    QVariant headerData(int section, Qt::Orientation orientation, int role) const override {
+        if (role != Qt::DisplayRole || orientation != Qt::Horizontal) {
+            return {};
+        }
+        return m_headers.value(section);
+    }
+    // Only the value columns are sortable; the name and status columns keep
+    // insertion order so a stable ranking is always available.
+    void sort(int column, Qt::SortOrder order = Qt::AscendingOrder) override {
+        if (!m_numericColumns.contains(column)) {
+            return;
+        }
+        m_sortColumn = column;
+        m_sortOrder = order;
+        applyForcedSort();
+        refilter();
+    }
+
+private:
+    void applyForcedSort() {
+        if (m_sortColumn < 0) {
+            return;
+        }
+        const int column = m_sortColumn;
+        const Qt::SortOrder order = m_sortOrder;
+        std::stable_sort(m_rows.begin(), m_rows.end(),
+                         [column, order](const TableRow& a, const TableRow& b) {
+                             const double left = a.keys.value(column);
+                             const double right = b.keys.value(column);
+                             return order == Qt::AscendingOrder ? left < right : left > right;
+                         });
+    }
+
+    void refilter() {
+        beginResetModel();
+        m_visible.clear();
+        for (int i = 0; i < m_rows.size(); ++i) {
+            const TableRow& row = m_rows.at(i);
+            if (m_hideIdle && row.idle) {
+                continue;
+            }
+            if (!m_needle.isEmpty() && !row.search.contains(m_needle, Qt::CaseInsensitive)) {
+                continue;
+            }
+            m_visible.append(i);
+        }
+        endResetModel();
+    }
+
+    QStringList m_headers;
+    QSet<int> m_numericColumns;
+    QList<TableRow> m_rows;
+    QList<int> m_visible;
+    QString m_needle;
+    bool m_hideIdle = false;
+    int m_sortColumn = -1;
+    Qt::SortOrder m_sortOrder = Qt::DescendingOrder;
+};
+
+} // namespace
+
+Details::Details() : QWidget(nullptr, Qt::Window) {
+    setObjectName(QStringLiteral("details"));
+    setWindowTitle(QStringLiteral("ball · 流量详情"));
+    resize(780, 580);
+    auto* layout = new QVBoxLayout(this);
+    layout->setContentsMargins(20, 16, 20, 16);
+    layout->setSpacing(14);
+
+    auto* heading = new QHBoxLayout;
+    auto* title = new QLabel(QStringLiteral("网络流量"), this);
+    QFont titleFont = font();
+    titleFont.setPointSizeF(titleFont.pointSizeF() + 5);
+    titleFont.setBold(true);
+    title->setFont(titleFont);
+    heading->addWidget(title);
+    heading->addStretch();
+    auto* onTop = new QToolButton(this);
+    onTop->setObjectName(QStringLiteral("details.onTop"));
+    onTop->setText(QStringLiteral("置顶"));
+    onTop->setCheckable(true);
+    onTop->setToolTip(QStringLiteral("使详情窗口保持在其他普通窗口之上"));
+    connect(onTop, &QToolButton::toggled, this, [this](bool checked) {
+        const bool visible = isVisible();
+        setWindowFlag(Qt::WindowStaysOnTopHint, checked);
+        if (visible) {
+            show();
+        }
+    });
+    heading->addWidget(onTop);
+    layout->addLayout(heading);
+
+    m_selectionLabel = new QLabel(this);
+    m_selectionLabel->setObjectName(QStringLiteral("details.selection"));
+    m_selectionLabel->setProperty("role", "muted");
+    m_selectionLabel->setWordWrap(true);
+    m_selectionLabel->setTextFormat(Qt::PlainText);
+    layout->addWidget(m_selectionLabel);
+
+    auto* totals = new QHBoxLayout;
+    const QStringList titles{QStringLiteral("当前速率"), QStringLiteral("今日累计"),
+                             QStringLiteral("本次累计")};
+    for (int column = 0; column < 3; ++column) {
+        auto* card = new QFrame(this);
+        card->setProperty("role", "card");
+        auto* cardLayout = new QVBoxLayout(card);
+        cardLayout->setContentsMargins(14, 12, 14, 12);
+        cardLayout->setSpacing(8);
+        auto* caption = new QLabel(titles.at(column), card);
+        caption->setProperty("role", "muted");
+        cardLayout->addWidget(caption);
+        m_downLabels[column] = new QLabel(card);
+        m_upLabels[column] = new QLabel(card);
+        m_downLabels[column]->setProperty("role", "download");
+        m_upLabels[column]->setProperty("role", "upload");
+        for (QLabel* value : {m_downLabels[column], m_upLabels[column]}) {
+            value->setFont(numericFont());
+            value->setTextInteractionFlags(Qt::TextSelectableByMouse);
+            cardLayout->addWidget(value);
+        }
+        totals->addWidget(card, 1);
+    }
+    m_downLabels[0]->setObjectName(QStringLiteral("details.currentDown"));
+    m_upLabels[0]->setObjectName(QStringLiteral("details.currentUp"));
+    m_downLabels[1]->setObjectName(QStringLiteral("details.todayDown"));
+    m_upLabels[1]->setObjectName(QStringLiteral("details.todayUp"));
+    m_downLabels[2]->setObjectName(QStringLiteral("details.sessionDown"));
+    m_upLabels[2]->setObjectName(QStringLiteral("details.sessionUp"));
+    layout->addLayout(totals);
+
+    m_quality = new QWidget(this);
+    auto* qualityLayout = new QVBoxLayout(m_quality);
+    qualityLayout->setContentsMargins(0, 0, 0, 0);
+    auto* qualityHeading = new QHBoxLayout;
+    m_qualitySummary = new QLabel(m_quality);
+    m_qualitySummary->setObjectName(QStringLiteral("details.quality"));
+    m_qualitySummary->setProperty("role", "warning");
+    m_qualitySummary->setTextFormat(Qt::PlainText);
+    m_qualitySummary->setWordWrap(true);
+    qualityHeading->addWidget(m_qualitySummary, 1);
+    auto* reasons = new QToolButton(m_quality);
+    reasons->setObjectName(QStringLiteral("details.showReasons"));
+    reasons->setText(QStringLiteral("查看原因"));
+    reasons->setCheckable(true);
+    qualityHeading->addWidget(reasons);
+    qualityLayout->addLayout(qualityHeading);
+    m_qualityReasons = new QLabel(m_quality);
+    m_qualityReasons->setObjectName(QStringLiteral("details.reasons"));
+    m_qualityReasons->setTextFormat(Qt::PlainText);
+    m_qualityReasons->setWordWrap(true);
+    m_qualityReasons->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    m_qualityReasons->setProperty("role", "muted");
+    m_qualityReasons->hide();
+    connect(reasons, &QToolButton::toggled, m_qualityReasons, &QLabel::setVisible);
+    qualityLayout->addWidget(m_qualityReasons);
+    layout->addWidget(m_quality);
+
+    auto* tools = new QHBoxLayout;
+    m_search = new QLineEdit(this);
+    m_search->setObjectName(QStringLiteral("details.search"));
+    m_search->setPlaceholderText(QStringLiteral("搜索进程名或 PID"));
+    m_search->setClearButtonEnabled(true);
+    tools->addWidget(m_search, 1);
+    m_showIdle = new QCheckBox(QStringLiteral("显示空闲"), this);
+    m_showIdle->setObjectName(QStringLiteral("details.showIdle"));
+    tools->addWidget(m_showIdle);
+    m_period = new QComboBox(this);
+    m_period->setObjectName(QStringLiteral("details.period"));
+    m_period->addItems(titles);
+    m_period->setAccessibleName(QStringLiteral("表格统计口径"));
+    tools->addWidget(m_period);
+    layout->addLayout(tools);
+
+    m_tabs = new QTabWidget(this);
+    m_tabs->setObjectName(QStringLiteral("details.tabs"));
+    m_processTable = new QTableView(m_tabs);
+    m_processTable->setObjectName(QStringLiteral("details.processTable"));
+    m_interfaceTable = new QTableView(m_tabs);
+    m_interfaceTable->setObjectName(QStringLiteral("details.interfaceTable"));
+    m_tabs->addTab(m_processTable, QStringLiteral("进程"));
+    m_tabs->addTab(m_interfaceTable, QStringLiteral("网卡"));
+    layout->addWidget(m_tabs, 1);
+
+    m_processTable->setModel(new TrafficTableModel({QStringLiteral("进程"), QStringLiteral("PID"),
+                                                    QStringLiteral("状态"), QStringLiteral("下行"),
+                                                    QStringLiteral("上行")},
+                                                   {3, 4}, this));
+    m_interfaceTable->setModel(new TrafficTableModel(
+        {QStringLiteral("网卡"), QStringLiteral("类型"), QStringLiteral("状态"),
+         QStringLiteral("下行"), QStringLiteral("上行")},
+        {3, 4}, this));
+    for (QTableView* table : {m_processTable, m_interfaceTable}) {
+        table->setSortingEnabled(true);
+        table->setSelectionBehavior(QAbstractItemView::SelectRows);
+        table->setSelectionMode(QAbstractItemView::SingleSelection);
+        table->setEditTriggers(QAbstractItemView::NoEditTriggers);
+        table->setShowGrid(false);
+        table->setWordWrap(false);
+        table->setAlternatingRowColors(true);
+        table->verticalHeader()->hide();
+        table->verticalHeader()->setDefaultSectionSize(36);
+        table->horizontalHeader()->setSectionResizeMode(QHeaderView::ResizeToContents);
+        table->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Stretch);
+        table->sortByColumn(3, Qt::DescendingOrder);
+    }
+    connect(m_search, &QLineEdit::textChanged, this, &Details::filterTables);
+    connect(m_showIdle, &QCheckBox::toggled, this, &Details::filterTables);
+    connect(m_period, &QComboBox::currentIndexChanged, this, &Details::rebuildTables);
+    connect(m_tabs, &QTabWidget::currentChanged, this, [this](int index) {
+        m_search->setPlaceholderText(index == 0 ? QStringLiteral("搜索进程名或 PID")
+                                                : QStringLiteral("搜索网卡名"));
+        m_search->clear();
+    });
+
+    m_startedLabel = new QLabel(this);
+    m_startedLabel->setObjectName(QStringLiteral("details.started"));
+    m_startedLabel->setProperty("role", "muted");
+    m_startedLabel->setWordWrap(true);
+    layout->addWidget(m_startedLabel);
+    setSnapshot(std::nullopt, false, {});
+}
+
+void Details::setTheme(Theme theme) { applyTheme(*this, theme); }
+
+void Details::setStatus(const QString& summary, const QStringList& reasons) {
+    m_qualitySummary->setText(summary);
+    m_qualityReasons->setText(reasons.join(QLatin1Char('\n')));
+    m_quality->setVisible(!summary.isEmpty());
+}
+
+void Details::setSnapshot(const std::optional<Snapshot>& snapshot, bool fresh,
+                          const QStringList& selectedInterfaces) {
+    m_snapshot = snapshot;
+    m_fresh = fresh;
+    m_selectionLabel->setText(QStringLiteral("所选网卡：%1")
+                                  .arg(selectedInterfaces.isEmpty()
+                                           ? QStringLiteral("未选择")
+                                           : selectedInterfaces.join(QStringLiteral("、"))));
+    const auto totals = snapshot.has_value() && snapshot->interfacesAvailable
+                            ? sumSelectedInterfaces(snapshot->interfaces, selectedInterfaces)
+                            : InterfaceTotals{};
+    const bool usable = fresh && totals.valid;
+    m_downLabels[0]->setText(
+        QStringLiteral("↓ %1").arg(usable ? formatRate(totals.rxBps).trimmed() : placeholder()));
+    m_upLabels[0]->setText(
+        QStringLiteral("↑ %1").arg(usable ? formatRate(totals.txBps).trimmed() : placeholder()));
+    const ByteCounters counters[]{totals.today, totals.session};
+    for (int i = 0; i < 2; ++i) {
+        m_downLabels[i + 1]->setText(QStringLiteral("↓ %1").arg(
+            usable ? formatBytes(counters[i].rxBytes).trimmed() : placeholder()));
+        m_upLabels[i + 1]->setText(QStringLiteral("↑ %1").arg(
+            usable ? formatBytes(counters[i].txBytes).trimmed() : placeholder()));
+    }
+    const QString started =
+        snapshot.has_value() && snapshot->started.isValid()
+            ? snapshot->started.toLocalTime().toString(QStringLiteral("yyyy-MM-dd HH:mm:ss"))
+            : placeholder();
+    m_startedLabel->setText(
+        QStringLiteral("本次监测开始于 %1 · 统计仅保存在后台内存，后台重启后清零").arg(started));
+    rebuildTables();
+}
+
+void Details::rebuildTables() {
+    QList<TableRow> processes;
+    QList<TableRow> interfaces;
+    if (m_snapshot.has_value()) {
+        const int period = m_period->currentIndex();
+        const bool processUsable =
+            m_fresh && m_snapshot->processStatus.available && !m_snapshot->processStatus.stale;
+        const bool interfaceUsable = m_fresh && m_snapshot->interfacesAvailable;
+        // The same five-column table changes metric, retaining search and numeric sort.
+        const auto addValues = [period](TableRow& target, const auto& row, bool usable) {
+            const ByteCounters bytes = period == 1 ? row.today : row.session;
+            const bool rates = period == 0;
+            target.texts.append(rates ? (usable ? formatRate(row.rxBps) : unavailableRate())
+                                      : formatBytes(bytes.rxBytes));
+            target.texts.append(rates ? (usable ? formatRate(row.txBps) : unavailableRate())
+                                      : formatBytes(bytes.txBytes));
+            target.keys = {0, 0, 0, rates ? row.rxBps : double(bytes.rxBytes),
+                           rates ? row.txBps : double(bytes.txBytes)};
+            target.idle = rates ? row.rxBps == 0.0 && row.txBps == 0.0
+                                : bytes.rxBytes == 0 && bytes.txBytes == 0;
+        };
+        for (const auto& row : m_snapshot->processes) {
+            TableRow item;
+            item.texts = {row.name.isEmpty() ? QStringLiteral("(未知)") : row.name,
+                          QString::number(row.pid),
+                          row.present ? QStringLiteral("当前") : QStringLiteral("历史")};
+            addValues(item, row, processUsable);
+            if (period == 0 && !row.present) {
+                item.idle = true;
+            }
+            item.search = row.name + QLatin1Char(' ') + QString::number(row.pid);
+            processes.append(item);
+        }
+        for (const auto& row : m_snapshot->interfaces) {
+            TableRow item;
+            item.texts = {row.name, interfaceKindName(row.kind),
+                          row.up ? QStringLiteral("启用") : QStringLiteral("停用")};
+            addValues(item, row, interfaceUsable);
+            item.search = row.name;
+            interfaces.append(item);
+        }
+    }
+    static_cast<TrafficTableModel*>(m_processTable->model())->setRows(processes);
+    static_cast<TrafficTableModel*>(m_interfaceTable->model())->setRows(interfaces);
+    filterTables();
+}
+
+void Details::filterTables() {
+    for (QTableView* table : {m_processTable, m_interfaceTable}) {
+        static_cast<TrafficTableModel*>(table->model())
+            ->setFilter(m_search->text(), !m_showIdle->isChecked());
+    }
+}
+
+void Details::keyPressEvent(QKeyEvent* event) {
+    if (event->key() == Qt::Key_Escape) {
+        close();
+        event->accept();
+        return;
+    }
+    QWidget::keyPressEvent(event);
+}
+
+} // namespace ball::ui

@@ -4,6 +4,7 @@
 // and no network access are needed; the layer-shell protocol itself is verified
 // in a Wayland session instead.
 #include "ui/autostart.h"
+#include "ui/details.h"
 #include "ui/format.h"
 #include "ui/hud.h"
 #include "ui/placement.h"
@@ -15,16 +16,20 @@
 #include <QAbstractItemModel>
 #include <QAction>
 #include <QCheckBox>
+#include <QComboBox>
 #include <QDateTime>
+#include <QFontMetrics>
 #include <QGuiApplication>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QKeyEvent>
 #include <QLabel>
 #include <QLineEdit>
 #include <QLocalServer>
 #include <QLocalSocket>
 #include <QMenu>
+#include <QRegularExpression>
 #include <QScopeGuard>
 #include <QScreen>
 #include <QSettings>
@@ -35,6 +40,7 @@
 #include <QTemporaryDir>
 #include <QTest>
 #include <QTimer>
+#include <QToolButton>
 #include <QUuid>
 
 #include <cmath>
@@ -187,15 +193,25 @@ private Q_SLOTS:
     void switchesTabsAndSortsProcesses();
     void filtersIdleProcessesAndSearch();
     void interfaceSelectionExcludesLoopback();
-    void clickTogglesExpandedAndDragDoesNot();
-    void lockedPositionStillTogglesByClick();
+    void clickOpensIndependentDetailsAndDragDoesNot();
+    void lockedPositionStillOpensDetails();
     void waylandDragTracksRequestedPosition();
     void waylandContinuousMotionTracksSurfaceMovement();
     void waylandLockedClickAndDragAreDistinct();
     void waylandDragSavesRequestedPosition();
     void waylandDragRequestsSurfaceCommit();
-    void escapeCollapsesAndPinKeepsPanel();
+    void detailsSurviveDeactivationAndEscapeClosesOnlyDetails();
     void remembersPositionAndOpacity();
+    void appearanceRoundTripAndInvalidPreferences();
+    void barLayoutsStayCompactAndDoNotClip();
+    void themeChangesAreLocalAndKeepTextLegible();
+    void fontChangesResizeTheBarWithoutClipping();
+    void periodSwitchKeepsNumericSortSearchAndHistory();
+    void processQualityDoesNotInvalidateInterfaceRates();
+    void partialInterfaceSelectionIsVisible();
+    void staleRatesAreUnavailableInBothWindows();
+    void detailsGeometrySurvivesRestart();
+    void appearanceMenuUpdatesPreferences();
     void contextMenuStaysCompact();
     void autostartMenuUsesUserConfiguration();
 
@@ -232,9 +248,10 @@ protected:
 } // namespace
 
 void TestUi::init() {
+    QTest::failOnWarning(QRegularExpression(u"Could not parse stylesheet.*"_s));
     m_name = u"ball-ui-%1"_s.arg(QUuid::createUuid().toString(QUuid::WithoutBraces));
     QVERIFY(m_server.listen(m_name));
-    m_settingsPath = m_settingsDir.filePath(u"prefs.ini"_s);
+    m_settingsPath = m_settingsDir.filePath(m_name + u".ini"_s);
 }
 
 void TestUi::cleanup() {
@@ -582,7 +599,7 @@ void TestUi::preferencesRoundTrip() {
 
     // A corrupted opacity must not be able to make the HUD invisible.
     reread.setValue(u"hud/opacity"_s, 0.0);
-    QCOMPARE(ball::ui::Preferences::load(reread).opacity, 0.9);
+    QCOMPARE(ball::ui::Preferences::load(reread).opacity, 0.96);
 }
 
 void TestUi::showsDigitsFromSnapshot() {
@@ -597,8 +614,8 @@ void TestUi::showsDigitsFromSnapshot() {
     QVERIFY(status != nullptr);
     // Default selection is eno1 + wlan0: 1024 + 500 = 1524 B/s down.
     QVERIFY(waitFor([rx] { return rx->text().contains(u"1.49"_s); }));
-    QVERIFY(rx->text().startsWith(u"↓"_s));
-    QCOMPARE(status->text(), u"正常"_s);
+    QCOMPARE(rx->text(), u"1.49"_s);
+    QVERIFY(status->text().isEmpty());
 }
 
 void TestUi::switchesTabsAndSortsProcesses() {
@@ -607,12 +624,15 @@ void TestUi::switchesTabsAndSortsProcesses() {
     QVERIFY(acceptConnection() != nullptr);
     send(snapshotLine());
     QVERIFY(waitFor([&hud] {
-        return hud.findChild<QLabel*>(u"hud.totalDown"_s) != nullptr &&
-               hud.findChild<QLabel*>(u"hud.totalDown"_s)->text().contains(u"1.49"_s);
+        return hud.detailsWindow()->findChild<QLabel*>(u"details.currentDown"_s) != nullptr &&
+               hud.detailsWindow()
+                   ->findChild<QLabel*>(u"details.currentDown"_s)
+                   ->text()
+                   .contains(u"1.49"_s);
     }));
 
-    auto* tabs = hud.findChild<QTabWidget*>(u"hud.tabs"_s);
-    auto* table = hud.findChild<QTableView*>(u"hud.processTable"_s);
+    auto* tabs = hud.detailsWindow()->findChild<QTabWidget*>(u"details.tabs"_s);
+    auto* table = hud.detailsWindow()->findChild<QTableView*>(u"details.processTable"_s);
     QVERIFY(tabs != nullptr);
     QVERIFY(table != nullptr);
     QCOMPARE(tabs->tabText(0), u"进程"_s);
@@ -630,9 +650,9 @@ void TestUi::filtersIdleProcessesAndSearch() {
     Hud hud(startServer(), settings);
     QVERIFY(acceptConnection() != nullptr);
     send(snapshotLine());
-    auto* table = hud.findChild<QTableView*>(u"hud.processTable"_s);
-    auto* search = hud.findChild<QLineEdit*>(u"hud.processSearch"_s);
-    auto* showIdle = hud.findChild<QCheckBox*>(u"hud.showIdle"_s);
+    auto* table = hud.detailsWindow()->findChild<QTableView*>(u"details.processTable"_s);
+    auto* search = hud.detailsWindow()->findChild<QLineEdit*>(u"details.search"_s);
+    auto* showIdle = hud.detailsWindow()->findChild<QCheckBox*>(u"details.showIdle"_s);
     QVERIFY(table != nullptr && search != nullptr && showIdle != nullptr);
     QVERIFY(waitFor([table] { return table->model()->rowCount() == 2; }));
 
@@ -665,13 +685,15 @@ void TestUi::interfaceSelectionExcludesLoopback() {
     // The first-run default is the enabled physical interfaces only.
     QCOMPARE(hud.selectedInterfaces(), QStringList({u"eno1"_s, u"wlan0"_s}));
 
-    auto* interfaceTable = hud.findChild<QTableView*>(u"hud.interfaceTable"_s);
+    auto* interfaceTable = hud.detailsWindow()->findChild<QTableView*>(u"details.interfaceTable"_s);
     QVERIFY(interfaceTable != nullptr);
     // All four rows exist in the table; only the totals use the selection. The
     // down tunnel is hidden as idle until the user asks for it.
     QVERIFY(waitFor([interfaceTable] { return interfaceTable->model()->rowCount() == 3; }));
 
-    const auto totalDown = [&hud] { return hud.findChild<QLabel*>(u"hud.totalDown"_s)->text(); };
+    const auto totalDown = [&hud] {
+        return hud.detailsWindow()->findChild<QLabel*>(u"details.currentDown"_s)->text();
+    };
     const QString before = totalDown();
     hud.setSelectedInterfaces({u"lo"_s});
     const QString after = totalDown();
@@ -684,27 +706,46 @@ void TestUi::interfaceSelectionExcludesLoopback() {
     QCOMPARE(ball::ui::Preferences::load(reread).interfaces, QStringList({u"lo"_s}));
 }
 
-void TestUi::clickTogglesExpandedAndDragDoesNot() {
+void TestUi::clickOpensIndependentDetailsAndDragDoesNot() {
     QSettings settings(m_settingsPath, QSettings::IniFormat);
     Hud hud(startServer(), settings);
     hud.move(100, 100);
     hud.show();
     QVERIFY(waitFor([&hud] { return hud.isVisible(); }));
+    const QSize barSize = hud.size();
+    const QPoint barPosition = hud.requestedPosition();
+    auto* details = hud.detailsWindow();
+    QVERIFY(details->isWindow());
+    QVERIFY(details->parentWidget() == nullptr);
+    QCOMPARE(details->windowModality(), Qt::NonModal);
+    QCOMPARE(details->windowType(), Qt::Window);
+    QSignalSpy exit(&hud, &Hud::exitRequested);
 
+    for (int i = 0; i < 5; ++i) {
+        QTest::mouseClick(&hud, Qt::LeftButton, Qt::NoModifier, QPoint(20, 20));
+        QVERIFY(details->isVisible());
+        QCOMPARE(hud.detailsWindow(), details);
+        QCOMPARE(hud.size(), barSize);
+        QCOMPARE(hud.requestedPosition(), barPosition);
+        details->close();
+        QVERIFY(!details->isVisible());
+        QCOMPARE(hud.size(), barSize);
+        QVERIFY(hud.isVisible());
+    }
+    // Repeated clicks bring back one window, rather than toggling or duplicating it.
+    hud.showDetails();
     QTest::mouseClick(&hud, Qt::LeftButton, Qt::NoModifier, QPoint(20, 20));
-    QVERIFY(hud.isExpanded());
-    QTest::mouseClick(&hud, Qt::LeftButton, Qt::NoModifier, QPoint(20, 20));
-    QVERIFY(!hud.isExpanded());
-
-    // A press-move-release beyond the drag threshold is a drag, not a click.
+    QVERIFY(details->isVisible());
+    details->close();
     const QPoint start(20, 20);
     QTest::mousePress(&hud, Qt::LeftButton, Qt::NoModifier, start);
     QTest::mouseMove(&hud, start + QPoint(60, 60));
     QTest::mouseRelease(&hud, Qt::LeftButton, Qt::NoModifier, start + QPoint(60, 60));
-    QVERIFY(!hud.isExpanded());
+    QVERIFY(!details->isVisible());
+    QVERIFY(exit.isEmpty());
 }
 
-void TestUi::lockedPositionStillTogglesByClick() {
+void TestUi::lockedPositionStillOpensDetails() {
     QSettings settings(m_settingsPath, QSettings::IniFormat);
     Hud hud(startServer(), settings);
     hud.move(200, 200);
@@ -712,11 +753,10 @@ void TestUi::lockedPositionStillTogglesByClick() {
     QVERIFY(waitFor([&hud] { return hud.isVisible(); }));
     hud.setLocked(true);
 
-    // Locking must not disable the click: the panel still opens and closes.
+    // Locking the HUD must not prevent opening details.
     QTest::mouseClick(&hud, Qt::LeftButton, Qt::NoModifier, QPoint(20, 20));
-    QVERIFY(hud.isExpanded());
-    // Expanding resizes the surface and may clamp it into view; that is layout,
-    // not a drag, so the reference is taken after the panel is open.
+    QVERIFY(hud.detailsWindow()->isVisible());
+    // Opening details never moves or resizes the locked HUD.
     const QPoint lockedAt = hud.pos();
 
     // A drag on a locked HUD is ignored; the surface stays where it was.
@@ -725,9 +765,9 @@ void TestUi::lockedPositionStillTogglesByClick() {
     QTest::mouseMove(&hud, start + QPoint(80, 80));
     QTest::mouseRelease(&hud, Qt::LeftButton, Qt::NoModifier, start + QPoint(80, 80));
     QCOMPARE(hud.pos(), lockedAt);
-    // A drag is not a click, even on a locked HUD, so the panel stays open; a
+    // A drag is not a click, even on a locked HUD, so details stay open; a
     // large locked drag must never accidentally toggle it.
-    QVERIFY(hud.isExpanded());
+    QVERIFY(hud.detailsWindow()->isVisible());
 }
 
 void TestUi::waylandDragTracksRequestedPosition() {
@@ -759,8 +799,8 @@ void TestUi::waylandDragTracksRequestedPosition() {
     if (offscreen) {
         QCOMPARE(hud.pos(), QPoint(0, 0));
     }
-    // A drag is not a click, so the panel stayed closed.
-    QVERIFY(!hud.isExpanded());
+    // A drag is not a click, so details stay closed.
+    QVERIFY(!hud.detailsWindow()->isVisible());
 }
 
 void TestUi::waylandContinuousMotionTracksSurfaceMovement() {
@@ -801,20 +841,18 @@ void TestUi::waylandLockedClickAndDragAreDistinct() {
     QVERIFY(waitFor([&hud] { return hud.isVisible(); }));
     hud.setLocked(true);
 
-    // A click still toggles the panel while locked. Expanding resizes the
-    // surface and may clamp it into view (layout, not a drag), so the locked
-    // reference is taken once the panel is open.
+    // A click still opens details while the HUD position is locked.
     QTest::mouseClick(&hud, Qt::LeftButton, Qt::NoModifier, QPoint(20, 20));
-    QVERIFY(hud.isExpanded());
+    QVERIFY(hud.detailsWindow()->isVisible());
     const QPoint lockedAt = hud.requestedPosition();
 
     // A press-move-release past the threshold is a drag, not a click: it must
-    // neither move the locked surface nor toggle the panel closed.
+    // neither move the locked surface nor close the details window.
     QTest::mousePress(&hud, Qt::LeftButton, Qt::NoModifier, QPoint(20, 20));
     QTest::mouseMove(&hud, QPoint(120, 100));
     QTest::mouseRelease(&hud, Qt::LeftButton, Qt::NoModifier, QPoint(120, 100));
     QCOMPARE(hud.requestedPosition(), lockedAt);
-    QVERIFY(hud.isExpanded());
+    QVERIFY(hud.detailsWindow()->isVisible());
 }
 
 void TestUi::waylandDragSavesRequestedPosition() {
@@ -855,30 +893,31 @@ void TestUi::waylandDragRequestsSurfaceCommit() {
     QTest::mouseRelease(&hud, Qt::LeftButton, Qt::NoModifier, QPoint(70, 20));
 }
 
-void TestUi::escapeCollapsesAndPinKeepsPanel() {
+void TestUi::detailsSurviveDeactivationAndEscapeClosesOnlyDetails() {
     QSettings settings(m_settingsPath, QSettings::IniFormat);
     Hud hud(startServer(), settings);
-    hud.setExpanded(true);
-    QVERIFY(hud.isExpanded());
-
-    // Esc always closes the panel, even when the position is locked.
-    hud.setLocked(true);
-    QKeyEvent escape(QEvent::KeyPress, Qt::Key_Escape, Qt::NoModifier);
-    QCoreApplication::sendEvent(&hud, &escape);
-    QVERIFY(!hud.isExpanded());
-
-    // A pinned panel survives losing activation, so the user can work in
-    // another window while it stays open. Locking alone does not.
-    hud.setLocked(false);
-    hud.setExpanded(true);
+    hud.show();
+    hud.showDetails();
+    auto* details = hud.detailsWindow();
+    const QSize barSize = hud.size();
     QEvent deactivate(QEvent::WindowDeactivate);
     QCoreApplication::sendEvent(&hud, &deactivate);
-    QVERIFY(!hud.isExpanded());
+    QCoreApplication::sendEvent(details, &deactivate);
+    QVERIFY(details->isVisible());
+    auto* search = details->findChild<QLineEdit*>(u"details.search"_s);
+    QTest::keyClick(search, Qt::Key_Escape);
+    QVERIFY(!details->isVisible());
+    QVERIFY(hud.isVisible());
+    QCOMPARE(hud.size(), barSize);
 
-    hud.setPinned(true);
-    hud.setExpanded(true);
-    QCoreApplication::sendEvent(&hud, &deactivate);
-    QVERIFY(hud.isExpanded());
+    hud.showDetails();
+    auto* top = details->findChild<QToolButton*>(u"details.onTop"_s);
+    top->setChecked(true);
+    QVERIFY(details->windowFlags().testFlag(Qt::WindowStaysOnTopHint));
+    QVERIFY(details->isVisible());
+    top->setChecked(false);
+    QVERIFY(!details->windowFlags().testFlag(Qt::WindowStaysOnTopHint));
+    QVERIFY(details->isVisible());
 }
 
 void TestUi::remembersPositionAndOpacity() {
@@ -905,6 +944,12 @@ void TestUi::contextMenuStaysCompact() {
     QVERIFY(menu->width() < bounds.width() / 2);
     QVERIFY(menu->height() < bounds.height() / 2);
     menu->close();
+    const auto childMenus = menu->findChildren<QMenu*>().size();
+    for (int i = 0; i < 3; ++i) {
+        hud.openContextMenu(hud.mapToGlobal(QPoint(20, 20)));
+        QCOMPARE(menu->findChildren<QMenu*>().size(), childMenus);
+        menu->close();
+    }
 }
 
 void TestUi::autostartMenuUsesUserConfiguration() {
@@ -934,6 +979,247 @@ void TestUi::autostartMenuUsesUserConfiguration() {
     action->trigger();
     QVERIFY(!action->isChecked());
     QVERIFY(!ball::ui::autostartEnabled(configuration.path()));
+}
+
+void TestUi::appearanceRoundTripAndInvalidPreferences() {
+    QSettings settings(m_settingsPath, QSettings::IniFormat);
+    const auto defaults = ball::ui::Preferences::load(settings);
+    QCOMPARE(defaults.theme, ball::ui::Theme::Porcelain);
+    QCOMPARE(defaults.barLayout, ball::ui::BarLayout::TwoLine);
+    {
+        Hud hud(startServer(), settings);
+        hud.setTheme(ball::ui::Theme::Paper);
+        hud.setBarLayout(ball::ui::BarLayout::SingleLine);
+        hud.setOpacity(0.7);
+    }
+    {
+        Hud restored(startServer(), settings);
+        QCOMPARE(restored.theme(), ball::ui::Theme::Paper);
+        QCOMPARE(restored.barLayout(), ball::ui::BarLayout::SingleLine);
+        QCOMPARE(restored.opacity(), 0.7);
+    }
+    settings.setValue(u"hud/theme"_s, u"unknown"_s);
+    settings.setValue(u"hud/layout"_s, u"unknown"_s);
+    const auto invalid = ball::ui::Preferences::load(settings);
+    QCOMPARE(invalid.theme, defaults.theme);
+    QCOMPARE(invalid.barLayout, defaults.barLayout);
+}
+
+void TestUi::barLayoutsStayCompactAndDoNotClip() {
+    QSettings settings(m_settingsPath, QSettings::IniFormat);
+    Hud hud(startServer(), settings);
+    hud.show();
+    auto* rx = hud.findChild<QLabel*>(u"hud.rx"_s);
+    auto* tx = hud.findChild<QLabel*>(u"hud.tx"_s);
+    QSize twoLine;
+    for (const auto layout : {ball::ui::BarLayout::TwoLine, ball::ui::BarLayout::SingleLine,
+                              ball::ui::BarLayout::TwoLine}) {
+        hud.setBarLayout(layout);
+        QCoreApplication::processEvents();
+        QVERIFY(hud.width() < 600);
+        QVERIFY(hud.height() < 120);
+        QCOMPARE(hud.minimumSize(), hud.maximumSize());
+        for (auto* label : {rx, tx}) {
+            QVERIFY(label->width() >= QFontMetrics(label->font()).horizontalAdvance(u"1023.99"_s));
+            QVERIFY(hud.rect().contains(QRect(label->mapTo(&hud, QPoint()), label->size())));
+        }
+        const auto rxPoint = rx->mapTo(&hud, QPoint());
+        const auto txPoint = tx->mapTo(&hud, QPoint());
+        if (layout == ball::ui::BarLayout::TwoLine) {
+            QCOMPARE(rxPoint.x(), txPoint.x());
+            QVERIFY(txPoint.y() > rxPoint.y());
+            twoLine = hud.size();
+        } else {
+            QCOMPARE(rxPoint.y(), txPoint.y());
+            QVERIFY(txPoint.x() > rxPoint.x());
+            QVERIFY(hud.width() > twoLine.width());
+            QVERIFY(hud.height() < twoLine.height());
+        }
+        const auto size = hud.size();
+        hud.showDetails();
+        hud.detailsWindow()->resize(1000, 700);
+        hud.detailsWindow()->close();
+        QCOMPARE(hud.size(), size);
+    }
+}
+
+void TestUi::fontChangesResizeTheBarWithoutClipping() {
+    QSettings settings(m_settingsPath, QSettings::IniFormat);
+    Hud hud(startServer(), settings);
+    hud.show();
+    auto* rx = hud.findChild<QLabel*>(u"hud.rx"_s);
+    const auto before = hud.size();
+    QFont larger = hud.font();
+    larger.setPointSizeF(larger.pointSizeF() + 4);
+    hud.setFont(larger);
+    QCoreApplication::processEvents();
+    QVERIFY(hud.width() > before.width());
+    QVERIFY(hud.height() > before.height());
+    QCOMPARE(rx->width(), QFontMetrics(rx->font()).horizontalAdvance(u"1023.99"_s));
+    hud.setBarLayout(ball::ui::BarLayout::SingleLine);
+    QVERIFY(hud.rect().contains(QRect(rx->mapTo(&hud, QPoint()), rx->size())));
+}
+
+void TestUi::themeChangesAreLocalAndKeepTextLegible() {
+    QSettings settings(m_settingsPath, QSettings::IniFormat);
+    Hud hud(startServer(), settings);
+    const QPalette applicationPalette = qApp->palette();
+    hud.show();
+    hud.showDetails();
+    for (const auto theme :
+         {ball::ui::Theme::Porcelain, ball::ui::Theme::Paper, ball::ui::Theme::Graphite}) {
+        hud.setTheme(theme);
+        const auto colors = ball::ui::themeColors(theme);
+        QCOMPARE(hud.palette().color(QPalette::Window), colors.background);
+        QCOMPARE(hud.detailsWindow()->palette().color(QPalette::Window), colors.background);
+        QCOMPARE(hud.detailsWindow()->palette().color(QPalette::Text), colors.text);
+        QCOMPARE(qApp->palette(), applicationPalette);
+        QCOMPARE(hud.findChild<QLabel*>(u"hud.rx"_s)->palette().color(QPalette::WindowText),
+                 colors.text);
+        QVERIFY(std::abs(colors.text.lightness() - colors.background.lightness()) > 140);
+        const auto size = hud.size();
+        hud.setOpacity(0.5);
+        const auto image = hud.grab().toImage();
+        const auto background =
+            image.pixelColor(qRound(8 * image.devicePixelRatio()), image.height() / 2);
+        QVERIFY(background.alpha() >= 120 && background.alpha() <= 135);
+        QCOMPARE(hud.size(), size);
+    }
+}
+
+void TestUi::periodSwitchKeepsNumericSortSearchAndHistory() {
+    QSettings settings(m_settingsPath, QSettings::IniFormat);
+    Hud hud(startServer(), settings);
+    QVERIFY(acceptConnection() != nullptr);
+    send(snapshotLine());
+    auto* details = hud.detailsWindow();
+    auto* period = details->findChild<QComboBox*>(u"details.period"_s);
+    auto* table = details->findChild<QTableView*>(u"details.processTable"_s);
+    auto* search = details->findChild<QLineEdit*>(u"details.search"_s);
+    QVERIFY(waitFor([table] { return table->model()->rowCount() == 2; }));
+    QCOMPARE(table->model()->columnCount(), 5);
+    for (int metric = 1; metric <= 2; ++metric) {
+        period->setCurrentIndex(metric);
+        // Historical processes with nonzero totals are useful even with idle hidden.
+        QCOMPARE(table->model()->rowCount(), 3);
+        QCOMPARE(findText(table->model(), 0, 0), u"firefox"_s);
+        QVERIFY(!findText(table->model(), 0, 3).contains(u"/s"_s));
+        table->sortByColumn(3, Qt::AscendingOrder);
+        QCOMPARE(findText(table->model(), 0, 0), u"dead"_s);
+        search->setText(u"1234"_s);
+        QCOMPARE(table->model()->rowCount(), 1);
+        QCOMPARE(findText(table->model(), 0, 0), u"firefox"_s);
+        search->clear();
+        table->sortByColumn(3, Qt::DescendingOrder);
+    }
+    period->setCurrentIndex(0);
+    QCOMPARE(table->model()->rowCount(), 2);
+    QVERIFY(findText(table->model(), 0, 3).contains(u"/s"_s));
+}
+
+void TestUi::processQualityDoesNotInvalidateInterfaceRates() {
+    QSettings settings(m_settingsPath, QSettings::IniFormat);
+    Hud hud(startServer(), settings);
+    QVERIFY(acceptConnection() != nullptr);
+    auto object = QJsonDocument::fromJson(snapshotLine()).object();
+    auto process = object[u"process_status"_s].toObject();
+    process[u"incomplete"_s] = true;
+    object[u"process_status"_s] = process;
+    send(QJsonDocument(object).toJson(QJsonDocument::Compact));
+    auto* status = hud.findChild<QLabel*>(u"hud.status"_s);
+    auto* rx = hud.findChild<QLabel*>(u"hud.rx"_s);
+    auto* quality = hud.detailsWindow()->findChild<QLabel*>(u"details.quality"_s);
+    auto* reasons = hud.detailsWindow()->findChild<QLabel*>(u"details.reasons"_s);
+    QVERIFY(waitFor([status] { return status->text() == u"!"_s; }));
+    QCOMPARE(rx->text(), u"1.49"_s);
+    QVERIFY(quality->text().contains(u"当前采集正常"_s));
+    QVERIFY(quality->text().contains(u"历史缺口"_s));
+    QVERIFY(!reasons->text().isEmpty());
+    hud.showDetails();
+    auto* toggle = hud.detailsWindow()->findChild<QToolButton*>(u"details.showReasons"_s);
+    QVERIFY(!reasons->isVisible());
+    toggle->setChecked(true);
+    QVERIFY(reasons->isVisible());
+
+    send(snapshotLine(u"2026-10-14T14:30:03+08:00"_s, true, false, true));
+    QVERIFY(waitFor([quality] { return quality->text().contains(u"进程采集不可用"_s); }));
+    QCOMPARE(rx->text(), u"1.49"_s);
+    process[u"incomplete"_s] = false;
+    process[u"error"_s] = u"collector error"_s;
+    object[u"process_status"_s] = process;
+    send(QJsonDocument(object).toJson(QJsonDocument::Compact));
+    QVERIFY(waitFor([reasons] { return reasons->text().contains(u"collector error"_s); }));
+    QVERIFY(quality->text().contains(u"进程采集不可用"_s));
+    send(snapshotLine());
+    QVERIFY(waitFor([status] { return status->text().isEmpty(); }));
+}
+
+void TestUi::partialInterfaceSelectionIsVisible() {
+    QSettings settings(m_settingsPath, QSettings::IniFormat);
+    Hud hud(startServer(), settings);
+    QVERIFY(acceptConnection() != nullptr);
+    send(snapshotLine());
+    QVERIFY(waitFor([&hud] { return !hud.selectedInterfaces().isEmpty(); }));
+    hud.setSelectedInterfaces({u"eno1"_s, u"missing"_s});
+    auto* status = hud.findChild<QLabel*>(u"hud.status"_s);
+    auto* quality = hud.detailsWindow()->findChild<QLabel*>(u"details.quality"_s);
+    QCOMPARE(status->text(), u"!"_s);
+    QVERIFY(quality->text().contains(u"部分所选网卡缺失"_s));
+    hud.setSelectedInterfaces({});
+    QCOMPARE(status->text(), u"未选"_s);
+    QCOMPARE(hud.findChild<QLabel*>(u"hud.rx"_s)->text(), u"—"_s);
+    hud.setSelectedInterfaces({u"missing"_s});
+    QCOMPARE(status->text(), u"异常"_s);
+}
+
+void TestUi::staleRatesAreUnavailableInBothWindows() {
+    QSettings settings(m_settingsPath, QSettings::IniFormat);
+    Hud hud(startServer(), settings);
+    QVERIFY(acceptConnection() != nullptr);
+    send(snapshotLine());
+    auto* rx = hud.findChild<QLabel*>(u"hud.rx"_s);
+    QVERIFY(waitFor([rx] { return rx->text() == u"1.49"_s; }));
+    m_client->disconnectFromServer();
+    QVERIFY(waitFor([rx] { return rx->text() == u"—"_s; }));
+    auto* details = hud.detailsWindow();
+    QVERIFY(details->findChild<QLabel*>(u"details.currentDown"_s)->text().contains(u"—"_s));
+    for (const auto& name : {u"details.processTable"_s, u"details.interfaceTable"_s}) {
+        auto* table = details->findChild<QTableView*>(name);
+        QVERIFY(findText(table->model(), 0, 3).contains(u"--"_s));
+    }
+    QCOMPARE(hud.findChild<QLabel*>(u"hud.status"_s)->text(), u"过期"_s);
+}
+
+void TestUi::detailsGeometrySurvivesRestart() {
+    QSize saved;
+    {
+        QSettings settings(m_settingsPath, QSettings::IniFormat);
+        Hud hud(startServer(), settings);
+        hud.showDetails();
+        hud.detailsWindow()->resize(740, 520);
+        saved = hud.detailsWindow()->size();
+        hud.detailsWindow()->close();
+    }
+    QSettings settings(m_settingsPath, QSettings::IniFormat);
+    Hud restored(startServer(), settings);
+    restored.showDetails();
+    QCOMPARE(restored.detailsWindow()->size(), saved);
+}
+
+void TestUi::appearanceMenuUpdatesPreferences() {
+    QSettings settings(m_settingsPath, QSettings::IniFormat);
+    Hud hud(startServer(), settings);
+    auto* theme = hud.findChild<QAction*>(u"hud.action.theme.1"_s);
+    auto* layout = hud.findChild<QAction*>(u"hud.action.layout.1"_s);
+    QVERIFY(theme != nullptr && layout != nullptr);
+    theme->trigger();
+    layout->trigger();
+    QCOMPARE(hud.theme(), ball::ui::Theme::Paper);
+    QCOMPARE(hud.barLayout(), ball::ui::BarLayout::SingleLine);
+    const auto saved = ball::ui::Preferences::load(settings);
+    QCOMPARE(saved.theme, hud.theme());
+    QCOMPARE(saved.barLayout, hud.barLayout());
+    QVERIFY(hud.findChild<QAction*>(u"hud.action.pin"_s) == nullptr);
 }
 
 QTEST_MAIN(TestUi)

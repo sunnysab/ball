@@ -34,6 +34,8 @@ add_library(ball_ui STATIC
     src/ui/placement.cpp
     src/ui/preferences.cpp
     src/ui/autostart.cpp
+    src/ui/appearance.cpp
+    src/ui/details.cpp
     src/ui/hud.cpp
 )
 target_include_directories(ball_ui PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
