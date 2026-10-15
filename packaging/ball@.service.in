@@ -1,0 +1,35 @@
+# ball backend unit template. Enable one instance per desktop user:
+#   systemctl enable --now ball@<user>.service
+# The instance name selects both the private group that may connect to the
+# socket and the runtime directory /run/ball-<user>.
+[Unit]
+Description=ball 网络流量监测后台（用户 %i）
+After=network.target
+
+[Service]
+Type=simple
+# Packet capture (AF_PACKET), eBPF/BTF and reading other users' /proc entries
+# require root, so the backend never drops privileges.
+User=root
+# Must be the user's private group with the same name; %i is the username.
+Group=%i
+RuntimeDirectory=ball-%i
+RuntimeDirectoryMode=0750
+UMask=0077
+ExecStart="@CMAKE_INSTALL_FULL_BINDIR@/ball" --daemon --socket /run/ball-%i/gui.sock --socktrail-bin "@CMAKE_INSTALL_FULL_LIBEXECDIR@/ball/socktrail"
+Restart=on-failure
+RestartSec=2
+# SIGTERM only reaches the daemon, which then stops its collector child itself;
+# SIGKILL to the whole group is the backstop after this timeout.
+KillMode=mixed
+TimeoutStopSec=10
+
+# Moderate hardening only. RestrictAddressFamilies is deliberately absent: it
+# would block AF_PACKET, which traffic collection needs.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectHome=read-only
+
+[Install]
+WantedBy=multi-user.target

@@ -7,6 +7,9 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 find_package(Qt6 REQUIRED COMPONENTS Widgets Network)
 find_package(LayerShellQt REQUIRED)
+include(GNUInstallDirs)
+
+set(BALL_SOCKTRAIL_BINARY "" CACHE FILEPATH "External socktrail executable to install")
 
 # Before any target: the daemon library has QObject sources, and AUTOMOC is
 # enabled per target at creation time.
@@ -37,11 +40,31 @@ target_compile_options(ball_ui PRIVATE -Wall -Wextra -Wpedantic)
 target_link_libraries(ball_ui PUBLIC Qt6::Widgets Qt6::Network LayerShellQt::Interface)
 
 add_executable(ball src/main.cpp)
-target_compile_definitions(ball PRIVATE BALL_VERSION="${PROJECT_VERSION}")
+target_compile_definitions(ball PRIVATE
+    BALL_VERSION="${PROJECT_VERSION}"
+    BALL_DEFAULT_COLLECTOR_PATH="${CMAKE_INSTALL_FULL_LIBEXECDIR}/ball/socktrail"
+)
 target_compile_options(ball PRIVATE -Wall -Wextra -Wpedantic)
 target_link_libraries(ball PRIVATE ball_ui ball_daemon)
 
-install(TARGETS ball RUNTIME DESTINATION bin)
+install(TARGETS ball RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+configure_file(packaging/ball@.service.in ball@.service @ONLY)
+install(FILES ${CMAKE_CURRENT_BINARY_DIR}/ball@.service DESTINATION lib/systemd/system)
+configure_file(packaging/ball.desktop.in ball.desktop @ONLY)
+install(FILES ${CMAKE_CURRENT_BINARY_DIR}/ball.desktop
+    DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/applications)
+install(FILES packaging/ball.svg
+    DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/icons/hicolor/scalable/apps)
+
+if(BALL_SOCKTRAIL_BINARY)
+    if(NOT EXISTS "${BALL_SOCKTRAIL_BINARY}" OR IS_DIRECTORY "${BALL_SOCKTRAIL_BINARY}")
+        message(FATAL_ERROR "BALL_SOCKTRAIL_BINARY must name an existing executable file")
+    endif()
+    install(PROGRAMS "${BALL_SOCKTRAIL_BINARY}"
+        DESTINATION ${CMAKE_INSTALL_LIBEXECDIR}/ball RENAME socktrail)
+else()
+    message(WARNING "No collector will be installed; provide BALL_SOCKTRAIL_BINARY or --socktrail-bin")
+endif()
 
 include(CTest)
 if(BUILD_TESTING)

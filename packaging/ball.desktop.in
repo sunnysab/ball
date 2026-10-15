@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=ball 流量悬浮窗
+GenericName=网络流量监测
+Comment=在 KDE Wayland 桌面显示实时网络流量
+Exec="@CMAKE_INSTALL_FULL_BINDIR@/ball"
+Icon=ball
+Terminal=false
+StartupNotify=false
+Categories=System;Monitor;

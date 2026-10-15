@@ -1,173 +1,256 @@
 # ball
 
-一个常驻 KDE Plasma Wayland 桌面的网络流量悬浮窗（HUD）。
+KDE Plasma Wayland 桌面上的网络流量悬浮窗（HUD）。
 
-## 当前状态
+ball 由一个后台采集守护进程和一个桌面悬浮窗组成：后台以 root 运行，采集网卡与
+每进程的收发字节并经本机 Unix socket 发布只读快照；悬浮窗以普通用户运行，只读取
+该 socket 并展示。所有统计都保存在内存里。
 
-本仓库目前是 **可构建的骨架加统计核心**：一个无边框半透明、位于 layer-shell `Top` 层的窗口，
-最小 CLI（`--help` / `--version`），以及不依赖 QWidget 的流量统计核心。
+## 运行环境与限制
 
-已实现：
-
-- `src/daemon/interfaces`：通过 Linux rtnetlink `RTM_GETLINK` 读取每块网卡的累计 RX/TX、
-  名称、index 与 flags，标记物理 / 虚拟 / loopback。非阻塞 socket 加有限 `poll` 超时：
-  `Interfaces::poll(timeoutMs)` 阻塞调用线程最多 `timeoutMs`，后台线程请使用较小超时或异步调度。
-- `src/daemon/traffic`：在内存中按网卡分别累计「今日」与「本次监测」的收发字节；
-  速率用调用方提供的单调时间戳（如 `QElapsedTimer::elapsed`）计算，墙钟只用于监测起点与日期。
-- `src/daemon/processes`：在内存中按进程（`pid` + socktrail `start_ns`）累计「今日」与「本次监测」
-  的收发字节，语义与网卡累计一致，另外处理后端采集会话重启与进程缺席后重现。
-- `src/daemon/socktrail`：异步订阅外部 `socktrail --socket` 的 Unix socket NDJSON 流，把
-  周期性 `stats` 帧喂给 `Processes`。只使用 `stats` 的全量 `process_io` 表，不从 `flow` 帧求和。
-- `src/daemon/service`：统一采样网卡、管理采集子进程、订阅进程数据，并通过受限权限的
-  本地 socket 发布完整快照。GUI 断开不影响采集；慢客户端会被断开；停止服务清理自己的子进程。
-  运行目录由部署层创建，快照字段见 [本地协议](docs/protocol.md)。
-- `src/ui`：无边框半透明流量条、进程/网卡面板、数值排序与搜索、空闲过滤、
-  网卡选择、位置锁定、面板固定、边缘吸附及托盘控制。只保存显示偏好，不保存流量历史。
-
-尚未接入程序入口：GUI / daemon 模式切换和安装配置。
-组件已有独立测试，`main` 仍是最小窗口。
-
-统计契约：
-
-- 首次样本只建立基线，不产生流量；`elapsed` 为 0 时不消耗基线，避免漏记或尖峰；
-- 速率只看单调时间，墙钟回拨或跳进不会影响速率；无效的墙钟 / 单调样本被拒绝，不污染累计；
-- 计数器方向重置时重新建立基线，不下溢、不产生反直觉尖峰；
-- 本地日期变化时清空「今日」，「本次监测」保持不变；
-- 监测起点在首次有效采样时记录，供后续界面展示；
-- 网卡消失时保留已观察流量，同一 index 重现时重建基线，重命名保持累计值；
-- 所有数据仅在内存中，从监测开始计数，不落盘保存历史。
-
-进程累计契约（`Processes`）：
-
-- 输入 `ProcessCounter{pid, startNs, name, rxBytes, txBytes}`，`startNs` 是采集器
-  `start_ns`（纳秒身份），不是 `/proc/<pid>/stat` 的 starttime tick；`pid` + `startNs` 共同
-  构成身份，PID 复用不会混入旧进程的累计；
-- `rxBytes` / `txBytes` 是采集器当前会话的累计值，不保证覆盖进程启动以来的全部流量；
-- 首个有效快照只建立基线（监测开始前的流量计为 0）；此后首次出现的进程按新段处理，
-  其当前计数值全部计入（进程在后端启动后才产生流量的常见情形）；
-- 差分使用调用方提供的单调毫秒；某方向计数回退表示该方向的新段，按新段字节计入并保留
-  自身累计，不下溢、不产生尖峰；
-- 进程缺席时保留行与累计、速率归零，`present` 为 false；同一身份重现时按新段计入；
-- `backendSessionChanged` 为 true 时（后端 socktrail 重启）重建全部基线，保留已累计的
-  today / session，该样本速率为 0；
-- 本地日期变化只清 today，session 不变；无效墙钟 / 单调样本被拒且不污染状态；
-- 输出 `ProcessTraffic{pid, startNs, name, present, today, session, rate}`，一般 QMap 行；
-- 同样只在内存中，不落盘。
-
-socktrail 订阅契约（`Socktrail`）：
-
-- 协议为每行一个 JSON 对象的 NDJSON；`kind` 为 `hello` / `flow` / `stats`。客户端只读
-  `stats` 的**全量** `process_io` 累计值，**不**从 `flow` 增量求和，否则会因丢帧而少计；
-- 每帧先完整解析并校验再改动状态：`hello` 校验 `version == 1` 与 `started`（带时区的
-  RFC 3339），`stats` 校验 `at`、每个进程的 `pid` / `start_ns` / `rx_bytes` / `tx_bytes`
-  以及 `probes.pid` 与未索引 / 过期字节字段。数字用 `QJsonValue::toInteger` 读取，不经
-  `double` 损失 > 2^53 的整数；负数、小数、缺字段、重复身份、非法 pid 一律拒绝整帧；
-- 一个字节计数若超出可精确表示的 `qint64` 范围也拒绝整帧，不跳过单行：部分接受会删掉
-  进程的旧基线，反而制造一次假重启；
-- 断线或拒绝帧会关闭连接并重连，错误是短 ASCII 文本；累计值在断线时保留，不清零；
-- 每次连接必须先收到合法 `hello` 才接受 `stats`。`available()` 在一次完整 `stats` 之后
-  为 true，连接建立本身不算；实时展示必须同时检查 `available()` 与 `!stale()`，
-  质量丢失由独立的 `incomplete()` 标记说明；
-- `stale()` 由单调定时器判定：约 5 秒没有 `stats` 即 stale，`flow` 帧不刷新新鲜度，
-  stale 时给出明确原因；
-- `incomplete()` 表示观测历史存在无法弥补的缺口：尚未收到 `stats`、断线、后端重启、
-  `stats` 帧携带 PID 丢失 / 未索引等质量问题时保持为 true。瞬时速率不伪造；
-- 同一毫秒到达的多个 `stats` 帧不能靠单调时钟区分，保留最新一帧，等出现正间隔后再计入，
-  不假造时间戳，也不会让最后一帧的累计永远丢失；
-- 墙钟只用于本地日期与监测起点（`frame.at.toLocalTime()`，不把 UTC 当本地）；单调时间
-  使用只初始化一次的 `QElapsedTimer`，因此 `Processes` 的历史在重连后仍连续；
-- `Socktrail::kMaxLineBytes`（16 MiB）是单帧长度上限，decode 前检查，包括已经带换行的
-  超长行；分块读取处理半行与一读多帧，超长即断开，避免缓冲无界增长；
-- PID 丢失 / 未索引字节只作为质量提示（`qualityNotes()`），不加入任何已知进程或网卡总和；
-- 重连约每秒一次，只有一个 timer；`stop()` 与析构都不再重连，对象归属为父子关系，
-  信号 lambda 都带 context，不使用任何阻塞事件循环的 `waitFor...` 调用。
-
-采样失败语义：
-
-- `Interfaces::poll()` 返回 `std::optional<QList<InterfaceInfo>>`；`nullopt` 表示整次 dump 未成功
-  （超时、`NLM_F_DUMP_INTR`、`NLMSG_ERROR`、`MSG_TRUNC`、坏帧 / 坏属性、`POLLERR` 等），
-  调用方 **不能** 当作空网卡列表，否则会错误删除接口基线；只有完整成功的 dump 才返回列表。
-- 解码器 `decodeLinkMessage` 用 `memcpy` 读 header / `ifinfomsg` / `rtattr`，拒绝负 index、
-  非 NUL 接口名、长度不合法或尾部残留的属性；`IFLA_STATS64` 只要求字段到 `tx_bytes` 末端。
-- 物理 / 虚拟由真实轮询时按 `/sys/class/net/<name>/device` 是否存在判定，
-  `IFLA_LINKINFO` 仅作为 decoder 层提示。
-
-> 跨午夜的采样区间会被计入新的一天，因此「今日」最多存在一个采样区间的误差。
-
-规划的最终形态：
-
-- 仅支持 KDE Plasma Wayland（依赖 layer-shell 协议），不支持 X11；
-- 流量由外部 Go 程序 `socktrail` 采集，ball 只负责展示；
-- 在内存中统计「今日」与「本次监测」累计值；
-- 从监测起点开始计数，不落盘保存流量历史；
-- 提供进程视图与网卡视图两个视图。
+- **仅支持 KDE Plasma Wayland**：使用 layer-shell 协议，需要 Qt6 与 LayerShellQt。
+- 本项目采用 Qt，只承诺支持 KDE Plasma Wayland；未实现 X11 / GNOME 适配。
+- 后台需要 root：AF_PACKET 抓包、eBPF/BTF 程序挂载、读取其他用户的 `/proc/<pid>`
+  都要求特权；悬浮窗本身不需要 root，也不做任何特权操作。
+- 流量采集由外部 Go 程序 [socktrail](https://github.com/jimyag/socktrail) 完成，
+  ball 不抓包，只管理该子进程并订阅它的 NDJSON 输出。
 
 ## 依赖
 
 - CMake ≥ 3.25、Ninja
-- 支持 C++23 的编译器（开发环境为 GCC 16 / Clang 23）
-- Qt 6（Core / Gui / Widgets / Network）
-- LayerShellQt（`LayerShellQt::Interface`）
+- 支持 C++23 的编译器
+- Qt 6（Core / Gui / Widgets / Network）与 LayerShellQt 的 CMake 包
+- 可执行的外部采集器 `socktrail`（见下节）
 
-## 构建与运行
+以上全部来自发行版包，构建过程不联网、不下载任何依赖。
+
+## 安装
+
+### 1. 准备采集器 socktrail
+
+ball 使用独立兼容补丁 `db7df63`（分支 `fix/recvmsg-four-args`），为本机 Linux 7.2
+新增四参数 `recvmsg` 探针；原检出目录的 `main` 不变。已在本地缓存准备好的 Go 1.27
+环境中验证真实 TCP/UDP 及订阅数据。可在 ball 根目录执行：
 
 ```sh
-cmake --preset dev          # Debug 配置，生成 build/dev 与 compile_commands.json
-cmake --build --preset dev
-ctest --preset dev          # ball_version、ball_traffic、ball_processes 与 ball_socktrail 单元测试
+BALL_DIR="$PWD"
+mkdir -p "$BALL_DIR/build"
+cd ../ball-worktrees/socktrail-compat
+GOTOOLCHAIN=local GOPROXY=off GOSUMDB=off CGO_ENABLED=0 \
+  go build -trimpath -o "$BALL_DIR/build/socktrail" .
+"$BALL_DIR/build/socktrail" --version
+cd "$BALL_DIR"
+```
 
-# 核心测试不依赖桌面会话，可在无显示环境直接跑：
-env -u DISPLAY -u WAYLAND_DISPLAY QT_QPA_PLATFORM=offscreen ./build/dev/ball_traffic_test
+把生成的 `socktrail` 放在一个固定位置，构建 ball 时用
+`-DBALL_SOCKTRAIL_BINARY=<绝对路径>` 指向它，安装时会被装到
+`<prefix>/libexec/ball/socktrail`。不传该变量时安装不会包含采集器，CMake 会给出
+明确警告，需要你自行把 collector 放到这个路径（或在运行时用 `--socktrail-bin` 指定）。
+
+### 2. 配置与构建 ball
+
+**安装前缀必须在 configure 阶段确定。** ball 会把默认采集器路径
+`<prefix>/libexec/ball/socktrail` 编译进可执行文件，systemd unit 和 desktop 文件的
+`ExecStart` / `Exec` 也在 configure 时写死为绝对路径。因此：
+
+- 用 `-DCMAKE_INSTALL_PREFIX=/usr`（发行版风格）或 `-DCMAKE_INSTALL_PREFIX=/usr/local`
+  （默认值）在 configure 时选好；
+- **只执行 `cmake --install --prefix ...` 改路径是不够的**：文件会装到新前缀，但
+  二进制里编译进去的采集器路径与 unit/desktop 里的绝对路径仍指向旧前缀。
+
+```sh
+# 以安装到 /usr 为例；开发调试可用 CMakePresets 的 dev / release
+cmake -S . -B build/release -G Ninja \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_INSTALL_PREFIX=/usr \
+      -DBALL_SOCKTRAIL_BINARY=/path/to/socktrail
+cmake --build build/release
+```
+
+不使用预设也能离线构建；`BUILD_TESTING=OFF` 可跳过测试目标。
+
+### 3. 安装
+
+```sh
+# 先暂存验证安装内容，不写系统目录
+DESTDIR=/tmp/ball-stage cmake --install build/release
+find /tmp/ball-stage -type f | sort
+
+# 确认无误后再真正安装
+sudo cmake --install build/release
+```
+
+安装后的文件（以 `CMAKE_INSTALL_PREFIX=/usr` 为例）：
+
+```
+/usr/bin/ball
+/usr/libexec/ball/socktrail
+/usr/lib/systemd/system/ball@.service
+/usr/share/applications/ball.desktop
+/usr/share/icons/hicolor/scalable/apps/ball.svg
+```
+
+## 运行
+
+### 后台服务（root，systemd）
+
+unit 是模板 `ball@.service`，实例名就是运行 GUI 的用户名：
+
+```sh
+# 前提：该用户必须有同名的私有组（见下节）
+sudo systemctl daemon-reload
+sudo systemctl enable --now ball@$USER.service
+
+systemctl status ball@$USER.service
+sudo systemctl restart ball@$USER.service
+sudo systemctl stop ball@$USER.service
+sudo systemctl disable --now ball@$USER.service
+```
+
+unit 以 `User=root Group=%i` 启动，创建运行目录 `/run/ball-%i`（`0750`，root 所有、
+组为 `%i`），并以
+`ExecStart=<bindir>/ball --daemon --socket /run/ball-%i/gui.sock --socktrail-bin <libexecdir>/ball/socktrail`
+运行。停止时先给守护进程发 SIGTERM，由它自己清理采集子进程；`TimeoutStopSec=10`
+之后才会强杀整个进程组。
+
+### GUI（普通用户）
+
+普通用户直接启动桌面程序即可，它默认连接 `/run/ball-<当前用户名>/gui.sock`：
+
+```sh
+ball              # 或从应用菜单启动「ball 流量悬浮窗」
+```
+
+也可以从 KDE 应用菜单启动（desktop 文件的 `Exec` 是绝对路径）。**不要用 sudo
+运行 GUI**：程序明确拒绝以 root 启动 GUI。
+
+## 界面操作
+
+- 左键点击流量条：展开 / 收起进程与网卡面板。
+- 拖动流量条：移动位置，靠近边缘时吸附；右键「锁定位置」只禁止移动，不禁止点击。
+- 右键「固定展开」：点击其他窗口时保留面板；Esc 仍可明确收起。
+- 面板可按列排序、按进程名 / PID 搜索，勾选「显示空闲」查看累计记录。
+- 右键选择统计网卡和背景透明度；文字保持不透明。首次默认只选启用的物理网卡。
+- 托盘或右键可隐藏 / 恢复界面；「退出 GUI」不会停止后台。
+
+### 前台开发运行
+
+开发时可以让 ball 同时充当后台：
+
+```sh
+# 手动启动时先准备目录及目标组；后台不会自动创建 /run 目录
+sudo install -d -o root -g "$(id -gn)" -m 0750 "/run/ball-$USER"
+sudo -g "$(id -gn)" ./build/dev/ball --daemon \
+    --socket "/run/ball-$USER/gui.sock" \
+    --socktrail-bin "$PWD/build/socktrail"
+# 前台后台用 Ctrl+C 停止；另开一个终端，以普通用户启动 GUI
+./build/dev/ball
+```
+
+`ball --help` 列出全部参数，`ball --version` 打印版本。daemon 模式**必须**指定
+绝对路径 `--socket`；`--socktrail-bin` 可省略，默认使用编译期安装路径。
+GUI 的 `--socket` 可省略，默认连接当前用户名对应的运行目录。
+
+## socket 权限与私有组
+
+- 运行目录 `/run/ball-<用户名>` 由 systemd 创建：`0750`、root 所有、组为同名私有组，
+  其他用户无法进入。
+- 快照 socket 本身权限是 `0660`：root 与同名私有组成员可读写，其他人不行。
+- systemd 启动实例时解析 `Group=%i`，该同名私有组必须存在，GUI 用户也须属于该组。
+  没有该组时可由管理员准备：
+
+```sh
+id -gn              # 当前用户的主组名，应与用户名一致
+getent group "$USER"  # 有输出且组名等于用户名即可
+# 缺少时（需要 root）：
+sudo groupadd "$USER" && sudo usermod -aG "$USER" "$USER"
+```
+
+只需同名组存在且用户属于它，不要求它一定是主组。新增补充组后需重新登录，
+使当前会话获得组权限；否则 GUI 仍可能无法连接。请不要改成所有用户可读写的 socket。
+
+## 数据口径
+
+ball 只把统计放在内存中，不落盘、不保存历史，因此：
+
+- **关闭 GUI 不会丢失数据**：后台继续采样与累计，重新打开窗口后仍显示同一后台会话
+  的累计值。
+- **后台重启会清零「今日」和「本次监测」**：`started` 变为新时刻，之前累计不再保留。
+- **首次有效采样之前都是 0**：第一帧只用于建立基线，不计入任何字节。
+- 「今日」为本地日期内的累计，跨本地午夜清空；「本次监测」从后台启动后的首次有效
+  采样开始累计，跨午夜不变。
+
+两种统计口径**不相等**，请不要把两个数字对齐：
+
+- 网卡视图：内核接口计数器的观测字节，包含无法归属到进程的流量。
+- 进程视图：TCP/UDP 应用 socket I/O 字节，不与接口字节相加。协议头、重传、回环、
+  代理、VPN 以及所选网卡范围都会使两者不同；进程合计可能小于，也可能大于网卡合计。
+- 首次默认选择启用的物理网卡，可在右键菜单修改；VPN、虚拟接口、回环不会默认混入。
+  选定接口统计并不等于运营商计费的纯互联网流量。
+- 采集器丢事件、未覆盖路径或网络命名空间限制可能导致进程统计不完整；界面会显示
+  已知的质量问题。跨午夜的区间按新日期归属，误差最多一个采样区间。
+
+## 诊断
+
+后台日志：
+
+```sh
+journalctl -u ball@$USER.service -b -n 100 --no-pager
+journalctl -u ball@$USER.service -f      # Ctrl+C 停止跟随
+```
+
+**界面没有任何数据**时按顺序检查：
+
+1. 后台是否在跑：`systemctl status ball@$USER.service`。
+2. socket 是否存在、权限是否正确：
+   `ls -l /run/ball-$USER/gui.sock`（应为 `srw-rw---- root <用户组>`）。
+3. GUI 与后台实例名是否一致（GUI 默认按当前用户名找 socket，后台 `%i` 由
+   `ball@<用户名>` 决定）。
+4. 采集器是否可执行：日志里出现 `no collector configured` 或采集器启动失败时，
+   检查 `<prefix>/libexec/ball/socktrail` 是否存在且可执行，或用 `--socktrail-bin`
+   显式指定。
+5. 内核是否支持采集：socktrail 依赖较新内核的 eBPF/BTF 与 AF_PACKET。若日志提示
+   BTF / eBPF 不可用，先确认内核与 `socktrail` 的运行环境；此时网卡视图通常仍有
+   数据，进程视图为空。
+
+网卡视图有数据、进程视图为空是常见状态，代表采集器不可用或未获得足够内核支持，
+而不是后台崩溃。
+
+## 构建与测试
+
+```sh
+cmake --preset dev          # Debug + BUILD_TESTING=ON，产物在 build/dev
+cmake --build --preset dev
+ctest --preset dev          # 全部单元测试
 
 cmake --preset release && cmake --build --preset release
 ```
 
-运行（必须在 KDE Wayland 会话中，否则会以错误退出）：
+测试不依赖桌面会话与 root；GUI 测试在 `QT_QPA_PLATFORM=offscreen` 下运行。
+本机还已验证：KDE Wayland layer-shell 的 Top 层、展开前后键盘策略、位置锁/面板固定，
+带沙箱的临时 systemd 后台、普通用户 socket 权限、真实 TCP/UDP 进程流量与退出清理。
+物理多屏热插拔和所有全屏应用组合尚未逐一人工验证。
+验证安装内容而不写系统目录：
 
 ```sh
-./build/dev/ball
+DESTDIR=/tmp/ball-stage cmake --install build/release
+desktop-file-validate /tmp/ball-stage/usr/share/applications/ball.desktop
+systemd-analyze verify /tmp/ball-stage/usr/lib/systemd/system/ball@.service
 ```
 
-安装到系统：
-
-```sh
-cmake --install build/release --prefix /usr/local
-```
-
-代码格式与静态检查：
-
-```sh
-clang-format -i src/daemon/*.cpp src/daemon/*.h tests/*.cpp
-# .clang-tidy 的 HeaderFilterRegex 只检查 src/ 与 tests/，AUTOMOC 产物不参与
-clang-tidy -p build/dev --removed-arg=-mno-direct-extern-access \
-    --checks='-*,bugprone-*,performance-*,clang-analyzer-*' --warnings-as-errors='*' \
-    src/daemon/interfaces.cpp src/daemon/traffic.cpp src/daemon/processes.cpp \
-    src/daemon/socktrail.cpp tests/traffic.cpp tests/processes.cpp tests/socktrail.cpp
-echo $?   # 非 0 表示有未处理的告警
-```
-
-`--removed-arg` 用于跳过 Qt 发行版注入、Clang 无法识别的
-`-mno-direct-extern-access` 编译参数。
-
-## 代码风格
-
-- 源码、标识符与注释使用英语；面向用户的界面文字（后续实现）统一使用简体中文；文档使用中文。
-- 缩进 4 空格，列宽 100，见 `.clang-format`。
-- 编译启用 `-Wall -Wextra -Wpedantic`，警告视为需要修复的问题。
+`systemd-analyze verify` 在暂存目录里会因为 `ExecStart` 的绝对路径在该前缀下不存在
+而报 `is not executable`——这是预期的暂存副作用；把 `ExecStart` 临时改成本地已构建
+的二进制后应验证通过，若仍有其他语法错误则是 unit 本身的问题。
 
 ## 目录结构
 
 ```
-CMakeLists.txt        构建入口：ball_daemon 静态库、ball 可执行文件与 CTest 单元测试
-CMakePresets.json     dev / release 的 configure、build、test presets
-.clang-tidy           只对 src/ 与 tests/ 源码报错，忽略 AUTOMOC 生成代码
-src/main.cpp          程序入口：CLI 解析与最小 layer-shell 窗口
-src/daemon/           流量统计核心：rtnetlink 网卡读取、按网卡与按进程的内存累计、socktrail 订阅
-  socktrail.h/.cpp   Unix socket NDJSON 客户端：帧解析校验、重连、可用性与新鲜度状态
-  interfaces.h/.cpp  rtnetlink 网卡读取
-  traffic.h/.cpp     按网卡累计
-  processes.h/.cpp   按进程累计
-tests/traffic.cpp     QtTest（QTEST_GUILESS_MAIN）：解析器 / 累计逻辑测试与只读网卡烟测
-tests/processes.cpp   QtTest（QTEST_GUILESS_MAIN）：进程累计的基线 / 差分 / 重启 / 跨日测试
-tests/socktrail.cpp   QtTest（QTEST_GUILESS_MAIN）：帧校验与本地 QLocalServer mock 端到端测试
+CMakeLists.txt          构建入口、安装规则、配置生成 unit / desktop
+CMakePresets.json       dev / release 的 configure、build、test presets
+packaging/              ball@.service.in、ball.desktop.in、ball.svg
+docs/protocol.md        后台与 GUI 之间的本地快照协议
+src/main.cpp            程序入口：CLI 解析与 layer-shell 窗口/Daemon 模式
+src/daemon/             流量核心：网卡读取、内存累计、socktrail 订阅、快照服务
+src/ui/                 无边框悬浮窗、进程/网卡面板、托盘与偏好
+tests/                  QtTest 单元测试与假采集器 fixture
 ```

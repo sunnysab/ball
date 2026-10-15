@@ -21,11 +21,6 @@
 #include <sys/signalfd.h>
 #include <unistd.h>
 
-#ifndef BALL_DEFAULT_COLLECTOR_PATH
-// The packaging layer supplies the real prefix; this keeps a bare build usable.
-#define BALL_DEFAULT_COLLECTOR_PATH "/usr/local/libexec/ball/socktrail"
-#endif
-
 namespace {
 
 // Blocks the termination signals before any Qt object exists, so every Qt
