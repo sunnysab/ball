@@ -1,6 +1,7 @@
 // ball: a network traffic HUD for KDE Wayland sessions.
 #include "ui/hud.h"
 
+#include "ui/autostart.h"
 #include "ui/format.h"
 #include "ui/placement.h"
 #include "ui/snapshot_client.h"
@@ -11,6 +12,7 @@
 #include <QAction>
 #include <QApplication>
 #include <QCheckBox>
+#include <QCoreApplication>
 #include <QEvent>
 #include <QFontMetrics>
 #include <QGridLayout>
@@ -22,6 +24,7 @@
 #include <QLabel>
 #include <QLineEdit>
 #include <QMenu>
+#include <QMessageBox>
 #include <QMouseEvent>
 #include <QPainter>
 #include <QPainterPath>
@@ -30,6 +33,8 @@
 #include <QScreen>
 #include <QSet>
 #include <QSettings>
+#include <QSignalBlocker>
+#include <QStandardPaths>
 #include <QSystemTrayIcon>
 #include <QTabWidget>
 #include <QTableView>
@@ -378,6 +383,27 @@ void Hud::buildContextMenu() {
                                                                : QStringLiteral("隐藏"));
     hideAction->setObjectName(QStringLiteral("hud.action.hide"));
     connect(hideAction, &QAction::triggered, this, [this] { setHiddenByUser(!m_hiddenByUser); });
+
+    const QString configDirectory =
+        QStandardPaths::writableLocation(QStandardPaths::ConfigLocation);
+    auto* autostartAction = m_contextMenu->addAction(QStringLiteral("登录时启动界面"));
+    autostartAction->setObjectName(QStringLiteral("hud.action.autostart"));
+    autostartAction->setCheckable(true);
+    autostartAction->setChecked(autostartEnabled(configDirectory));
+    autostartAction->setToolTip(QStringLiteral("登录后自动显示流量条；后台采集由独立服务管理"));
+    connect(autostartAction, &QAction::triggered, this,
+            [this, autostartAction, configDirectory](bool enabled) {
+                QString error;
+                if (!setAutostartEnabled(configDirectory, QCoreApplication::applicationFilePath(),
+                                         enabled, error)) {
+                    {
+                        const QSignalBlocker blocker(autostartAction);
+                        autostartAction->setChecked(autostartEnabled(configDirectory));
+                    }
+                    QMessageBox::warning(this, QStringLiteral("无法设置登录自启"),
+                                         QStringLiteral("无法保存设置：%1").arg(error));
+                }
+            });
 
     auto* lockAction = m_contextMenu->addAction(QStringLiteral("锁定位置"));
     lockAction->setObjectName(QStringLiteral("hud.action.lock"));

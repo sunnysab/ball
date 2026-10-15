@@ -33,6 +33,7 @@ add_library(ball_ui STATIC
     src/ui/traffic_model.cpp
     src/ui/placement.cpp
     src/ui/preferences.cpp
+    src/ui/autostart.cpp
     src/ui/hud.cpp
 )
 target_include_directories(ball_ui PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -93,6 +94,10 @@ if(BUILD_TESTING)
     qt_add_executable(ball_ui_test tests/ui.cpp)
     target_link_libraries(ball_ui_test PRIVATE Qt6::Test ball_ui)
 
+    qt_add_executable(ball_autostart_test tests/autostart.cpp)
+    # GUI-free: the helper only touches files, so the test needs no display.
+    target_link_libraries(ball_autostart_test PRIVATE Qt6::Test Qt6::Core ball_ui)
+
     qt_add_executable(ball_ui_preview tests/ui_preview.cpp)
     target_link_libraries(ball_ui_preview PRIVATE ball_ui)
 
@@ -105,6 +110,10 @@ if(BUILD_TESTING)
 
     add_test(NAME ball_ui COMMAND ball_ui_test)
     set_tests_properties(ball_ui PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 90)
+
+    add_test(NAME ball_autostart COMMAND ball_autostart_test)
+    set_tests_properties(ball_autostart PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
+        TIMEOUT 90)
 
     add_test(NAME ball_version COMMAND ball --version)
     set_tests_properties(ball_version PROPERTIES PASS_REGULAR_EXPRESSION "ball ${PROJECT_VERSION}")

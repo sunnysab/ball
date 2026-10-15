@@ -3,6 +3,7 @@
 // HUD widgets. A real QLocalServer mock stands in for the backend, so no root
 // and no network access are needed; the layer-shell protocol itself is verified
 // in a Wayland session instead.
+#include "ui/autostart.h"
 #include "ui/format.h"
 #include "ui/hud.h"
 #include "ui/placement.h"
@@ -12,6 +13,7 @@
 #include "ui/traffic_model.h"
 
 #include <QAbstractItemModel>
+#include <QAction>
 #include <QCheckBox>
 #include <QDateTime>
 #include <QGuiApplication>
@@ -22,8 +24,12 @@
 #include <QLineEdit>
 #include <QLocalServer>
 #include <QLocalSocket>
+#include <QMenu>
+#include <QScopeGuard>
+#include <QScreen>
 #include <QSettings>
 #include <QSignalSpy>
+#include <QStandardPaths>
 #include <QTabWidget>
 #include <QTableView>
 #include <QTemporaryDir>
@@ -189,6 +195,8 @@ private Q_SLOTS:
     void waylandDragSavesRequestedPosition();
     void escapeCollapsesAndPinKeepsPanel();
     void remembersPositionAndOpacity();
+    void contextMenuStaysCompact();
+    void autostartMenuUsesUserConfiguration();
 
 private:
     QString startServer();
@@ -861,6 +869,49 @@ void TestUi::remembersPositionAndOpacity() {
     QSettings settings(m_settingsPath, QSettings::IniFormat);
     QCOMPARE(ball::ui::Preferences::load(settings).opacity, 0.5);
     QVERIFY(ball::ui::Preferences::load(settings).hasPosition);
+}
+
+void TestUi::contextMenuStaysCompact() {
+    QSettings settings(m_settingsPath, QSettings::IniFormat);
+    Hud hud(startServer(), settings);
+    hud.show();
+    hud.openContextMenu(hud.mapToGlobal(QPoint(20, 20)));
+    auto* menu = hud.findChild<QMenu*>(u"hud.menu"_s);
+    QVERIFY(menu != nullptr);
+    QVERIFY(waitFor([menu] { return menu->isVisible(); }));
+    const auto bounds = hud.screen()->geometry();
+    QVERIFY(menu->width() < bounds.width() / 2);
+    QVERIFY(menu->height() < bounds.height() / 2);
+    menu->close();
+}
+
+void TestUi::autostartMenuUsesUserConfiguration() {
+    QTemporaryDir configuration;
+    QVERIFY(configuration.isValid());
+    const bool hadConfig = qEnvironmentVariableIsSet("XDG_CONFIG_HOME");
+    const auto previous = qgetenv("XDG_CONFIG_HOME");
+    qputenv("XDG_CONFIG_HOME", configuration.path().toUtf8());
+    const auto restore = qScopeGuard([hadConfig, previous] {
+        if (hadConfig) {
+            qputenv("XDG_CONFIG_HOME", previous);
+        } else {
+            qunsetenv("XDG_CONFIG_HOME");
+        }
+    });
+    QCOMPARE(QStandardPaths::writableLocation(QStandardPaths::ConfigLocation),
+             configuration.path());
+    QSettings settings(m_settingsPath, QSettings::IniFormat);
+    Hud hud(startServer(), settings);
+    auto* action = hud.findChild<QAction*>(u"hud.action.autostart"_s);
+    QVERIFY(action != nullptr);
+    QVERIFY(action->isCheckable());
+    QVERIFY(!action->isChecked());
+    action->trigger();
+    QVERIFY(action->isChecked());
+    QVERIFY(ball::ui::autostartEnabled(configuration.path()));
+    action->trigger();
+    QVERIFY(!action->isChecked());
+    QVERIFY(!ball::ui::autostartEnabled(configuration.path()));
 }
 
 QTEST_MAIN(TestUi)
