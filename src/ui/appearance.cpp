@@ -77,7 +77,6 @@ void applyTheme(QWidget& widget, Theme theme) {
             QToolButton { background: %5; border: 1px solid %6; border-radius: 6px;
                           padding: 6px 10px; }
             QToolButton:hover, QToolButton:checked { background: %7; border-color: %8; }
-            QComboBox { padding: 5px 9px; }
         )")
                              .arg(colors.muted.name(), colors.download.name(), colors.upload.name(),
                                   colors.warning.name(), colors.surface.name(),

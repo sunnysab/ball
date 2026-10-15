@@ -3,6 +3,7 @@
 // HUD widgets. A real QLocalServer mock stands in for the backend, so no root
 // and no network access are needed; the layer-shell protocol itself is verified
 // in a Wayland session instead.
+#include "process.h"
 #include "ui/autostart.h"
 #include "ui/details.h"
 #include "ui/format.h"
@@ -16,8 +17,8 @@
 #include <QAbstractItemModel>
 #include <QAction>
 #include <QCheckBox>
-#include <QComboBox>
 #include <QDateTime>
+#include <QFile>
 #include <QFontMetrics>
 #include <QGuiApplication>
 #include <QJsonArray>
@@ -45,6 +46,7 @@
 
 #include <cmath>
 #include <limits>
+#include <unistd.h>
 
 using ball::ui::Hud;
 using ball::ui::InterfaceKind;
@@ -206,7 +208,9 @@ private Q_SLOTS:
     void barLayoutsStayCompactAndDoNotClip();
     void themeChangesAreLocalAndKeepTextLegible();
     void fontChangesResizeTheBarWithoutClipping();
-    void periodSwitchKeepsNumericSortSearchAndHistory();
+    void allMetricsAreVisibleAndSortNumerically();
+    void commandLineFormattingPreservesArguments();
+    void processTooltipReadsVerifiedCommandLineAndEscapesMarkup();
     void processQualityDoesNotInvalidateInterfaceRates();
     void partialInterfaceSelectionIsVisible();
     void staleRatesAreUnavailableInBothWindows();
@@ -1087,34 +1091,77 @@ void TestUi::themeChangesAreLocalAndKeepTextLegible() {
     }
 }
 
-void TestUi::periodSwitchKeepsNumericSortSearchAndHistory() {
+void TestUi::allMetricsAreVisibleAndSortNumerically() {
     QSettings settings(m_settingsPath, QSettings::IniFormat);
     Hud hud(startServer(), settings);
     QVERIFY(acceptConnection() != nullptr);
     send(snapshotLine());
     auto* details = hud.detailsWindow();
-    auto* period = details->findChild<QComboBox*>(u"details.period"_s);
     auto* table = details->findChild<QTableView*>(u"details.processTable"_s);
     auto* search = details->findChild<QLineEdit*>(u"details.search"_s);
     QVERIFY(waitFor([table] { return table->model()->rowCount() == 2; }));
-    QCOMPARE(table->model()->columnCount(), 5);
-    for (int metric = 1; metric <= 2; ++metric) {
-        period->setCurrentIndex(metric);
-        // Historical processes with nonzero totals are useful even with idle hidden.
-        QCOMPARE(table->model()->rowCount(), 3);
+    QVERIFY(details->findChild<QObject*>(u"details.period"_s) == nullptr);
+    QCOMPARE(table->model()->columnCount(), 9);
+    for (int column = 3; column < 9; ++column) {
+        QVERIFY(!table->isColumnHidden(column));
+        table->sortByColumn(column, Qt::AscendingOrder);
+        QCOMPARE(findText(table->model(), 0, 0), u"code"_s);
+        table->sortByColumn(column, Qt::DescendingOrder);
         QCOMPARE(findText(table->model(), 0, 0), u"firefox"_s);
-        QVERIFY(!findText(table->model(), 0, 3).contains(u"/s"_s));
-        table->sortByColumn(3, Qt::AscendingOrder);
-        QCOMPARE(findText(table->model(), 0, 0), u"dead"_s);
-        search->setText(u"1234"_s);
-        QCOMPARE(table->model()->rowCount(), 1);
-        QCOMPARE(findText(table->model(), 0, 0), u"firefox"_s);
-        search->clear();
-        table->sortByColumn(3, Qt::DescendingOrder);
     }
-    period->setCurrentIndex(0);
-    QCOMPARE(table->model()->rowCount(), 2);
     QVERIFY(findText(table->model(), 0, 3).contains(u"/s"_s));
+    QVERIFY(!findText(table->model(), 0, 5).contains(u"/s"_s));
+    QVERIFY(!findText(table->model(), 0, 7).contains(u"/s"_s));
+    search->setText(u"1234"_s);
+    QCOMPARE(table->model()->rowCount(), 1);
+    search->clear();
+    details->findChild<QCheckBox*>(u"details.showIdle"_s)->setChecked(true);
+    QCOMPARE(table->model()->rowCount(), 3);
+    auto* interfaces = details->findChild<QTableView*>(u"details.interfaceTable"_s);
+    QCOMPARE(interfaces->model()->columnCount(), 9);
+}
+
+void TestUi::commandLineFormattingPreservesArguments() {
+    QCOMPARE(ball::ui::formatCommandLine({u"/usr/bin/app"_s, u"--flag"_s, u"two words"_s, u"a'b"_s,
+                                          QString(), u"$(whoami)"_s}),
+             u"/usr/bin/app --flag 'two words' 'a'\\''b' '' '$(whoami)'"_s);
+}
+
+void TestUi::processTooltipReadsVerifiedCommandLineAndEscapesMarkup() {
+    QFile stat(u"/proc/self/stat"_s);
+    QVERIFY(stat.open(QIODevice::ReadOnly));
+    const auto data = stat.readAll();
+    const auto ticks = data.mid(data.lastIndexOf(')') + 2).split(' ').at(19).toULongLong();
+    const auto hz = quint64(::sysconf(_SC_CLK_TCK));
+    const quint64 startNs = (ticks / hz) * 1'000'000'000 + (ticks % hz) * 1'000'000'000 / hz;
+    const int pid = int(QCoreApplication::applicationPid());
+    const auto argv = ball::readProcessCommandLine({pid, startNs});
+    QVERIFY(!argv.isEmpty());
+
+    QSettings settings(m_settingsPath, QSettings::IniFormat);
+    Hud hud(startServer(), settings);
+    const auto parsed = ball::ui::parseSnapshot(snapshotLine());
+    QVERIFY(parsed.snapshot.has_value());
+    auto snapshot = parsed.snapshot.value_or(Snapshot{});
+    auto& process = snapshot.processes.first();
+    process.pid = pid;
+    process.startNs = startNs;
+    process.name = u"tokio-rt-worker"_s;
+    hud.detailsWindow()->setSnapshot(snapshot, true, {u"eno1"_s});
+    auto* table = hud.detailsWindow()->findChild<QTableView*>(u"details.processTable"_s);
+    const auto index = table->model()->index(0, 0);
+    QCOMPARE(index.data().toString(), ball::readProcessName({pid, startNs}));
+    const auto tooltip = index.data(Qt::ToolTipRole).toString();
+    QVERIFY(tooltip.contains(ball::ui::formatCommandLine(argv).toHtmlEscaped()));
+    QVERIFY(!tooltip.contains(u"命令行不可用"_s));
+
+    process.pid = std::numeric_limits<int>::max();
+    process.name = u"<img src='x'>"_s;
+    hud.detailsWindow()->setSnapshot(snapshot, true, {u"eno1"_s});
+    const auto unavailable = table->model()->index(0, 0).data(Qt::ToolTipRole).toString();
+    QVERIFY(unavailable.contains(u"命令行不可用"_s));
+    QVERIFY(unavailable.contains(u"&lt;img"_s));
+    QVERIFY(!unavailable.contains(u"<img"_s));
 }
 
 void TestUi::processQualityDoesNotInvalidateInterfaceRates() {

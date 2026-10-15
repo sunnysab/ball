@@ -15,6 +15,11 @@ set(BALL_SOCKTRAIL_BINARY "" CACHE FILEPATH "External socktrail executable to in
 # enabled per target at creation time.
 qt_standard_project_setup()
 
+add_library(ball_process STATIC src/process.cpp)
+target_include_directories(ball_process PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_compile_options(ball_process PRIVATE -Wall -Wextra -Wpedantic)
+target_link_libraries(ball_process PUBLIC Qt6::Core)
+
 add_library(ball_daemon STATIC
     src/daemon/interfaces.cpp
     src/daemon/traffic.cpp
@@ -24,7 +29,7 @@ add_library(ball_daemon STATIC
 )
 target_include_directories(ball_daemon PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_compile_options(ball_daemon PRIVATE -Wall -Wextra -Wpedantic)
-target_link_libraries(ball_daemon PUBLIC Qt6::Core Qt6::Network)
+target_link_libraries(ball_daemon PUBLIC Qt6::Core Qt6::Network ball_process)
 
 add_library(ball_ui STATIC
     src/ui/snapshot.cpp
@@ -40,7 +45,7 @@ add_library(ball_ui STATIC
 )
 target_include_directories(ball_ui PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_compile_options(ball_ui PRIVATE -Wall -Wextra -Wpedantic)
-target_link_libraries(ball_ui PUBLIC Qt6::Widgets Qt6::Network LayerShellQt::Interface)
+target_link_libraries(ball_ui PUBLIC Qt6::Widgets Qt6::Network LayerShellQt::Interface ball_process)
 
 add_executable(ball src/main.cpp)
 target_compile_definitions(ball PRIVATE
@@ -75,6 +80,9 @@ if(BUILD_TESTING)
 
     qt_add_executable(ball_traffic_test tests/traffic.cpp)
     target_link_libraries(ball_traffic_test PRIVATE Qt6::Test ball_daemon)
+
+    qt_add_executable(ball_process_test tests/process.cpp)
+    target_link_libraries(ball_process_test PRIVATE Qt6::Test ball_daemon)
 
     qt_add_executable(ball_processes_test tests/processes.cpp)
     target_link_libraries(ball_processes_test PRIVATE Qt6::Test ball_daemon)
@@ -123,6 +131,9 @@ if(BUILD_TESTING)
     add_test(NAME ball_traffic COMMAND ball_traffic_test)
     # The core is GUI-free; keep the test runnable without a desktop session.
     set_tests_properties(ball_traffic PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
+    add_test(NAME ball_process COMMAND ball_process_test)
+    set_tests_properties(ball_process PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 
     add_test(NAME ball_processes COMMAND ball_processes_test)
     set_tests_properties(ball_processes PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")

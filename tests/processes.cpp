@@ -3,6 +3,7 @@
 
 #include <QDateTime>
 #include <QList>
+#include <QTemporaryDir>
 #include <QTest>
 #include <QTime>
 
@@ -35,6 +36,7 @@ class TestProcesses : public QObject {
     Q_OBJECT
 
 private Q_SLOTS:
+    void init() { QVERIFY(m_proc.isValid()); }
     void firstSampleEstablishesBaseline();
     void realElapsedAddsBothDirections();
     void newProcessCountsExistingBytes();
@@ -47,10 +49,13 @@ private Q_SLOTS:
     void wallClockStepKeepsMonotonicRates();
     void invalidSamplesAreRejected();
     void idleProcessRateIsZeroAndMissingPidIgnored();
+
+private:
+    QTemporaryDir m_proc;
 };
 
 void TestProcesses::firstSampleEstablishesBaseline() {
-    Processes processes;
+    Processes processes(m_proc.path());
     QVERIFY(processes.update({makeCounter(42, u"firefox"_s, 1000, {1'000'000, 2'000'000})},
                              referenceDate(), 0));
 
@@ -67,7 +72,7 @@ void TestProcesses::firstSampleEstablishesBaseline() {
 }
 
 void TestProcesses::realElapsedAddsBothDirections() {
-    Processes processes;
+    Processes processes(m_proc.path());
     processes.update({makeCounter(42, u"firefox"_s, 1000, {1'000, 2'000})}, referenceDate(), 0);
     processes.update({makeCounter(42, u"firefox"_s, 1000, {4'000, 3'000})}, referenceDate(),
                      10'000);
@@ -83,7 +88,7 @@ void TestProcesses::realElapsedAddsBothDirections() {
 }
 
 void TestProcesses::newProcessCountsExistingBytes() {
-    Processes processes;
+    Processes processes(m_proc.path());
     processes.update({makeCounter(42, u"firefox"_s, 1000, {1'000, 1'000})}, referenceDate(), 0);
     // pid 43 appears for the first time; its segment is already non-zero.
     processes.update({makeCounter(42, u"firefox"_s, 1000, {1'500, 1'500}),
@@ -99,7 +104,7 @@ void TestProcesses::newProcessCountsExistingBytes() {
 }
 
 void TestProcesses::recycledPidIsANewIdentity() {
-    Processes processes;
+    Processes processes(m_proc.path());
     processes.update({makeCounter(7, u"old"_s, 100, {1'000, 1'000})}, referenceDate(), 0);
     processes.update({makeCounter(7, u"old"_s, 100, {1'100, 1'100})}, referenceDate(), 1'000);
     // The PID is reused by a different incarnation: a separate row, not a
@@ -120,7 +125,7 @@ void TestProcesses::recycledPidIsANewIdentity() {
 }
 
 void TestProcesses::counterRollbackStartsNewSegment() {
-    Processes processes;
+    Processes processes(m_proc.path());
     processes.update({makeCounter(9, u"app"_s, 1, {10'000, 10'000})}, referenceDate(), 0);
     // rx restarted while tx kept growing: each direction is handled on its own.
     processes.update({makeCounter(9, u"app"_s, 1, {500, 12'000})}, referenceDate(), 1'000);
@@ -134,7 +139,7 @@ void TestProcesses::counterRollbackStartsNewSegment() {
 }
 
 void TestProcesses::absentProcessKeepsTotalsAndCountsOnReturn() {
-    Processes processes;
+    Processes processes(m_proc.path());
     processes.update({makeCounter(5, u"app"_s, 1, {1'000, 1'000})}, referenceDate(), 0);
     processes.update({makeCounter(5, u"app"_s, 1, {1'500, 1'500})}, referenceDate(), 1'000);
     QCOMPARE(processes.row(5, 1).session.rxBytes, quint64(500));
@@ -158,7 +163,7 @@ void TestProcesses::absentProcessKeepsTotalsAndCountsOnReturn() {
 }
 
 void TestProcesses::backendRestartRebasesAndKeepsTotals() {
-    Processes processes;
+    Processes processes(m_proc.path());
     processes.update({makeCounter(3, u"app"_s, 1, {1'000, 2'000})}, referenceDate(), 0);
     processes.update({makeCounter(3, u"app"_s, 1, {3'000, 4'000})}, referenceDate(), 1'000);
     QCOMPARE(processes.row(3, 1).session.rxBytes, quint64(2'000));
@@ -184,7 +189,7 @@ void TestProcesses::backendRestartRebasesAndKeepsTotals() {
 }
 
 void TestProcesses::crossingMidnightClearsTodayOnly() {
-    Processes processes;
+    Processes processes(m_proc.path());
     const QDateTime beforeMidnight(QDate(2026, 10, 14), QTime(23, 59, 50));
     processes.update({makeCounter(2, u"app"_s, 1, {100, 100})}, beforeMidnight, 0);
     const QDateTime afterMidnight(QDate(2026, 10, 15), QTime(0, 0, 10));
@@ -202,7 +207,7 @@ void TestProcesses::crossingMidnightClearsTodayOnly() {
 }
 
 void TestProcesses::zeroElapsedKeepsBaseline() {
-    Processes processes;
+    Processes processes(m_proc.path());
     processes.update({makeCounter(2, u"app"_s, 1, {1'000, 1'000})}, referenceDate(), 0);
     processes.update({makeCounter(2, u"app"_s, 1, {2'000, 2'000})}, referenceDate(), 0);
     QCOMPARE(processes.row(2, 1).today.rxBytes, quint64(0));
@@ -215,7 +220,7 @@ void TestProcesses::zeroElapsedKeepsBaseline() {
 }
 
 void TestProcesses::wallClockStepKeepsMonotonicRates() {
-    Processes processes;
+    Processes processes(m_proc.path());
     // Wall clock jumps five minutes backwards, monotonic time advances 10 s.
     processes.update({makeCounter(2, u"app"_s, 1, {1'000, 1'000})}, referenceDate(), 0);
     processes.update({makeCounter(2, u"app"_s, 1, {3'000, 2'000})}, referenceDate().addSecs(-300),
@@ -236,7 +241,7 @@ void TestProcesses::wallClockStepKeepsMonotonicRates() {
 }
 
 void TestProcesses::invalidSamplesAreRejected() {
-    Processes processes;
+    Processes processes(m_proc.path());
     QVERIFY(processes.update({makeCounter(2, u"app"_s, 1, {1'000, 1'000})}, referenceDate(), 0));
     QCOMPARE(processes.row(2, 1).session.rxBytes, quint64(0));
 
@@ -251,14 +256,14 @@ void TestProcesses::invalidSamplesAreRejected() {
     QCOMPARE(processes.row(2, 1).session.rxBytes, quint64(4'000));
     QCOMPARE(processes.row(2, 1).rate.rxBytesPerSecond, 400.0);
 
-    Processes fresh;
+    Processes fresh(m_proc.path());
     QVERIFY(!fresh.update({makeCounter(2, u"app"_s, 1, {1, 1})}, QDateTime(), 0));
     QVERIFY(!fresh.monitoringStart().isValid());
     QVERIFY(fresh.rows().isEmpty());
 }
 
 void TestProcesses::idleProcessRateIsZeroAndMissingPidIgnored() {
-    Processes processes;
+    Processes processes(m_proc.path());
     processes.update({makeCounter(2, u"app"_s, 1, {1'000, 1'000})}, referenceDate(), 0);
     // Idle process: counters did not move, so the rate stays zero but the
     // accumulated row survives.

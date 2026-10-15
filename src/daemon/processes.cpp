@@ -1,6 +1,8 @@
 // ball: a network traffic HUD for KDE Wayland sessions.
 #include "daemon/processes.h"
 
+#include "process.h"
+
 #include <QSet>
 
 namespace ball {
@@ -53,7 +55,13 @@ bool Processes::update(const QList<ProcessCounter>& counters, const QDateTime& n
         ProcessTraffic& row = m_rows[key];
         row.pid = counter.pid;
         row.startNs = counter.startNs;
-        row.name = counter.name;
+        // Collector comm can be a worker thread's name even when PID is TGID.
+        const QString name = readProcessName({counter.pid, counter.startNs}, m_procRoot);
+        if (!name.isEmpty()) {
+            row.name = name;
+        } else if (row.name.isEmpty()) {
+            row.name = counter.name;
+        }
         row.present = true;
 
         if (baselineOnly) {

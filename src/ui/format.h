@@ -4,6 +4,7 @@
 
 #include <QFont>
 #include <QString>
+#include <QStringList>
 
 namespace ball::ui {
 
@@ -20,5 +21,8 @@ QString formatBytes(quint64 bytes);
 // Placeholder shown when no fresh value exists. It uses the same fixed width as
 // a real value so the HUD does not jump when data appears or expires.
 QString unavailableRate();
+
+// A readable POSIX-shell representation that preserves argument boundaries.
+QString formatCommandLine(const QStringList& arguments);
 
 } // namespace ball::ui

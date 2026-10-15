@@ -47,6 +47,9 @@ struct ProcessTraffic {
 // accumulation continues across a backend session restart.
 class Processes {
 public:
+    explicit Processes(QString procRoot = QStringLiteral("/proc"))
+        : m_procRoot(std::move(procRoot)) {}
+
     // Feeds one snapshot of every process the backend currently knows.
     // `now` is wall-clock time (monitoring start and local date only),
     // `monotonicMs` a monotonic timestamp (e.g. QElapsedTimer::elapsed) used
@@ -68,6 +71,7 @@ private:
         quint64 txBytes = 0;
     };
 
+    QString m_procRoot;
     QMap<Key, ProcessTraffic> m_rows;
     QMap<Key, Baseline> m_baseline;
     QDateTime m_start;

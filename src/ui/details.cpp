@@ -1,12 +1,12 @@
 // ball: independent traffic details, fed by the HUD's existing subscription.
 #include "ui/details.h"
 
+#include "process.h"
 #include "ui/format.h"
 #include "ui/traffic_model.h"
 
 #include <QAbstractTableModel>
 #include <QCheckBox>
-#include <QComboBox>
 #include <QFrame>
 #include <QHBoxLayout>
 #include <QHeaderView>
@@ -37,6 +37,8 @@ struct TableRow {
     QList<double> keys;
     bool idle = false;
     QString search;
+    int pid = 0;
+    quint64 startNs = 0;
 };
 
 // One table's rows plus its filter. Sorting reads the numeric keys, so
@@ -82,6 +84,20 @@ public:
             return m_numericColumns.contains(index.column())
                        ? QVariant(int(Qt::AlignRight | Qt::AlignVCenter))
                        : QVariant(int(Qt::AlignLeft | Qt::AlignVCenter));
+        case Qt::ToolTipRole:
+            if (row.pid > 0) {
+                const auto arguments = readProcessCommandLine({row.pid, row.startNs});
+                const QString command =
+                    arguments.isEmpty()
+                        ? QStringLiteral(
+                              "命令行不可用：进程已退出、无读取权限、身份已变化或超过 64 KiB。")
+                        : formatCommandLine(arguments);
+                return QStringLiteral("<qt><b>%1 · PID %2</b><br>%3</qt>")
+                    .arg(
+                        row.texts.first().toHtmlEscaped(), QString::number(row.pid),
+                        command.toHtmlEscaped().replace(QLatin1Char('\n'), QStringLiteral("<br>")));
+            }
+            return {};
         case Qt::FontRole:
             return m_numericColumns.contains(index.column()) ? QVariant(numericFont()) : QVariant();
         case kSortRole:
@@ -154,7 +170,7 @@ private:
 Details::Details() : QWidget(nullptr, Qt::Window) {
     setObjectName(QStringLiteral("details"));
     setWindowTitle(QStringLiteral("ball · 流量详情"));
-    resize(780, 580);
+    resize(1180, 620);
     auto* layout = new QVBoxLayout(this);
     layout->setContentsMargins(20, 16, 20, 16);
     layout->setSpacing(14);
@@ -256,11 +272,6 @@ Details::Details() : QWidget(nullptr, Qt::Window) {
     m_showIdle = new QCheckBox(QStringLiteral("显示空闲"), this);
     m_showIdle->setObjectName(QStringLiteral("details.showIdle"));
     tools->addWidget(m_showIdle);
-    m_period = new QComboBox(this);
-    m_period->setObjectName(QStringLiteral("details.period"));
-    m_period->addItems(titles);
-    m_period->setAccessibleName(QStringLiteral("表格统计口径"));
-    tools->addWidget(m_period);
     layout->addLayout(tools);
 
     m_tabs = new QTabWidget(this);
@@ -273,14 +284,16 @@ Details::Details() : QWidget(nullptr, Qt::Window) {
     m_tabs->addTab(m_interfaceTable, QStringLiteral("网卡"));
     layout->addWidget(m_tabs, 1);
 
-    m_processTable->setModel(new TrafficTableModel({QStringLiteral("进程"), QStringLiteral("PID"),
-                                                    QStringLiteral("状态"), QStringLiteral("下行"),
-                                                    QStringLiteral("上行")},
-                                                   {3, 4}, this));
+    m_processTable->setModel(new TrafficTableModel(
+        {QStringLiteral("进程"), QStringLiteral("PID"), QStringLiteral("状态"),
+         QStringLiteral("当前↓"), QStringLiteral("当前↑"), QStringLiteral("今日↓"),
+         QStringLiteral("今日↑"), QStringLiteral("本次↓"), QStringLiteral("本次↑")},
+        {3, 4, 5, 6, 7, 8}, this));
     m_interfaceTable->setModel(new TrafficTableModel(
         {QStringLiteral("网卡"), QStringLiteral("类型"), QStringLiteral("状态"),
-         QStringLiteral("下行"), QStringLiteral("上行")},
-        {3, 4}, this));
+         QStringLiteral("当前↓"), QStringLiteral("当前↑"), QStringLiteral("今日↓"),
+         QStringLiteral("今日↑"), QStringLiteral("本次↓"), QStringLiteral("本次↑")},
+        {3, 4, 5, 6, 7, 8}, this));
     for (QTableView* table : {m_processTable, m_interfaceTable}) {
         table->setSortingEnabled(true);
         table->setSelectionBehavior(QAbstractItemView::SelectRows);
@@ -292,12 +305,12 @@ Details::Details() : QWidget(nullptr, Qt::Window) {
         table->verticalHeader()->hide();
         table->verticalHeader()->setDefaultSectionSize(36);
         table->horizontalHeader()->setSectionResizeMode(QHeaderView::ResizeToContents);
+        table->horizontalHeader()->setMinimumSectionSize(80);
         table->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Stretch);
         table->sortByColumn(3, Qt::DescendingOrder);
     }
     connect(m_search, &QLineEdit::textChanged, this, &Details::filterTables);
     connect(m_showIdle, &QCheckBox::toggled, this, &Details::filterTables);
-    connect(m_period, &QComboBox::currentIndexChanged, this, &Details::rebuildTables);
     connect(m_tabs, &QTabWidget::currentChanged, this, [this](int index) {
         m_search->setPlaceholderText(index == 0 ? QStringLiteral("搜索进程名或 PID")
                                                 : QStringLiteral("搜索网卡名"));
@@ -356,33 +369,40 @@ void Details::rebuildTables() {
     QList<TableRow> processes;
     QList<TableRow> interfaces;
     if (m_snapshot.has_value()) {
-        const int period = m_period->currentIndex();
         const bool processUsable =
             m_fresh && m_snapshot->processStatus.available && !m_snapshot->processStatus.stale;
         const bool interfaceUsable = m_fresh && m_snapshot->interfacesAvailable;
-        // The same five-column table changes metric, retaining search and numeric sort.
-        const auto addValues = [period](TableRow& target, const auto& row, bool usable) {
-            const ByteCounters bytes = period == 1 ? row.today : row.session;
-            const bool rates = period == 0;
-            target.texts.append(rates ? (usable ? formatRate(row.rxBps) : unavailableRate())
-                                      : formatBytes(bytes.rxBytes));
-            target.texts.append(rates ? (usable ? formatRate(row.txBps) : unavailableRate())
-                                      : formatBytes(bytes.txBytes));
-            target.keys = {0, 0, 0, rates ? row.rxBps : double(bytes.rxBytes),
-                           rates ? row.txBps : double(bytes.txBytes)};
-            target.idle = rates ? row.rxBps == 0.0 && row.txBps == 0.0
-                                : bytes.rxBytes == 0 && bytes.txBytes == 0;
+        const auto addValues = [](TableRow& target, const auto& row, bool usable) {
+            target.texts.append({usable ? formatRate(row.rxBps) : unavailableRate(),
+                                 usable ? formatRate(row.txBps) : unavailableRate(),
+                                 formatBytes(row.today.rxBytes), formatBytes(row.today.txBytes),
+                                 formatBytes(row.session.rxBytes),
+                                 formatBytes(row.session.txBytes)});
+            target.keys = {0,
+                           0,
+                           0,
+                           row.rxBps,
+                           row.txBps,
+                           double(row.today.rxBytes),
+                           double(row.today.txBytes),
+                           double(row.session.rxBytes),
+                           double(row.session.txBytes)};
+            target.idle = row.rxBps == 0.0 && row.txBps == 0.0;
         };
         for (const auto& row : m_snapshot->processes) {
             TableRow item;
-            item.texts = {row.name.isEmpty() ? QStringLiteral("(未知)") : row.name,
+            const QString name = readProcessName({row.pid, row.startNs});
+            const QString displayName = name.isEmpty() ? row.name : name;
+            item.texts = {displayName.isEmpty() ? QStringLiteral("(未知)") : displayName,
                           QString::number(row.pid),
                           row.present ? QStringLiteral("当前") : QStringLiteral("历史")};
             addValues(item, row, processUsable);
-            if (period == 0 && !row.present) {
+            if (!row.present) {
                 item.idle = true;
             }
-            item.search = row.name + QLatin1Char(' ') + QString::number(row.pid);
+            item.search = displayName + QLatin1Char(' ') + QString::number(row.pid);
+            item.pid = row.pid;
+            item.startNs = row.startNs;
             processes.append(item);
         }
         for (const auto& row : m_snapshot->interfaces) {

@@ -7,7 +7,6 @@
 #include <QWidget>
 
 class QCheckBox;
-class QComboBox;
 class QLabel;
 class QLineEdit;
 class QTabWidget;
@@ -41,7 +40,6 @@ private:
     QWidget* m_quality = nullptr;
     QLabel* m_qualitySummary = nullptr;
     QLabel* m_qualityReasons = nullptr;
-    QComboBox* m_period = nullptr;
     QLineEdit* m_search = nullptr;
     QCheckBox* m_showIdle = nullptr;
     QTabWidget* m_tabs = nullptr;

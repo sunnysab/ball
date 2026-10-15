@@ -2,6 +2,7 @@
 #include "ui/format.h"
 
 #include <QLocale>
+#include <QRegularExpression>
 
 #include <cmath>
 
@@ -48,6 +49,20 @@ QString formatBytes(quint64 bytes) { return formatValue(static_cast<double>(byte
 QString unavailableRate() {
     return QStringLiteral("--").rightJustified(kNumberWidth) + QLatin1Char(' ') +
            QString(kRateUnitWidth, QLatin1Char(' '));
+}
+
+QString formatCommandLine(const QStringList& arguments) {
+    static const QRegularExpression unsafe(QStringLiteral("[^A-Za-z0-9_@%+=:,./-]"));
+    QStringList quoted;
+    quoted.reserve(arguments.size());
+    for (QString argument : arguments) {
+        if (argument.isEmpty() || argument.contains(unsafe)) {
+            argument.replace(QLatin1Char('\''), QStringLiteral("'\\''"));
+            argument = QLatin1Char('\'') + argument + QLatin1Char('\'');
+        }
+        quoted.append(argument);
+    }
+    return quoted.join(QLatin1Char(' '));
 }
 
 } // namespace ball::ui
