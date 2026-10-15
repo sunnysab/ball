@@ -200,7 +200,6 @@ int main(int argc, char* argv[]) {
     if (::geteuid() == 0) {
         return fail(QStringLiteral("refusing to run the GUI as root"), 1);
     }
-    qputenv("QT_WAYLAND_SHELL_INTEGRATION", "layer-shell");
     QApplication app(argc, argv);
     QCoreApplication::setOrganizationName(QStringLiteral("ball"));
     QCoreApplication::setApplicationName(QStringLiteral("ball"));
