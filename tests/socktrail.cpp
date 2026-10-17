@@ -17,6 +17,7 @@
 #include <initializer_list>
 #include <limits>
 
+using ball::ConnectionSnapshot;
 using ball::ProcessTraffic;
 using ball::Socktrail;
 using ball::SocktrailFrame;
@@ -57,9 +58,12 @@ struct Process {
 };
 
 // The quality section: every field a real stats frame carries besides the table.
+// `ktlsStatus` is appended to the pid probe when non-empty, mirroring the
+// optional upstream probes.ktls object.
 void writeQuality(ball::test::Writer& writer, quint64 kernelLost = 0, quint64 dropped = 0,
                   quint64 invalid = 0, quint64 expiredCount = 0, quint64 unindexedRx = 0,
-                  quint64 unindexedTx = 0, quint64 unmatchedBytes = 0) {
+                  quint64 unindexedTx = 0, quint64 unmatchedBytes = 0,
+                  const QString& ktlsStatus = QString()) {
     msgpack::packer<msgpack::sbuffer>& packer = writer.packer();
     writer.key(QLatin1StringView("io_unindexed"));
     packer.pack_map(2);
@@ -78,7 +82,7 @@ void writeQuality(ball::test::Writer& writer, quint64 kernelLost = 0, quint64 dr
     writer.key(QLatin1StringView("io_unmatched_bytes"));
     packer.pack(unmatchedBytes);
     writer.key(QLatin1StringView("probes"));
-    packer.pack_map(1);
+    packer.pack_map(ktlsStatus.isEmpty() ? 1 : 2);
     writer.key(QLatin1StringView("pid"));
     packer.pack_map(3);
     writer.key(QLatin1StringView("kernel_lost"));
@@ -87,6 +91,12 @@ void writeQuality(ball::test::Writer& writer, quint64 kernelLost = 0, quint64 dr
     packer.pack(dropped);
     writer.key(QLatin1StringView("invalid"));
     packer.pack(invalid);
+    if (!ktlsStatus.isEmpty()) {
+        writer.key(QLatin1StringView("ktls"));
+        packer.pack_map(1);
+        writer.key(QLatin1StringView("status"));
+        writer.text(ktlsStatus);
+    }
 }
 
 // The collector-run IP totals a healthy fixture reports. The real publisher
@@ -166,31 +176,67 @@ QByteArray statsWithIp(const QDateTime& at, QLatin1StringView name,
     });
 }
 
-QByteArray helloLine(const QDateTime& started = kStarted, int version = 1) {
+QByteArray helloLine(const QDateTime& started = kStarted, int version = 1,
+                     const QStringList& kinds = {}) {
     return ball::test::envelope(u"hello"_s, QLatin1StringView("hello"),
                                 [&](ball::test::Writer& writer) {
                                     msgpack::packer<msgpack::sbuffer>& packer = writer.packer();
-                                    packer.pack_map(2);
+                                    packer.pack_map(kinds.isEmpty() ? 2 : 3);
                                     writer.key(QLatin1StringView("version"));
                                     packer.pack(version);
                                     writer.key(QLatin1StringView("started"));
                                     writer.timestamp(started);
+                                    if (!kinds.isEmpty()) {
+                                        // The hello declares what the socket
+                                        // publishes, so a subscriber need not
+                                        // wait for a flow frame to learn it.
+                                        writer.key(QLatin1StringView("kinds"));
+                                        packer.pack_array(uint32_t(kinds.size()));
+                                        for (const QString& kind : kinds) {
+                                            writer.text(kind);
+                                        }
+                                    }
                                 });
 }
 
-// A flow frame: legal, but never allowed to feed the totals.
-QByteArray flowLine(const QString& padding = QString()) {
+// A complete flow frame with the required fields a real connection row always
+// carries. The counters are cumulative since first observation, so a later
+// frame with the same ID must replace them, never add up. `padding` rides in an
+// unrelated field that the decoder ignores, which keeps the frame's size under
+// the test's control.
+QByteArray flowLine(quint64 id = 1, quint64 rxBytes = 1'000'000, quint64 txBytes = 2'000'000,
+                    const QString& padding = QString()) {
+    const QDateTime first = kStarted;
+    const QDateTime last = kStarted.addSecs(5);
     return ball::test::envelope(u"flow"_s, QLatin1StringView("flow"),
                                 [&](ball::test::Writer& writer) {
                                     msgpack::packer<msgpack::sbuffer>& packer = writer.packer();
-                                    packer.pack_map(3);
-                                    writer.key(QLatin1StringView("pid"));
-                                    packer.pack(99);
+                                    packer.pack_map(padding.isEmpty() ? 9 : 10);
+                                    writer.key(QLatin1StringView("id"));
+                                    packer.pack(id);
+                                    writer.key(QLatin1StringView("protocol"));
+                                    writer.text(u"TCP"_s);
+                                    writer.key(QLatin1StringView("source"));
+                                    writer.text(u"10.0.0.2:40000"_s);
+                                    writer.key(QLatin1StringView("target"));
+                                    writer.text(u"10.0.0.5:443"_s);
+                                    writer.key(QLatin1StringView("first_seen"));
+                                    writer.timestamp(first);
+                                    writer.key(QLatin1StringView("last_seen"));
+                                    writer.timestamp(last);
                                     writer.key(QLatin1StringView("rx_bytes"));
-                                    packer.pack(uint64_t(5'000'000));
+                                    packer.pack(rxBytes);
                                     writer.key(QLatin1StringView("tx_bytes"));
-                                    packer.pack(uint64_t(6'000'000));
-                                    (void)padding;
+                                    packer.pack(txBytes);
+                                    writer.key(QLatin1StringView("packets"));
+                                    packer.pack(rxBytes + txBytes);
+                                    if (!padding.isEmpty()) {
+                                        // An unknown key the decoder ignores,
+                                        // so a large frame stays legal and
+                                        // still spans several reads.
+                                        writer.key(QLatin1StringView("pad"));
+                                        writer.text(padding);
+                                    }
                                 });
 }
 
@@ -225,7 +271,11 @@ private Q_SLOTS:
     void helloThenFirstStats();
     void statsBeforeHelloIsRejected();
     void accumulatedStatsAcrossSplitFrames();
-    void flowFramesAreIgnored();
+    void connectionCacheIsReplacedAndSampled();
+    void flowBeforeHelloIsRejected();
+    void malformedFlowIsRejected();
+    void helloResetRebuildsConnectionCache();
+    void flowAloneIsNotFreshStats();
     void ipCountersFollowTheLatestStatsFrame();
     void badFrameDoesNotPartiallyUpdateIpCounters();
     void collectorRestartOverwritesIpCounters();
@@ -233,6 +283,7 @@ private Q_SLOTS:
     void newerStatsSupersedePendingStats();
     void firstConnectionFailureIsNotHistoricalGap();
     void qualityNotesMakeObservationIncomplete();
+    void diagnosticsAreNotDataLoss();
     void rejectedFrameLeavesStateUntouched();
     void disconnectAndReconnectBridgesGap();
     void reconnectAfterBackendRestartRebaselines();
@@ -327,9 +378,74 @@ void TestSocktrail::frameValidation() {
                  .status,
              SocktrailFrameStatus::ProtocolError);
 
-    // A flow frame is a legal object that must not yield any process data.
-    QCOMPARE(decode(flowLine()).status, SocktrailFrameStatus::Ignored);
+    // A flow frame is a legal object that carries exactly one connection row.
+    const SocktrailFrame flow = decode(flowLine());
+    QCOMPARE(flow.status, SocktrailFrameStatus::Flow);
+    QCOMPARE(flow.connection.id, quint64(1));
+    QCOMPARE(flow.connection.protocol, u"TCP"_s);
+    QCOMPARE(flow.connection.source, u"10.0.0.2:40000"_s);
+    QCOMPARE(flow.connection.target, u"10.0.0.5:443"_s);
+    QCOMPARE(flow.connection.rxBytes, quint64(1'000'000));
+    QCOMPARE(flow.connection.txBytes, quint64(2'000'000));
+    QCOMPARE(flow.connection.packets, quint64(3'000'000));
+    QVERIFY(flow.connection.firstSeen.isValid());
+    QVERIFY(flow.connection.lastSeen.isValid());
 
+    // A hello that declares flow makes the connection section available
+    // without waiting for the first frame.
+    const SocktrailFrame advertised =
+        decode(helloLine(kStarted, 1, {QStringLiteral("stats"), QStringLiteral("flow")}));
+    QCOMPARE(advertised.status, SocktrailFrameStatus::Hello);
+    QVERIFY(advertised.connectionsAdvertised);
+    QVERIFY(!decode(helloLine()).connectionsAdvertised);
+    // A non-array `kinds` is malformed, not merely empty.
+    QCOMPARE(decode(ball::test::envelope(u"hello"_s, QLatin1StringView("hello"),
+                                         [](ball::test::Writer& writer) {
+                                             msgpack::packer<msgpack::sbuffer>& packer =
+                                                 writer.packer();
+                                             packer.pack_map(3);
+                                             writer.key(QLatin1StringView("version"));
+                                             packer.pack(1);
+                                             writer.key(QLatin1StringView("started"));
+                                             writer.timestamp(kStarted);
+                                             writer.key(QLatin1StringView("kinds"));
+                                             packer.pack_map(0);
+                                         }))
+                 .status,
+             SocktrailFrameStatus::ProtocolError);
+
+    // The fields the connection page depends on are required on a flow frame,
+    // even though the snapshot decoder treats them as optional.
+    const auto missingFlowField = [](QLatin1StringView key) {
+        return ball::test::patchFrame(flowLine(), [key](msgpack::object& root, msgpack::zone&) {
+            msgpack::object* flow = ball::test::member(root, QLatin1StringView("flow"));
+            QVERIFY(flow != nullptr);
+            QVERIFY(ball::test::removeMember(*flow, key));
+        });
+    };
+    for (const QLatin1StringView key :
+         {QLatin1StringView("protocol"), QLatin1StringView("source"), QLatin1StringView("target"),
+          QLatin1StringView("first_seen"), QLatin1StringView("last_seen"),
+          QLatin1StringView("rx_bytes"), QLatin1StringView("tx_bytes"),
+          QLatin1StringView("packets")}) {
+        QCOMPARE(decode(missingFlowField(key)).status, SocktrailFrameStatus::ProtocolError);
+    }
+    // A zero ID is not a connection identity, and a broken counter rejects the
+    // row whole rather than partially filling it.
+    QCOMPARE(decode(flowLine(0)).status, SocktrailFrameStatus::ProtocolError);
+    QCOMPARE(decode(ball::test::patchFrame(flowLine(),
+                                           [](msgpack::object& root, msgpack::zone&) {
+                                               msgpack::object* flow = ball::test::member(
+                                                   root, QLatin1StringView("flow"));
+                                               QVERIFY(flow != nullptr);
+                                               msgpack::object* rx = ball::test::member(
+                                                   *flow, QLatin1StringView("rx_bytes"));
+                                               QVERIFY(rx != nullptr);
+                                               rx->type = msgpack::type::NEGATIVE_INTEGER;
+                                               rx->via.i64 = -1;
+                                           }))
+                 .status,
+             SocktrailFrameStatus::ProtocolError);
     // Malformed, unknown and non-object frames are protocol errors.
     QCOMPARE(decode(frame([](ball::test::Writer& writer) {
                  writer.packer().pack_array(2);
@@ -655,24 +771,131 @@ void TestSocktrail::accumulatedStatsAcrossSplitFrames() {
     QVERIFY(client.processes().row(7, 500).rate.rxBytesPerSecond > 0.0);
 }
 
-void TestSocktrail::flowFramesAreIgnored() {
+void TestSocktrail::connectionCacheIsReplacedAndSampled() {
     Socktrail client;
     client.start(startServer());
     QVERIFY(acceptConnection());
-    send(helloLine());
+    QVERIFY(!client.connectionsAvailable());
+    send(helloLine(kStarted, 1, {QStringLiteral("stats"), QStringLiteral("flow")}));
+    QTRY_VERIFY(client.connectionsAvailable());
     send(statsLine(QDateTime::fromString(u"2026-10-13T14:00:01Z"_s, Qt::ISODate),
                    {Process{7, 500, u"curl"_s, 1'000, 0}}));
     QTRY_VERIFY(client.available());
-    QTest::qWait(30);
 
-    // Flow frames name one connection's bytes; they must not feed the totals,
-    // add any identity, or refresh the freshness clock.
-    send(flowLine());
-    send(statsLine(QDateTime::fromString(u"2026-10-13T14:00:02Z"_s, Qt::ISODate),
-                   {Process{7, 500, u"curl"_s, 1'100, 0}}));
-    QTRY_COMPARE(client.processes().row(7, 500).session.rxBytes, quint64(100));
+    // The first flow frame only records a baseline once the next stats frame
+    // samples it: no rate yet.
+    send(flowLine(1, 1'000, 2'000));
+    QTRY_COMPARE(client.connections().rows().size(), 1);
+    ConnectionSnapshot row = client.connections().rows().first();
+    QCOMPARE(row.id, quint64(1));
+    QCOMPARE(row.rxBytes, quint64(1'000));
+    QCOMPARE(row.rxBps, 0.0);
+
+    // Flow frames never feed the process totals or add an identity there.
     QCOMPARE(client.processes().rows().size(), 1);
     QCOMPARE(client.processes().row(99, 1).present, false);
+
+    // A later frame with the same ID and larger cumulative counters replaces
+    // the row, never adds to it, and the next stats interval samples a rate.
+    QTest::qWait(30);
+    send(statsLine(QDateTime::fromString(u"2026-10-13T14:00:02Z"_s, Qt::ISODate),
+                   {Process{7, 500, u"curl"_s, 1'100, 0}}));
+    QTRY_COMPARE(client.connections().rows().first().rxBps, 0.0); // baseline
+    send(flowLine(1, 3'000, 2'000));
+    QTRY_COMPARE(client.connections().rows().first().rxBytes, quint64(3'000));
+    QTest::qWait(30);
+    send(statsLine(QDateTime::fromString(u"2026-10-13T14:00:03Z"_s, Qt::ISODate),
+                   {Process{7, 500, u"curl"_s, 1'200, 0}}));
+    QTRY_VERIFY(client.connections().rows().first().rxBps > 0.0);
+    row = client.connections().rows().first();
+    QCOMPARE(row.rxBytes, quint64(3'000));
+}
+
+void TestSocktrail::flowBeforeHelloIsRejected() {
+    Socktrail client;
+    client.start(startServer());
+    QVERIFY(acceptConnection());
+
+    // A flow frame may not identify the session before the hello does.
+    send(flowLine());
+    QTRY_VERIFY(!client.error().isEmpty());
+    QVERIFY(client.connections().rows().isEmpty());
+    QVERIFY(!client.connectionsAvailable());
+}
+
+void TestSocktrail::malformedFlowIsRejected() {
+    Socktrail client;
+    client.start(startServer());
+    QVERIFY(acceptConnection());
+    send(helloLine(kStarted, 1, {QStringLiteral("flow")}));
+    send(statsLine(QDateTime::fromString(u"2026-10-13T14:00:01Z"_s, Qt::ISODate),
+                   {Process{7, 500, u"curl"_s, 1'000, 0}}));
+    QTRY_VERIFY(client.available());
+    send(flowLine(1, 10, 20));
+    QTRY_COMPARE(client.connections().rows().size(), 1);
+
+    // A flow frame whose required counter is missing drops the connection
+    // instead of silently dropping the row.
+    send(ball::test::patchFrame(flowLine(2, 30, 40), [](msgpack::object& root, msgpack::zone&) {
+        msgpack::object* flow = ball::test::member(root, QLatin1StringView("flow"));
+        QVERIFY(flow != nullptr);
+        QVERIFY(ball::test::removeMember(*flow, QLatin1StringView("rx_bytes")));
+    }));
+    QTRY_VERIFY(!client.available());
+    QVERIFY(!client.error().isEmpty());
+    // The real cache is cleared with the connection.
+    QVERIFY(client.connections().rows().isEmpty());
+}
+
+void TestSocktrail::helloResetRebuildsConnectionCache() {
+    Socktrail client;
+    client.start(startServer());
+    QVERIFY(acceptConnection());
+    send(helloLine(kStarted, 1, {QStringLiteral("flow")}));
+    send(statsLine(QDateTime::fromString(u"2026-10-13T14:00:01Z"_s, Qt::ISODate),
+                   {Process{7, 500, u"curl"_s, 1'000, 0}}));
+    QTRY_VERIFY(client.available());
+    send(flowLine(1, 10, 20));
+    QTRY_COMPARE(client.connections().rows().size(), 1);
+
+    // A reconnect to the same collector restarts with a new hello. The cache is
+    // rebuilt because the disconnect may have hidden an `end` or an ID reuse.
+    m_client->close();
+    QTRY_VERIFY(!client.connectionsAvailable());
+    QVERIFY(client.connections().rows().isEmpty());
+    QVERIFY(acceptConnection(4000));
+    send(helloLine(kStarted, 1, {QStringLiteral("flow")}));
+    QTRY_VERIFY(client.connectionsAvailable());
+    QVERIFY(client.connections().rows().isEmpty());
+    send(statsLine(QDateTime::fromString(u"2026-10-13T14:00:03Z"_s, Qt::ISODate),
+                   {Process{7, 500, u"curl"_s, 1'500, 0}}));
+    QTRY_VERIFY(client.available());
+    send(flowLine(1, 50, 60));
+    QTRY_COMPARE(client.connections().rows().size(), 1);
+    QCOMPARE(client.connections().rows().first().rxBytes, quint64(50));
+}
+
+void TestSocktrail::flowAloneIsNotFreshStats() {
+    Socktrail client;
+    client.start(startServer());
+    QVERIFY(acceptConnection());
+    // No `kinds`: a legal flow frame is the first proof the collector supports
+    // connections.
+    send(helloLine());
+    QVERIFY(!client.connectionsAvailable());
+    send(statsLine(QDateTime::fromString(u"2026-10-13T14:00:01Z"_s, Qt::ISODate),
+                   {Process{7, 500, u"curl"_s, 1'000, 0}}));
+    QTRY_VERIFY(client.available());
+    send(flowLine());
+    QTRY_VERIFY(client.connectionsAvailable());
+
+    // A flow frame must not restart the freshness timer, so the stats window
+    // still expires.
+    QTest::qWait(Socktrail::kStatsTimeoutMs + 300);
+    QVERIFY(client.stale());
+    QVERIFY(!client.error().isEmpty());
+    // And it must not have kept the process totals fresh either.
+    QVERIFY(client.available());
 }
 
 void TestSocktrail::ipCountersFollowTheLatestStatsFrame() {
@@ -838,7 +1061,7 @@ void TestSocktrail::newerStatsSupersedePendingStats() {
                                  {Process{7, 500, u"app"_s, 1'400, 0}}, 40, 400);
     batch += statsLine(QDateTime::fromString(u"2026-10-13T14:00:03Z"_s, Qt::ISODate),
                        {Process{7, 500, u"app"_s, 2'100, 0}}, 70, 700);
-    batch += flowLine(QString(3LL * 1024 * 1024, u'x'));
+    batch += flowLine(5, 1'000, 2'000, QString(3LL * 1024 * 1024, u'x'));
     batch += statsLine(QDateTime::fromString(u"2026-10-13T14:00:04Z"_s, Qt::ISODate),
                        {Process{7, 500, u"app"_s, 2'600, 0}}, 90, 900);
     send(batch);
@@ -866,8 +1089,8 @@ void TestSocktrail::firstConnectionFailureIsNotHistoricalGap() {
 }
 
 void TestSocktrail::qualityNotesMakeObservationIncomplete() {
-    // A stats frame that lost PID events and unindexed bytes: the totals it
-    // carries are still applied, but the observation is not complete.
+    // Real losses (pipcked events, unindexed bytes) make the observation
+    // incomplete; explanations (expired IDs, unmatched I/O) do not.
     const SocktrailFrame frame = decode(statsFrame([](ball::test::Writer& writer) {
         msgpack::packer<msgpack::sbuffer>& packer = writer.packer();
         packer.pack_map(7);
@@ -880,11 +1103,15 @@ void TestSocktrail::qualityNotesMakeObservationIncomplete() {
     }));
     QCOMPARE(frame.status, SocktrailFrameStatus::Ok);
     QCOMPARE(frame.counters.size(), 1);
-    QCOMPARE(frame.qualityNotes.size(), 4);
-    // Socket I/O that matched no connection is named explicitly: it is missing
-    // from every process row, so a reader must be told about it.
-    QVERIFY(frame.qualityNotes.last().contains(u"unmatched socket I/O"_s));
-    QVERIFY(frame.qualityNotes.last().contains(u"7777"_s));
+    // PID losses and unindexed bytes are gaps in the process totals.
+    QCOMPARE(frame.qualityNotes.size(), 2);
+    QVERIFY(frame.qualityNotes.first().contains(u"PID events"_s));
+    // Expired identities and unmatched socket I/O explain the table without
+    // claiming it undercounts.
+    QCOMPARE(frame.infoNotes.size(), 2);
+    QVERIFY(frame.infoNotes.first().contains(u"expired PIDs"_s));
+    QVERIFY(frame.infoNotes.last().contains(u"unmatched socket I/O"_s));
+    QVERIFY(frame.infoNotes.last().contains(u"7777"_s));
 
     // Lost events are never added to a process total, and the notes mark the
     // observation as incomplete instead of silently discarding the loss.
@@ -903,7 +1130,7 @@ void TestSocktrail::qualityNotesMakeObservationIncomplete() {
         writeQuality(writer, 2, 3, 4, 1, 900, 100);
     }));
     QTRY_COMPARE(client.processes().rows().size(), 1);
-    QCOMPARE(client.qualityNotes().size(), 3);
+    QCOMPARE(client.qualityNotes().size(), 2);
     QVERIFY(client.incomplete());
     QCOMPARE(client.processes().row(7, 5).session.rxBytes, quint64(0));
 
@@ -913,6 +1140,67 @@ void TestSocktrail::qualityNotesMakeObservationIncomplete() {
                    {Process{7, 5, u"curl"_s, 30, 20}}));
     QTRY_COMPARE(client.processes().row(7, 5).session.rxBytes, quint64(20));
     QVERIFY(client.incomplete());
+}
+
+void TestSocktrail::diagnosticsAreNotDataLoss() {
+    // Expired PIDs and unmatched socket I/O explain where bytes went; they are
+    // not a gap in the process table, so a stats-only stream stays complete.
+    const SocktrailFrame frame = decode(statsFrame([](ball::test::Writer& writer) {
+        msgpack::packer<msgpack::sbuffer>& packer = writer.packer();
+        packer.pack_map(7);
+        writer.key(QLatin1StringView("at"));
+        writer.timestamp(QDateTime::currentDateTimeUtc());
+        writer.key(QLatin1StringView("process_io"));
+        packer.pack_array(1);
+        writeProcess(writer, 7, 5, u"curl"_s, 10, 20);
+        writeQuality(writer, 0, 0, 0, 3, 0, 0, 4'096);
+    }));
+    QCOMPARE(frame.status, SocktrailFrameStatus::Ok);
+    QVERIFY(frame.qualityNotes.isEmpty());
+    QCOMPARE(frame.infoNotes.size(), 2);
+
+    // The kTLS probe status is an explanation too, and a missing probes.ktls
+    // object or an "active" status adds nothing.
+    const auto withKtls = [](const QString& status) {
+        return decode(statsFrame([&](ball::test::Writer& writer) {
+            msgpack::packer<msgpack::sbuffer>& packer = writer.packer();
+            packer.pack_map(7);
+            writer.key(QLatin1StringView("at"));
+            writer.timestamp(QDateTime::currentDateTimeUtc());
+            writer.key(QLatin1StringView("process_io"));
+            packer.pack_array(0);
+            writeQuality(writer, 0, 0, 0, 0, 0, 0, 0, status);
+        }));
+    };
+    QVERIFY(withKtls(QStringLiteral("active")).infoNotes.isEmpty());
+    QVERIFY(withKtls(QStringLiteral("missing")).infoNotes.last().contains(u"kTLS"_s));
+    QVERIFY(withKtls(QStringLiteral("missing")).infoNotes.last().contains(u"missing"_s));
+
+    // A diagnostics string may legally contain newlines; it must be normalized
+    // to a single safe line rather than reject the whole stats frame.
+    Socktrail client;
+    client.start(startServer());
+    QVERIFY(acceptConnection());
+    send(helloLine());
+    send(statsFrame([](ball::test::Writer& writer) {
+        msgpack::packer<msgpack::sbuffer>& packer = writer.packer();
+        packer.pack_map(7);
+        writer.key(QLatin1StringView("at"));
+        writer.timestamp(QDateTime::fromString(u"2026-10-13T14:00:01Z"_s, Qt::ISODate));
+        writer.key(QLatin1StringView("process_io"));
+        packer.pack_array(0);
+        writeQuality(writer, 0, 0, 0, 0, 0, 0, 0, QStringLiteral("missing\nreason\x1b[31m"));
+    }));
+    QTRY_VERIFY(client.available());
+    QVERIFY(!client.stale());
+    QCOMPARE(client.infoNotes().size(), 1);
+    for (const QChar character : client.infoNotes().first()) {
+        QVERIFY(character.unicode() >= 0x20 && character.unicode() != 0x7f);
+    }
+    QVERIFY(client.infoNotes().first().contains(u"reason"_s));
+    QVERIFY(!client.infoNotes().first().contains(u"\n"_s));
+    // While a real gap still makes the observation incomplete and live.
+    QVERIFY(!client.incomplete());
 }
 
 void TestSocktrail::rejectedFrameLeavesStateUntouched() {

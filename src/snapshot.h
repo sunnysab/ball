@@ -229,6 +229,12 @@ struct SnapshotParseResult {
 // partially update the UI.
 SnapshotParseResult decodeSnapshot(const msgpack::object& frame);
 
+// Validates one connection row as the collector's flow section encodes it,
+// using the same grammar as the snapshot decoder so the two cannot drift.
+// `out` is left untouched when the row is rejected, so a malformed flow frame
+// never leaves a partial row behind.
+bool decodeConnection(const msgpack::object& row, ConnectionSnapshot& out);
+
 // Encodes one snapshot as one complete frame. `ok` is false when a value could
 // not be represented (an unset time) or when the finished frame would exceed
 // mp::kMaxFrameBytes; a too-large frame is never sent in parts or trimmed. The

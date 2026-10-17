@@ -13,7 +13,7 @@
 - 慢客户端必须被断开，不能阻塞采集或无限积压数据。GUI 重连后以最新快照覆盖状态，不累加快照。
 - 单帧上限 16 MiB（`mp::kMaxFrameBytes`）；超过上限或无法解析的字节流必须断开连接，
   不能继续解析，因为 MessagePack 没有可用来重新同步的分隔符。
-- 此接口不输出连接、域名、报文内容；只输出流量、进程标识、接口和数据质量。
+- 此接口输出连接标识、域名证据说明与端点的流量计数，但不输出报文内容、载荷或原始 flow。
 
 ## 快照
 
@@ -35,7 +35,8 @@
     "stale": false,
     "incomplete": false,
     "error": "",
-    "notes": []
+    "notes": [],
+    "info": []
   },
   "interfaces": [
     {
@@ -58,7 +59,40 @@
       "session": {"rx_bytes": 1024, "tx_bytes": 128},
       "rate": {"rx_bps": 512.0, "tx_bps": 64.0}
     }
-  ]
+  ],
+  "connections": [
+    {
+      "id": 42,
+      "protocol": "TCP",
+      "app": "tls",
+      "state": "established",
+      "direction": "outbound",
+      "source": "10.0.0.2:40000",
+      "target": "10.0.0.5:443",
+      "name": "example.com",
+      "detail": "sni: example.com",
+      "end": "",
+      "interfaces": ["eno1"],
+      "first_seen": "2026-10-14T14:29:58+08:00",
+      "last_seen": "2026-10-14T14:30:02+08:00",
+      "rx_bytes": 2048,
+      "tx_bytes": 512,
+      "packets": 40,
+      "retransmits": 0,
+      "rate": {"rx_bps": 1024.0, "tx_bps": 256.0},
+      "rtt_us": 800,
+      "rtt_source": "kernel",
+      "client": {"pid": 1234, "start_ns": 9007199254740993, "name": "firefox", "rx_bytes": 2048, "tx_bytes": 512},
+      "server": {"pid": 0},
+      "io": [{"pid": 1234, "start_ns": 9007199254740993, "name": "firefox", "rx_bytes": 2048, "tx_bytes": 512}]
+    }
+  ],
+  "connection_status": {
+    "available": true,
+    "stale": false,
+    "truncated": false,
+    "notes": []
+  }
 }
 ```
 
@@ -79,6 +113,8 @@
 - `kind` 只取 `physical`、`virtual`、`loopback`。网卡和进程的数组顺序不是身份；
   同一快照内网卡索引、`(pid, start_ns)` 都不得重复。
 - `interface_error` 与 `process_status` 的各字段、`notes` 数组必须存在，缺失即坏帧；
+  `process_status.info` 与整个 `connections` / `connection_status` 段是后加的可选字段，
+  缺失时分别视为空列表和“不支持连接”。字段一旦出现必须严格校验。
   所有字符串不得包含控制字符（口碑的解析器会拒绝，避免把终端转义带进界面）。
 - `today` 是本地日期内已观测累计；`session` 是本次监测已观测累计。首次监测前视为零，
   不从系统已有计数补算历史。后端重启时两者都清零。
@@ -98,20 +134,33 @@
   占位符 `—`（也包括还没有任何快照时）。已经收到的旧数值不得当作当前值展示。
 - `interfaces_available=false` 或 GUI 没有新鲜快照时，不能把过期速率显示成真实的零；应显示不可用状态。
 - 进程页是否实时可用须同时检查 `available` 和 `!stale`；不完整标记及原因可见。
+  `process_status.notes` 是真实数据缺口（PID 事件丢失、unindexed 字节），会进入
+  `incomplete`；`process_status.info` 只是解释（unmatched socket I/O、已过期 PID、
+  非 active 的 kTLS 探针），不驱动 `incomplete`。
+- 连接页由独立的 `connections` 与 `connection_status` 描述：`available` 表示采集器
+  声明或实际发送了 flow，`stale` 与 stats 新鲜度一致，`truncated` 表示有界缓存发生
+  了淘汰。字段缺失视为旧后台不支持连接，不伪装成可用的空表。连接速率只在成功应用
+  `stats` 时采样，flow 帧本身不会让 stats 变新鲜。
 - 快照只在 GUI 内保留最新一份，流量历史不落盘；显示位置、透明度及网卡选择可保存为偏好设置。
 
 ## 采集器订阅
 
 后台以 `--output msgpack --socket <路径>` 启动 socktrail，订阅同一个编码，但帧结构不同：
 每帧是一个带 `kind` 的信封，`kind` 取 `hello`、`flow` 或 `stats`，负载在同名 key 下。
-后台只使用 `hello`（`version=1`、`started` 时间戳）与 `stats`（`at` 时间戳、
+后台使用 `hello`（`version=1`、`started` 时间戳、可选 `kinds`）、`stats`（`at` 时间戳、
 `process_io` 全量进程表、`ip_packets` / `ip_bytes` 采集器运行累计、`probes.pid` 与
-`io_unindexed` / `expired_pid_io` / `expired_pid_count` 质量计数）；`flow` 帧按协议接受
-但完全忽略，因为进程累计只能来自 `stats` 表。`ip_packets` / `ip_bytes` 的可选规则与
-拒绝策略同 `process_io`：缺失为 0，存在但非法则拒绝整帧并断开订阅。
-后台只关心进程流量，所以采集器以 `--socket-kinds stats` 启动（spawn 模式
-由后台传参；外部采集器模式需在采集器侧自行配置）：`hello` 与 `stats` 之外的 `flow` 帧
-一律不发布。本机约 2000 条连接时，这会把订阅流量从约 4.8 MB/s 降到每秒约一帧。
+`io_unindexed` / `expired_pid_io` / `expired_pid_count` 质量计数）与 `flow`
+（一条连接：`id` 非零，`protocol` / `source` / `target` / `first_seen` / `last_seen` /
+`rx_bytes` / `tx_bytes` / `packets` 必需，其余字段按上游省略规则读取）。
+`hello.kinds` 包含 `flow` 即声明连接可用；没有 `kinds` 时直到收到首个合法 flow 才确认。
+每次 `hello`（包括同一采集器重连）都会重建连接缓存，断线立即清空并标记过期。
+`ip_packets` / `ip_bytes` 的可选规则与拒绝策略同 `process_io`：缺失为 0，
+存在但非法则拒绝整帧并断开订阅。
+后台还会读取 `probes.ktls.status`（可选）作为 `info` 说明，不自动提权。
+stats 的字符串诊断允许包含多行，读取时把控制字符归一为空格并在过长时明确省略，
+不会因为一条合法诊断就以坏帧为由拒绝 stats。
+采集器以 `--socket-kinds stats,flow` 启动，继续关闭 openssl 与 socket-sniff 探针
+（spawn 模式由后台传参；外部采集器模式需在采集器侧自行配置为 `stats,flow`）。
 采集器自身的字段说明见其仓库的 `docs/internals/stream-output.md`。
 
 ## 验证要求

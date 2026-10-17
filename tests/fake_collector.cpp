@@ -29,11 +29,49 @@ QByteArray helloFrame() {
     return ball::test::envelope(u"hello"_s, QLatin1StringView("hello"),
                                 [](ball::test::Writer& writer) {
                                     msgpack::packer<msgpack::sbuffer>& packer = writer.packer();
-                                    packer.pack_map(2);
+                                    packer.pack_map(3);
                                     writer.key(QLatin1StringView("version"));
                                     packer.pack(1);
                                     writer.key(QLatin1StringView("started"));
                                     writer.timestamp(kStarted);
+                                    // The socket publishes both kinds; the
+                                    // subscriber may then expect connections.
+                                    writer.key(QLatin1StringView("kinds"));
+                                    packer.pack_array(2);
+                                    writer.text(u"stats"_s);
+                                    writer.text(u"flow"_s);
+                                });
+}
+
+// One connection row, with the required fields a real flow frame always
+// carries. The counters are cumulative since first observation, so they grow
+// with every frame instead of being deltas.
+QByteArray flowFrame(quint64 id, quint64& rx, quint64& tx) {
+    const QDateTime first = QDateTime::fromString(u"2026-10-13T14:00:00Z"_s, Qt::ISODate);
+    return ball::test::envelope(u"flow"_s, QLatin1StringView("flow"),
+                                [&](ball::test::Writer& writer) {
+                                    msgpack::packer<msgpack::sbuffer>& packer = writer.packer();
+                                    rx += 400;
+                                    tx += 200;
+                                    packer.pack_map(9);
+                                    writer.key(QLatin1StringView("id"));
+                                    packer.pack(id);
+                                    writer.key(QLatin1StringView("protocol"));
+                                    writer.text(u"TCP"_s);
+                                    writer.key(QLatin1StringView("source"));
+                                    writer.text(u"10.0.0.2:40000"_s);
+                                    writer.key(QLatin1StringView("target"));
+                                    writer.text(u"10.0.0.5:443"_s);
+                                    writer.key(QLatin1StringView("first_seen"));
+                                    writer.timestamp(first);
+                                    writer.key(QLatin1StringView("last_seen"));
+                                    writer.timestamp(QDateTime::currentDateTimeUtc());
+                                    writer.key(QLatin1StringView("rx_bytes"));
+                                    packer.pack(rx);
+                                    writer.key(QLatin1StringView("tx_bytes"));
+                                    packer.pack(tx);
+                                    writer.key(QLatin1StringView("packets"));
+                                    packer.pack(rx + tx);
                                 });
 }
 
@@ -126,6 +164,17 @@ int main(int argc, char* argv[]) {
             file.write(QByteArray::number(QCoreApplication::applicationPid()) + '\n');
         }
     }
+    // One argument per line, so a test can assert exactly how the daemon
+    // spawned the collector without the fixture parsing the whole contract.
+    const QString argsFile = qEnvironmentVariable("BALL_FAKE_ARGS_FILE");
+    if (!argsFile.isEmpty()) {
+        QFile file(argsFile);
+        if (file.open(QIODevice::WriteOnly)) {
+            for (int i = 1; i < argc; ++i) {
+                file.write(QByteArray(argv[i]) + '\n');
+            }
+        }
+    }
     if (qEnvironmentVariableIsSet("BALL_FAKE_EXIT")) {
         return 3; // an immediately dying collector, like a broken install
     }
@@ -143,9 +192,18 @@ int main(int argc, char* argv[]) {
     QLocalSocket* peer = nullptr;
     quint64 rx = 0;
     quint64 tx = 0;
+    quint64 flowRx1 = 0;
+    quint64 flowTx1 = 0;
+    quint64 flowRx2 = 0;
+    quint64 flowTx2 = 0;
     const auto sendStats = [&] {
         if (peer != nullptr && peer->state() == QLocalSocket::ConnectedState) {
+            // One stats frame followed by two flow frames, so the subscriber's
+            // connection cache gets several rows and its process totals stay
+            // fed from the stats table alone.
             peer->write(statsFrame(rx, tx));
+            peer->write(flowFrame(1, flowRx1, flowTx1));
+            peer->write(flowFrame(2, flowRx2, flowTx2));
             peer->flush();
             std::fputs("collector output is not protocol data\n", stdout);
             std::fflush(stdout);

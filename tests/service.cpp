@@ -217,6 +217,8 @@ class TestService : public QObject {
 private Q_SLOTS:
     void snapshotBeforeStartIsWellFormed();
     void initialAndPeriodicSnapshots();
+    void servicePublishesConnections();
+    void spawnRequestsStatsAndFlow();
     void byteCountersKeepPrecision();
     void collectorFailureStillServesInterfaces();
     void collectorRestartsArePaced();
@@ -293,6 +295,66 @@ void TestService::initialAndPeriodicSnapshots() {
     QVERIFY(next.at > initial.at);
 
     service.stop();
+}
+
+void TestService::servicePublishesConnections() {
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+
+    Service service;
+    ServiceOptions options;
+    options.socketPath = dir.filePath(u"gui.sock"_s);
+    options.collectorBinary = fakeCollectorBinary();
+    QVERIFY2(service.start(options), qPrintable(service.error()));
+
+    // The fake collector advertises flow in its hello and publishes two flow
+    // frames per second, so the cache and its independent status become
+    // available without affecting the process totals.
+    QTRY_VERIFY_WITH_TIMEOUT(service.snapshot().connectionStatus.available, 10000);
+    QTRY_VERIFY_WITH_TIMEOUT(service.snapshot().connections.size() == 2, 10000);
+    const Snapshot snapshot = service.snapshot();
+    QCOMPARE(snapshot.connections.first().protocol, u"TCP"_s);
+    QVERIFY(snapshot.processStatus.available);
+    QVERIFY(!snapshot.connections.isEmpty());
+
+    // A GUI sees the connection section in the same frame as the process data.
+    QLocalSocket client;
+    client.connectToServer(options.socketPath);
+    QVERIFY(client.waitForConnected(2000));
+    FrameReader reader(client);
+    Snapshot decoded;
+    QVERIFY2(reader.waitForFrame(decoded, 3000), "no snapshot with connections");
+    QVERIFY(decoded.connectionStatus.available);
+    QVERIFY(!decoded.connections.isEmpty());
+
+    service.stop();
+}
+
+void TestService::spawnRequestsStatsAndFlow() {
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString argsFile = dir.filePath(u"collector.args"_s);
+    qputenv("BALL_FAKE_ARGS_FILE", argsFile.toUtf8());
+
+    Service service;
+    ServiceOptions options;
+    options.socketPath = dir.filePath(u"gui.sock"_s);
+    options.collectorBinary = fakeCollectorBinary();
+    QVERIFY2(service.start(options), qPrintable(service.error()));
+    QTRY_VERIFY_WITH_TIMEOUT(QFile::exists(argsFile), 5000);
+
+    QFile file(argsFile);
+    QVERIFY(file.open(QIODevice::ReadOnly));
+    const QStringList arguments =
+        QString::fromUtf8(file.readAll()).split(QLatin1Char('\n'), Qt::SkipEmptyParts);
+    // Both frame kinds are requested, while the packet-capture probes stay off.
+    QVERIFY(arguments.contains(u"--socket-kinds"_s));
+    QCOMPARE(arguments.at(arguments.indexOf(u"--socket-kinds"_s) + 1), u"stats,flow"_s);
+    QVERIFY(arguments.contains(u"--openssl-probe=false"_s));
+    QVERIFY(arguments.contains(u"--socket-sniff=false"_s));
+
+    service.stop();
+    qunsetenv("BALL_FAKE_ARGS_FILE");
 }
 
 void TestService::byteCountersKeepPrecision() {
@@ -406,6 +468,7 @@ void TestService::cleanup() {
     qunsetenv("BALL_FAKE_EXIT");
     qunsetenv("BALL_FAKE_PID_FILE");
     qunsetenv("BALL_FAKE_PROCESS_COUNT");
+    qunsetenv("BALL_FAKE_ARGS_FILE");
 }
 
 void TestService::collectorRecoversWhenBinaryAppears() {

@@ -10,6 +10,7 @@
 #include <chrono>
 #include <cmath>
 #include <limits>
+#include <utility>
 
 namespace ball {
 namespace {
@@ -432,6 +433,17 @@ bool readProcessStatus(const msgpack::object& parent, ProcessStatus& status) {
 }
 
 } // namespace
+
+bool decodeConnection(const msgpack::object& row, ConnectionSnapshot& out) {
+    // Decode into a temporary so a row that fails half way leaves the caller's
+    // value exactly as it was.
+    ConnectionSnapshot candidate;
+    if (!readConnection(row, candidate)) {
+        return false;
+    }
+    out = std::move(candidate);
+    return true;
+}
 
 QString interfaceKindName(InterfaceKind kind) {
     switch (kind) {

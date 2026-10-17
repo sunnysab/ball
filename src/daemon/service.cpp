@@ -298,7 +298,35 @@ void Service::broadcastSnapshot() {
     }
 }
 
-QByteArray Service::snapshotFrame(bool& ok) const { return encodeSnapshot(snapshot(), ok); }
+QByteArray Service::snapshotFrame(bool& ok) const {
+    Snapshot current = snapshot();
+    QByteArray frame = encodeSnapshot(current, ok);
+    if (ok || current.connections.isEmpty()) {
+        return frame;
+    }
+    // The full connection table did not fit one frame. Only the connection list
+    // of this local copy is reduced, so the interface and process sections
+    // (which the frame limit cannot have caused) stay intact and the real cache
+    // keeps every row for the next attempt. The reduction is recorded as
+    // truncation and kept in the status notes, never silently dropped.
+    const QString note =
+        QStringLiteral("connections reduced to fit one frame; not the full history, retrying");
+    if (!current.connectionStatus.notes.contains(note)) {
+        current.connectionStatus.notes.append(note);
+    }
+    current.connectionStatus.truncated = true;
+    while (!current.connections.isEmpty()) {
+        current.connections.remove(current.connections.size() / 2,
+                                   current.connections.size() - current.connections.size() / 2);
+        frame = encodeSnapshot(current, ok);
+        if (ok) {
+            return frame;
+        }
+    }
+    // The non-connection sections alone are still too large; the caller skips
+    // this tick rather than sending a frame we could not describe.
+    return frame;
+}
 
 bool Service::sendSnapshot(QLocalSocket* socket, const QByteArray& frame) {
     if (!m_clients.contains(socket) || socket->state() != QLocalSocket::ConnectedState) {
@@ -343,8 +371,25 @@ Snapshot Service::snapshot() const {
     snapshot.processStatus.incomplete = m_socktrail->incomplete();
     snapshot.processStatus.error = processError();
     snapshot.processStatus.notes = notes;
+    snapshot.processStatus.info = m_socktrail->infoNotes();
     snapshot.ipPackets = m_socktrail->ipPackets();
     snapshot.ipBytes = m_socktrail->ipBytes();
+
+    // The connection section is independent of the interface and process
+    // status: a collector that publishes no flow frames leaves it unavailable
+    // without affecting anything else, and says so explicitly.
+    snapshot.connectionStatus.available = m_socktrail->connectionsAvailable();
+    snapshot.connectionStatus.stale = !collectorUp || m_socktrail->stale();
+    snapshot.connectionStatus.truncated = m_socktrail->connections().truncated();
+    if (!collectorUp) {
+        snapshot.connectionStatus.notes.append(QStringLiteral("collector not running"));
+    } else if (!m_socktrail->connectionsAvailable()) {
+        snapshot.connectionStatus.notes.append(
+            QStringLiteral("collector does not publish flow frames"));
+    }
+    for (const ConnectionSnapshot& row : m_socktrail->connections().rows()) {
+        snapshot.connections.append(row);
+    }
 
     for (const InterfaceTraffic& row : m_traffic->rows()) {
         InterfaceSnapshot interface;
@@ -479,10 +524,9 @@ void Service::startCollector() {
          QStringLiteral("--socket-mode"), QStringLiteral("0600"), QStringLiteral("--refresh"),
          QStringLiteral("1s"), QStringLiteral("--openssl-probe=false"),
          QStringLiteral("--socket-sniff=false"),
-         // Only the process totals are consumed here, so the collector skips
-         // every flow frame: no connection view exists in this UI, and the
-         // frames would otherwise be the bulk of the stream.
-         QStringLiteral("--socket-kinds"), QStringLiteral("stats")});
+         // The connection page needs the per-connection rows, and the process
+         // totals come from the same stream; both kinds are requested.
+         QStringLiteral("--socket-kinds"), QStringLiteral("stats,flow")});
     // Subscribing before the socket exists is fine: Socktrail retries on its own
     // timer and connects as soon as the collector is listening.
     m_socktrail->start(m_rawSocketPath);

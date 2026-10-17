@@ -13,6 +13,9 @@ namespace {
 
 constexpr int kReconnectIntervalMs = 1000;
 constexpr int kMaxErrorLength = 120;
+// One diagnostics string from the collector. Long values are explicitly
+// ellipsized so a verbose reason is still readable and never unbounded.
+constexpr int kMaxDiagnosticLength = 160;
 constexpr quint64 kIntMax = quint64(std::numeric_limits<int>::max());
 
 SocktrailFrame reject(const char* reason) {
@@ -46,6 +49,41 @@ bool readTimestamp(const msgpack::object* const value, QDateTime& out) {
     return true;
 }
 
+// One short ASCII diagnostics line. Control characters, including the newlines
+// a raw error string may carry, become spaces, and an over-long value is marked
+// with an explicit ellipsis within the cap instead of being silently dropped or
+// allowed to grow without bound.
+QString sanitizeDiagnostic(const QString& text, int maxLength) {
+    QString out;
+    out.reserve(qMin(text.size(), qsizetype(maxLength)));
+    bool truncated = false;
+    for (const QChar character : text) {
+        if (out.size() >= maxLength) {
+            truncated = true;
+            break;
+        }
+        const char16_t code = character.unicode();
+        out.append(code >= 0x20 && code < 0x7f ? character : QLatin1Char(' '));
+    }
+    out = out.trimmed();
+    if (truncated) {
+        out = out.left(maxLength - 3) + QStringLiteral("...");
+    }
+    return out;
+}
+
+// One collector diagnostics string. A value of the wrong type is a bad frame;
+// anything else is normalized rather than rejected.
+QString readDiagnostic(const msgpack::object& value, bool& ok) {
+    if (value.type != msgpack::type::STR) {
+        ok = false;
+        return {};
+    }
+    ok = true;
+    return sanitizeDiagnostic(QString::fromUtf8(value.via.str.ptr, qsizetype(value.via.str.size)),
+                              kMaxDiagnosticLength);
+}
+
 SocktrailFrame parseHello(const msgpack::object& hello) {
     quint64 version = 0;
     const msgpack::object* const versionValue = mp::member(hello, QLatin1StringView("version"));
@@ -61,6 +99,27 @@ SocktrailFrame parseHello(const msgpack::object& hello) {
     SocktrailFrame frame;
     if (!readTimestamp(mp::member(hello, QLatin1StringView("started")), frame.backendStarted)) {
         return reject("bad started");
+    }
+    // `kinds` is optional; when present it declares which frame kinds the
+    // socket will publish, so `flow` there means the connection section is
+    // supported without waiting for the first frame.
+    const msgpack::object* const kinds = mp::member(hello, QLatin1StringView("kinds"));
+    if (kinds != nullptr) {
+        const msgpack::object* entries = nullptr;
+        quint32 size = 0;
+        if (!mp::arrayEntries(*kinds, entries, size)) {
+            return reject("bad kinds");
+        }
+        for (quint32 i = 0; i < size; ++i) {
+            bool ok = false;
+            const QString kind = mp::ascii(entries[i], ok);
+            if (!ok) {
+                return reject("bad kinds");
+            }
+            if (kind == QLatin1String("flow")) {
+                frame.connectionsAdvertised = true;
+            }
+        }
     }
     frame.status = SocktrailFrameStatus::Hello;
     return frame;
@@ -185,9 +244,9 @@ SocktrailFrame parseStats(const msgpack::object& stats) {
     if (expiredCountValue == nullptr || !mp::readCount(*expiredCountValue, expiredCount)) {
         return reject("bad expired_pid_count");
     }
-    // Socket I/O the collector could not attach to any connection. It is absent
-    // from every flow's io[] and from the process table, so it is the one gap a
-    // process total cannot show by itself.
+    // Socket I/O the collector could not attach to any connection. It is an
+    // explanation for why connection bytes are lower than the process table,
+    // not a hole in the process totals.
     quint64 unmatchedBytes = 0;
     const msgpack::object* const unmatchedValue =
         mp::member(stats, QLatin1StringView("io_unmatched_bytes"));
@@ -195,21 +254,70 @@ SocktrailFrame parseStats(const msgpack::object& stats) {
         return reject("bad io_unmatched_bytes");
     }
     if (expiredCount != 0 || expiredRx != 0 || expiredTx != 0) {
-        frame.qualityNotes.append(QStringLiteral("expired PIDs: %1 identities, RX %2, TX %3")
-                                      .arg(expiredCount)
-                                      .arg(expiredRx)
-                                      .arg(expiredTx));
+        // Expired PID I/O is socket I/O the collector could not attribute, but
+        // the bytes are still present in the process table's history; it is an
+        // explanation, not a hole in the totals.
+        frame.infoNotes.append(QStringLiteral("expired PIDs: %1 identities, RX %2, TX %3")
+                                   .arg(expiredCount)
+                                   .arg(expiredRx)
+                                   .arg(expiredTx));
     }
     if (unindexedRx != 0 || unindexedTx != 0) {
         frame.qualityNotes.append(
             QStringLiteral("unindexed bytes: RX %1, TX %2").arg(unindexedRx).arg(unindexedTx));
     }
     if (unmatchedBytes != 0) {
-        frame.qualityNotes.append(
-            QStringLiteral("unmatched socket I/O: %1 bytes").arg(unmatchedBytes));
+        // Socket I/O that matched no connection is not missing from the
+        // process table, so it is an explanation and not a data gap.
+        frame.infoNotes.append(QStringLiteral("unmatched socket I/O: %1 bytes (outside process_io)")
+                                   .arg(unmatchedBytes));
+    }
+
+    // The kTLS probe reports a load status, not a counter. A non-active status
+    // only explains that some TLS traffic may lack decryption keys; it is not a
+    // reason to distrust the totals.
+    const msgpack::object* const ktls = mp::member(*probesValue, QLatin1StringView("ktls"));
+    if (ktls != nullptr) {
+        const msgpack::object* const ktlsStatus = mp::member(*ktls, QLatin1StringView("status"));
+        if (ktlsStatus != nullptr) {
+            bool statusOk = false;
+            const QString status = readDiagnostic(*ktlsStatus, statusOk);
+            if (!statusOk) {
+                return reject("bad probes.ktls.status");
+            }
+            if (!status.isEmpty() && status != QLatin1String("active")) {
+                frame.infoNotes.append(QStringLiteral("kTLS probe: %1").arg(status));
+            }
+        }
     }
 
     frame.status = SocktrailFrameStatus::Ok;
+    return frame;
+}
+
+// One flow envelope, normalized to one connection row. `decodeConnection`
+// enforces the field grammar; the required fields of the collector's flow
+// schema are enforced here because they are optional in the snapshot contract.
+SocktrailFrame parseFlow(const msgpack::object& flow) {
+    ConnectionSnapshot connection;
+    if (!decodeConnection(flow, connection)) {
+        return reject("bad connection");
+    }
+    if (connection.protocol.isEmpty() || connection.source.isEmpty() ||
+        connection.target.isEmpty()) {
+        return reject("bad connection endpoints");
+    }
+    if (!connection.firstSeen.isValid() || !connection.lastSeen.isValid()) {
+        return reject("bad connection times");
+    }
+    if (mp::member(flow, QLatin1StringView("rx_bytes")) == nullptr ||
+        mp::member(flow, QLatin1StringView("tx_bytes")) == nullptr ||
+        mp::member(flow, QLatin1StringView("packets")) == nullptr) {
+        return reject("bad connection counters");
+    }
+    SocktrailFrame frame;
+    frame.status = SocktrailFrameStatus::Flow;
+    frame.connection = std::move(connection);
     return frame;
 }
 
@@ -222,12 +330,14 @@ SocktrailFrame decodeSocktrailFrame(const msgpack::object& frame) {
     if (!ok) {
         return reject("no kind");
     }
-    // Flow frames carry per-connection increments; process totals may only come
-    // from stats, so a flow frame is accepted and dropped without any state.
+    // Flow frames carry one connection row. The row is fully validated before
+    // it reaches the cache, so a malformed frame is rejected as a whole.
     if (kind == QLatin1String("flow")) {
-        SocktrailFrame ignored;
-        ignored.status = SocktrailFrameStatus::Ignored;
-        return ignored;
+        const msgpack::object* const flowValue = mp::member(frame, QLatin1StringView("flow"));
+        if (flowValue == nullptr) {
+            return reject("no flow");
+        }
+        return parseFlow(*flowValue);
     }
     if (kind == QLatin1String("hello")) {
         const msgpack::object* const helloValue = mp::member(frame, QLatin1StringView("hello"));
@@ -286,12 +396,16 @@ void Socktrail::start(const QString& path) {
     m_pendingStats = {};
     m_hasPendingStats = false;
     // Only the accumulator keeps its history; the observable state starts over
-    // as unavailable and incomplete until a hello and a stats frame arrive.
+    // as unavailable and incomplete until a hello and a stats frame arrive. The
+    // connection cache is rebuilt from the next hello.
+    m_connections.reset();
     if (!m_clock.isValid()) {
         m_clock.start();
     }
     m_helloReceived = false;
     m_qualityNotes.clear();
+    m_infoNotes.clear();
+    m_connectionsAvailable = false;
     m_ipPackets = 0;
     m_ipBytes = 0;
     m_error.clear();
@@ -316,6 +430,9 @@ void Socktrail::stop() {
     m_decoder.reset();
     m_pendingStats = {};
     m_hasPendingStats = false;
+    m_connections.reset();
+    m_infoNotes.clear();
+    m_connectionsAvailable = false;
     if (m_socket->state() != QLocalSocket::UnconnectedState) {
         m_socket->abort();
     }
@@ -346,6 +463,9 @@ void Socktrail::onConnected() {
     m_helloReceived = false;
     m_available = false;
     m_stale = true;
+    // The cache is rebuilt by the next hello; until then nothing is known.
+    m_connections.reset();
+    m_connectionsAvailable = false;
     // A successful connect is not recovery; retain diagnostics until valid stats.
     m_staleTimer->start();
     Q_EMIT updated();
@@ -378,14 +498,28 @@ void Socktrail::onReadyRead() {
 bool Socktrail::handleFrame(const msgpack::object& frame) {
     const SocktrailFrame decoded = decodeSocktrailFrame(frame);
     switch (decoded.status) {
-    case SocktrailFrameStatus::Ignored:
-        return true;
     case SocktrailFrameStatus::ProtocolError:
         dropConnection(decoded.error.isEmpty() ? QStringLiteral("bad frame") : decoded.error);
         return false;
     case SocktrailFrameStatus::Unsupported:
         dropConnection(QStringLiteral("unsupported version"));
         return false;
+    case SocktrailFrameStatus::Flow: {
+        // A flow frame may only follow a hello, exactly like stats; before the
+        // session is identified its kind is as untrustworthy as any other.
+        if (!m_helloReceived) {
+            dropConnection(QStringLiteral("flow before hello"));
+            return false;
+        }
+        // A valid flow proves the collector publishes connections even when
+        // the hello omitted `kinds`. It never touches the stats clock or the
+        // process totals; the cache is sampled when the next stats frame is
+        // applied.
+        m_connectionsAvailable = true;
+        m_connections.update(decoded.connection);
+        Q_EMIT updated();
+        return true;
+    }
     case SocktrailFrameStatus::Hello:
         // A different `started` means the backend restarted with fresh counters
         // and the history in between is lost for good.
@@ -398,6 +532,11 @@ bool Socktrail::handleFrame(const msgpack::object& frame) {
         }
         m_backendStarted = decoded.backendStarted;
         m_helloReceived = true;
+        // Every hello, including a reconnect to the same collector, rebuilds
+        // the connection cache: a reconnect may have missed `end` transitions
+        // and ID reuse in between, which an incremental update cannot repair.
+        m_connections.reset();
+        m_connectionsAvailable = decoded.connectionsAdvertised;
         return true;
     case SocktrailFrameStatus::Ok:
         break;
@@ -437,8 +576,12 @@ bool Socktrail::applyStats(const SocktrailFrame& stats, qint64 monotonicMs) {
     m_restartPending = false;
     m_lastAppliedMonoMs = monotonicMs;
     m_qualityNotes = stats.qualityNotes;
+    m_infoNotes = stats.infoNotes;
     m_ipPackets = stats.ipPackets;
     m_ipBytes = stats.ipBytes;
+    // Connection rates are sampled once per real stats interval, never on a
+    // flow frame, so a reconnect handshake cannot invent a traffic spike.
+    m_connections.sample(monotonicMs);
 
     // Stats arrives: the data is live again and the freshness timer restarts.
     // No flow frame ever touches this timer.
@@ -498,6 +641,10 @@ void Socktrail::onDisconnected() {
     m_decoder.reset();
     m_pendingStats = {};
     m_hasPendingStats = false;
+    // A dropped connection cannot vouch for any row: the cache is cleared and
+    // stays unavailable until the reconnect proves flow support again.
+    m_connections.reset();
+    m_connectionsAvailable = false;
     if (m_error.isEmpty()) {
         m_error = QByteArrayLiteral("disconnected");
     }
@@ -525,6 +672,8 @@ void Socktrail::dropConnection(const QString& reason) {
     m_stale = true;
     m_gapSeen = m_gapSeen || m_lastAppliedMonoMs >= 0;
     m_helloReceived = false;
+    m_connections.reset();
+    m_connectionsAvailable = false;
     if (m_socket->state() != QLocalSocket::UnconnectedState) {
         const QSignalBlocker blocker(m_socket);
         m_socket->abort();
@@ -543,15 +692,10 @@ void Socktrail::startReconnect() {
 }
 
 void Socktrail::setError(const QString& reason) {
-    QByteArray bytes = reason.toUtf8().left(kMaxErrorLength);
-    for (const char character : bytes) {
-        // The error is meant for logs and the CLI, so keep it short ASCII.
-        if (character < 0x20 || character >= 0x7f) {
-            bytes = QByteArrayLiteral("socket error");
-            break;
-        }
-    }
-    m_error = std::move(bytes);
+    // The error is meant for logs and the CLI, so keep it short and ASCII; a
+    // raw multi-line reason is normalized into one safe line instead of being
+    // discarded or rejected.
+    m_error = sanitizeDiagnostic(reason, kMaxErrorLength).toUtf8();
 }
 
 } // namespace ball

@@ -2,6 +2,7 @@
 // Asynchronous subscriber for the socktrail Unix-socket MessagePack stream.
 #pragma once
 
+#include "daemon/connections.h"
 #include "daemon/processes.h"
 #include "messagepack.h"
 
@@ -21,7 +22,7 @@ namespace ball {
 // leaves no partial state behind.
 enum class SocktrailFrameStatus : quint8 {
     Ok,            // kind "stats": `counters` holds the whole process_io table
-    Ignored,       // kind "flow" or another kind the totals do not use
+    Flow,          // kind "flow": `connection` holds one validated connection row
     Hello,         // kind "hello": version/started validated, `backendStarted`
     ProtocolError, // wrong/missing kind, bad field, duplicate identity or bad number
     Unsupported,   // kind "hello" with a version this client cannot read
@@ -30,19 +31,22 @@ enum class SocktrailFrameStatus : quint8 {
 // One --output msgpack frame, kept out of the client so it can be tested alone.
 struct SocktrailFrame {
     SocktrailFrameStatus status = SocktrailFrameStatus::ProtocolError;
-    QDateTime at;                   // stats: "at"
-    QDateTime backendStarted;       // hello: "started"
-    QList<ProcessCounter> counters; // stats: the full process_io table
-    quint64 ipPackets = 0;          // stats: collector-run IP packet count
-    quint64 ipBytes = 0;            // stats: collector-run IP bytes, not socket I/O
-    QStringList qualityNotes;       // stats: dropped / expired / unindexed bytes
-    QString error;                  // short ASCII reason for a rejected frame
+    QDateTime at;                       // stats: "at"
+    QDateTime backendStarted;           // hello: "started"
+    QList<ProcessCounter> counters;     // stats: the full process_io table
+    quint64 ipPackets = 0;              // stats: collector-run IP packet count
+    quint64 ipBytes = 0;                // stats: collector-run IP bytes, not socket I/O
+    QStringList qualityNotes;           // stats: PID events lost / unindexed bytes
+    QStringList infoNotes;              // stats: explanations that are not a gap
+    QString error;                      // short ASCII reason for a rejected frame
+    ConnectionSnapshot connection;      // flow: one validated connection row
+    bool connectionsAdvertised = false; // hello: "kinds" names flow
 };
 
 // Parses one complete frame. `frame` is the decoded object and the caller keeps
 // the storage alive, because the validated fields are copied out before it goes
-// away. Flow frames carry per-connection increments and are ignored entirely:
-// process totals may only come from the stats table.
+// away. Flow frames are validated as one connection row; the process totals may
+// only come from the stats table.
 SocktrailFrame decodeSocktrailFrame(const msgpack::object& frame);
 
 // Subscribes to a socktrail `--socket` MessagePack stream and keeps a Processes
@@ -78,10 +82,20 @@ public:
     bool stale() const { return m_stale; }
     // Empty while healthy, otherwise a short ASCII reason.
     QByteArray error() const { return m_error; }
-    // Quality notes (PID events lost, expired / unindexed bytes) for the UI.
-    // They are never added to any per-process total.
+    // Quality notes (PID events lost, unindexed bytes) for the UI. They are
+    // never added to any per-process total and they mark the observation as
+    // incomplete.
     QStringList qualityNotes() const { return m_qualityNotes; }
+    // Explanations that do not describe a data gap (unmatched socket I/O,
+    // expired PIDs, a non-active kTLS probe) for the UI.
+    QStringList infoNotes() const { return m_infoNotes; }
 
+    // Bounded cache of live and finished connections. Empty until a flow frame
+    // arrives, and never fed from the stats table.
+    const Connections& connections() const { return m_connections; }
+    // True once a hello advertised flow, or a real flow frame was seen from a
+    // collector that did not advertise. Every reconnect requires a new proof.
+    bool connectionsAvailable() const { return m_connectionsAvailable; }
     quint64 ipPackets() const { return m_ipPackets; }
     quint64 ipBytes() const { return m_ipBytes; }
 
@@ -113,6 +127,7 @@ private:
     void startReconnect();
 
     Processes m_processes;
+    Connections m_connections;
     QLocalSocket* m_socket = nullptr;
     QTimer* m_reconnectTimer = nullptr;
     QTimer* m_staleTimer = nullptr;
@@ -124,6 +139,7 @@ private:
     mp::Decoder m_decoder;
     QByteArray m_error;
     QStringList m_qualityNotes;
+    QStringList m_infoNotes;
     QDateTime m_backendStarted;
     SocktrailFrame m_pendingStats;
     quint64 m_ipPackets = 0;
@@ -137,6 +153,7 @@ private:
     bool m_available = false;
     bool m_incomplete = true;
     bool m_stale = true;
+    bool m_connectionsAvailable = false;
 };
 
 } // namespace ball
