@@ -49,6 +49,8 @@ private slots:
     void newBytesProduceRate();
     void repeatedAndBackwardSampleKeepBaseline();
     void unchangedCountersProduceZeroRate();
+    void updatesPreserveSampledRates();
+    void finishedIndexHandlesEqualTimestamps();
     void counterRegressionRebaselinesWithoutSpike();
     void finishedConnectionRatesAreZero();
     void resetClearsEverything();
@@ -117,6 +119,41 @@ void TestConnectionCache::repeatedAndBackwardSampleKeepBaseline() {
     const ConnectionSnapshot* row = findRow(rows, 1);
     QVERIFY(qFuzzyCompare(row->rxBps, 100.0));
     QVERIFY(qFuzzyCompare(row->txBps, 100.0));
+}
+
+void TestConnectionCache::updatesPreserveSampledRates() {
+    Connections cache;
+    cache.update(makeRow(1));
+    cache.sample(1000);
+    cache.update(makeRow(1, 100, 200));
+    cache.sample(2000);
+    cache.update(makeRow(1, 150, 300));
+    QCOMPARE(cache.rows().first().rxBps, 100.0);
+    QCOMPARE(cache.rows().first().txBps, 200.0);
+    cache.sample(2000);
+    cache.sample(1500);
+    QCOMPARE(cache.rows().first().rxBps, 100.0);
+    cache.sample(3000);
+    QCOMPARE(cache.rows().first().rxBps, 50.0);
+    QCOMPARE(cache.rows().first().txBps, 100.0);
+}
+
+void TestConnectionCache::finishedIndexHandlesEqualTimestamps() {
+    Connections cache;
+    for (quint64 id = 1; id <= quint64(Connections::kMaxConnections); ++id) {
+        ConnectionSnapshot row = makeRow(id);
+        row.end = QStringLiteral("fin");
+        cache.update(row);
+    }
+    ConnectionSnapshot updated = makeRow(5000);
+    updated.end = QStringLiteral("reset");
+    updated.lastSeen = QDateTime::fromMSecsSinceEpoch(3000);
+    cache.update(updated);
+    cache.update(makeRow(8193));
+    const auto rows = cache.rows();
+    QCOMPARE(rows.size(), qsizetype(Connections::kMaxConnections));
+    QVERIFY(!hasId(rows, 1));
+    QVERIFY(hasId(rows, 5000));
 }
 
 void TestConnectionCache::unchangedCountersProduceZeroRate() {

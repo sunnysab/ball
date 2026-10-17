@@ -10,7 +10,7 @@
 #include <QList>
 
 #include <list>
-#include <map>
+#include <set>
 
 namespace ball {
 
@@ -66,7 +66,7 @@ private:
     QHash<quint64, Entries::iterator> m_index;
     // Finished rows keyed by their end instant, so eviction can take the
     // earliest end without a full scan or sort. Duplicate instants are legal.
-    std::multimap<qint64, quint64> m_finishedIndex;
+    std::set<std::pair<qint64, quint64>> m_finishedIndex;
     qint64 m_budgetUsed = 0;
     bool m_truncated = false;
 };

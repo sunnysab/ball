@@ -51,14 +51,8 @@ qint64 finishKeyMs(const ConnectionSnapshot& row) {
 
 // Removes exactly one (end instant, ID) entry, leaving other rows that share
 // the instant alone.
-void eraseFinished(std::multimap<qint64, quint64>& index, const ConnectionSnapshot& row) {
-    auto range = index.equal_range(finishKeyMs(row));
-    for (auto it = range.first; it != range.second; ++it) {
-        if (it->second == row.id) {
-            index.erase(it);
-            return;
-        }
-    }
+void eraseFinished(std::set<std::pair<qint64, quint64>>& index, const ConnectionSnapshot& row) {
+    index.erase({finishKeyMs(row), row.id});
 }
 
 } // namespace
@@ -93,8 +87,12 @@ void Connections::update(const ConnectionSnapshot& row) {
                 break;
             }
         }
+        const double rxBps = entry.row.rxBps;
+        const double txBps = entry.row.txBps;
         entry.row = row;
         entry.finished = !row.end.isEmpty();
+        entry.row.rxBps = entry.finished ? 0.0 : rxBps;
+        entry.row.txBps = entry.finished ? 0.0 : txBps;
         m_budgetUsed += cost;
         if (entry.finished) {
             m_finishedIndex.insert({finishKeyMs(entry.row), entry.row.id});
@@ -121,6 +119,8 @@ void Connections::update(const ConnectionSnapshot& row) {
     m_entries.push_front(Entry{});
     Entry& entry = m_entries.front();
     entry.row = row;
+    entry.row.rxBps = 0.0;
+    entry.row.txBps = 0.0;
     entry.finished = !row.end.isEmpty();
     m_index.insert(row.id, m_entries.begin());
     m_budgetUsed += cost;
@@ -130,6 +130,9 @@ void Connections::update(const ConnectionSnapshot& row) {
 }
 
 void Connections::sample(qint64 monotonicMs) {
+    if (monotonicMs < 0) {
+        return;
+    }
     for (Entry& entry : m_entries) {
         ConnectionSnapshot& row = entry.row;
         if (entry.finished || !row.end.isEmpty()) {
@@ -148,10 +151,7 @@ void Connections::sample(qint64 monotonicMs) {
             continue;
         }
         if (monotonicMs <= entry.lastSampleMs) {
-            // Repeated or backward time: no measurable interval, so the
-            // baseline stays where it was.
-            row.rxBps = 0.0;
-            row.txBps = 0.0;
+            // No measurable interval: preserve the last rate and baseline.
             continue;
         }
 
