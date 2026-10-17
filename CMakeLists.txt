@@ -35,6 +35,7 @@ add_library(ball_daemon STATIC
     src/daemon/interfaces.cpp
     src/daemon/traffic.cpp
     src/daemon/processes.cpp
+    src/daemon/connections.cpp
     src/daemon/socktrail.cpp
     src/daemon/service.cpp
 )
@@ -107,6 +108,9 @@ if(BUILD_TESTING)
     qt_add_executable(ball_processes_test tests/processes.cpp)
     target_link_libraries(ball_processes_test PRIVATE Qt6::Test ball_daemon)
 
+    qt_add_executable(ball_connection_cache_test tests/connection_cache.cpp)
+    target_link_libraries(ball_connection_cache_test PRIVATE Qt6::Test ball_daemon)
+
     qt_add_executable(ball_socktrail_test tests/socktrail.cpp)
     target_link_libraries(ball_socktrail_test PRIVATE Qt6::Test ball_daemon ball_testkit)
 
@@ -164,6 +168,9 @@ if(BUILD_TESTING)
 
     add_test(NAME ball_processes COMMAND ball_processes_test)
     set_tests_properties(ball_processes PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
+    add_test(NAME ball_connection_cache COMMAND ball_connection_cache_test)
+    set_tests_properties(ball_connection_cache PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 
     add_test(NAME ball_socktrail COMMAND ball_socktrail_test)
     set_tests_properties(ball_socktrail PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
