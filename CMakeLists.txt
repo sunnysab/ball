@@ -87,6 +87,9 @@ endif()
 include(CTest)
 if(BUILD_TESTING)
     find_package(Qt6 REQUIRED COMPONENTS Test)
+    # Test-only dependency: the install script's drop-in handling is driven end
+    # to end with stubbed sudo/cmake/systemctl, so it needs no system access.
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
     # The test suites drive real sockets, so their fixtures write the same
     # frames a peer writes; tests/mp_frames.h is header-only.
@@ -169,4 +172,8 @@ if(BUILD_TESTING)
     add_test(NAME ball_cli COMMAND ball_cli_test)
     set_tests_properties(ball_cli PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
         TIMEOUT 120)
+
+    add_test(NAME ball_install
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/install.py)
+    set_tests_properties(ball_install PROPERTIES TIMEOUT 60)
 endif()

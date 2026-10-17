@@ -1,6 +1,6 @@
 # ball 交接文档：安装脚本、开机自启与后续计划
 
-**状态**：安装脚本已完成并验证；3.1（IP 计数展示）已完成，构建与自动化测试通过，真实采集器未测；其余后续计划未开始
+**状态**：安装脚本已完成并验证；3.1（IP 计数展示）已完成，构建与自动化测试通过，真实采集器未测；3.2（外部采集器 drop-in）已完成并通过隔离测试；其余后续计划未开始
 **涉及仓库**：`ball`（本仓库）、`socktrail`（`~/Code/0-Cloned/0-Internet/socktrail`）
 **相关文档**：`docs/collector-service-handoff.md`（采集器常驻服务化，已完成）
 
@@ -34,8 +34,9 @@
   传 `-DCMAKE_INSTALL_PREFIX`，安装时再传一次 `--prefix`，两者保持一致。
 - **`--uninstall` 只删本项目装的文件**，并且只删除带 `X-Ball-Managed=true` 的
   autostart 条目——用户手写的同路径文件不会被删。
-- **外部采集器模式改写 unit 的 `ExecStart`**：把 `--socktrail-bin "<path>"`
-  替换为 `--collector-socket "<path>"`。已用 `systemd-analyze verify` 验证生成的 unit。
+- **外部采集器模式使用实例级 drop-in**：在
+  `/etc/systemd/system/ball@<user>.service.d/collector.conf` 中清空并覆盖 `ExecStart`，
+  模板 unit 不变；重新 `cmake --install` 不会覆盖该配置。详见 §3.2。
 
 ### 1.2 已验证
 
@@ -44,7 +45,7 @@
 | `sh -n` 语法 | 通过 |
 | 暂存前缀安装（`--no-enable --no-gui-autostart`） | 文件树完整：`bin/ball`、`libexec/ball/socktrail`、unit、desktop、图标 |
 | 采集器打包进 `libexec/ball/socktrail` | 是（`-DBALL_SOCKTRAIL_BINARY` 生效） |
-| `--collector-socket` 改写 ExecStart | 正确，`systemd-analyze verify` 无输出 |
+| `--collector-socket` 覆盖 ExecStart | 实例级 drop-in；外部与内置模式均通过 `systemd-analyze verify` |
 | GUI 自启条目被 ball 自己的开关认可 | `autostartEnabled()` = true |
 | 缺采集器时 | 以退出码 1 报错并提示 `--collector-socket` |
 | 缺同名私有组时 | 以退出码 1 报错并给出 `groupadd`/`usermod` 命令 |
@@ -113,26 +114,38 @@
 
 **风险**：低。属于纯展示扩展，不影响累积逻辑。
 
-### 3.2 ball 的 unit 支持外部采集器（中风险）
+### 3.2 ball 的 unit 支持外部采集器（已完成）
 
-**动机**：`packaging/ball@.service.in` 目前写死 `--socktrail-bin`。`install.sh` 是靠
-`sed` 改写已安装的 unit 来实现外部模式的，这属于安装期打补丁，重新 `cmake --install`
-就会被覆盖。更好的做法是让 unit 本身可选。
+**动机**：此前 `install.sh` 用 `sed` 改写已安装的 unit，重新 `cmake --install`
+就会覆盖外部采集器配置。
 
-**方案**（择一）：
+**实现**：
 
-- 方案 A：unit 用 `EnvironmentFile=-/etc/ball/%i.conf`，把采集器来源做成配置项，
-  `ExecStart` 用 shell 展开。注意 unit 里 `ExecStart` 不用 shell，需要
-  `Environment=` 变量拼接或 `/bin/sh -c`（后者会引入引号与注入面的问题，不推荐）。
-- 方案 B（推荐）：保留单一 `ExecStart`，由 `install.sh` 在安装后写一个 drop-in
-  `/etc/systemd/system/ball@%i.service.d/collector.conf` 覆盖 `ExecStart`。
-  drop-in 不会被 `cmake --install` 覆盖，语义也符合 systemd 的惯例。
+- 模板仍使用 `--socktrail-bin`；脚本用实例级 drop-in
+  `/etc/systemd/system/ball@<user>.service.d/collector.conf` 覆盖命令，先写空 `ExecStart=`
+  清除模板值，再设置 `--collector-socket`，不使用 `sh -c`。
+- `# X-Ball-Managed=true` 标记归属；切回内置模式与卸载只删本脚本的配置，不删其他
+  drop-in。安装遇到同名自定义文件或符号链接时拒绝覆盖，卸载则保留。
+- 检查用户名与路径，转义命令参数中的引号、反斜线、`%`、`$`；安装失败清理临时文件。
+- drop-in 固定写系统配置目录，不随安装前缀改变。`--no-enable` 只是不启用服务，
+  仍会写系统配置并 reload，不能用于无副作用的暂存测试。
+- 已运行的实例不会被 `enable --now` 重启；切换模式后需要显式
+  `sudo systemctl restart "ball@$USER.service"`，并用 `systemctl cat` 检查其他覆盖配置。
 
-**验证**：`systemd-analyze verify`；`systemctl cat ball@<user>` 确认 drop-in 生效；
-spawn 与外部两种模式各起一次，确认进程树符合预期。
+**已验证**：
 
-**风险**：中。`ExecStart` 的覆盖是 systemd 里比较容易出错的部分（多个 `ExecStart` 会
-串联而非覆盖，必须用 `ExecStart=` 空赋值清空）。需要实测。
+- `sh -n`、`bash --posix -n` 语法检查与 Ruff 检查、格式检查通过。
+- 开发构建与全量 `ctest --preset dev` 通过（10/10 组，其中 `ball_install` 含 15 个用例）。
+- 隔离安装回归覆盖配置更新、模板重装、模式切换、卸载保护、自定义文件与符号链接、
+  路径校验与转义、临时文件失败清理；提权和服务操作全部被测试替身拦截。
+- 真实 `systemd-analyze verify` 在临时 unit 搜索路径中合并实际模板与 drop-in，
+  外部与内置模式均通过，包含特殊字符参数。
+
+**未验证**：真实 `/etc` 部署、`systemctl cat` 及两种模式的实际服务进程树。
+未启停正在运行的系统服务。环境未安装 ShellCheck，未运行该静态检查器。
+
+**风险**：其他管理员 drop-in 仍可能覆盖本脚本生成的命令，应检查最终合并配置；
+更新已安装的模板不影响外部模式，但重新运行 `install.sh` 时须明确选择采集器模式。
 
 ### 3.3 共享组部署验证（低风险）
 
@@ -178,30 +191,33 @@ ball 完全用不上——所以 spawn 模式显式关掉了这两个探针，�
 
 ## 4. 复现与验证步骤
 
-```sh
-cd ~/Code/ball
-
-# 构建 + 装到临时前缀，验证文件树与 unit 语法（不改动系统）
-./install.sh --prefix /tmp/ball-check --no-enable --no-gui-autostart
-find /tmp/ball-check -type f | sort
-systemd-analyze verify /tmp/ball-check/lib/systemd/system/ball@.service
-
-# 外部采集器模式的 ExecStart
-./install.sh --prefix /tmp/ball-check2 --collector-socket /run/socktrail/collector.sock \
-             --no-enable --no-gui-autostart
-grep ExecStart /tmp/ball-check2/lib/systemd/system/ball@.service
-
-# 清理
-sudo ./install.sh --prefix /tmp/ball-check --uninstall
-sudo ./install.sh --prefix /tmp/ball-check2 --uninstall
-```
-
-真实安装（会启用开机自启）：
+无 root、无系统配置变更的自动化验证：
 
 ```sh
-./install.sh
-systemctl status ball@$USER.service
+cmake --preset dev
+cmake --build --preset dev
+ctest --preset dev
+# 仅安装脚本隔离测试（fake sudo / cmake / systemctl，全部操作留在临时目录）：
+ctest --preset dev -R ball_install
+
+# 只暂存 CMake 安装内容，不调用 install.sh，不写 /etc 或重载服务：
+DESTDIR=/tmp/ball-stage cmake --install build/dev
+find /tmp/ball-stage -type f | sort
 ```
+
+实际安装（会写系统级配置，默认启用开机自启；尚未执行真实部署验证）：
+
+```sh
+./install.sh --collector-socket /run/socktrail/collector.sock
+systemctl cat "ball@$USER.service"
+systemd-analyze verify "ball@$USER.service"
+# 已运行实例需要重启才能应用新的 ExecStart：
+sudo systemctl restart "ball@$USER.service"
+systemctl status "ball@$USER.service"
+```
+
+不传 `--collector-socket` 再次安装可切回内置采集器模式；`--uninstall` 会停用服务，
+并移除本脚本的 drop-in，但保留自定义文件和其他 drop-in。
 
 ## 5. 已知问题与踩坑
 

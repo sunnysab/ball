@@ -19,6 +19,7 @@ ball 由一个后台采集守护进程和一个桌面悬浮窗组成：后台以
 
 - CMake ≥ 3.25、Ninja
 - 支持 C++23 的编译器
+- Python 3（仅 `BUILD_TESTING=ON` 时需要，用于安装脚本的隔离回归测试）
 - Qt 6（Core / Gui / Widgets / Network）与 LayerShellQt 的 CMake 包
 - [msgpack-cxx](https://github.com/msgpack/msgpack-c)（Arch: `msgpack-cxx`；CMake 包名
   `msgpack-cxx`）。后台与界面之间的快照协议和采集器订阅协议都使用 MessagePack。
@@ -90,7 +91,15 @@ GUI 登录自启条目。
 
 前提：存在与用户名同名的私有组（见「socket 权限与私有组」），脚本会在缺失时报错并给出
 修复命令。脚本会自动使用 `build/socktrail-new` 或 `build/socktrail` 作为采集器；也可以用
-`--collector-socket <路径>` 让后台改为订阅一个已经常驻的采集器（见下文「使用外部采集器」）。
+`--collector-socket <绝对路径>` 让后台改为订阅一个已经常驻的采集器（见下文「使用外部采集器」）。
+外部模式由 `/etc/systemd/system/ball@<user>.service.d/collector.conf` 配置，不改写安装的模板
+unit，重新 `cmake --install` 也不会覆盖它。该配置是系统级文件，不受 `--prefix` 影响；
+`--no-enable` 只跳过启用服务，仍会安装文件、更新 drop-in 并执行 `daemon-reload`，**不是沙箱安装**。
+只想暂存文件时请用下面的 `DESTDIR` 方式。
+
+脚本仅覆盖或删除带 `# X-Ball-Managed=true` 标记的 `collector.conf`。同名自定义文件或符号
+链接会使安装报错；卸载则保留它们。再次安装时不传 `--collector-socket` 会移除本脚本的
+覆盖配置，恢复模板的内置采集器模式，其他 drop-in 不变。
 
 也可以手工安装：
 
@@ -156,6 +165,20 @@ socktrail 的 `install-service.sh` 装的 `socktrail.service`），可以让 bal
 ball --daemon --socket /run/ball-$USER/gui.sock \
      --collector-socket /run/socktrail/collector.sock
 ```
+
+也可通过安装脚本为指定实例配置：
+
+```sh
+./install.sh --user "$USER" --collector-socket /run/socktrail/collector.sock
+systemctl cat "ball@$USER.service"
+systemd-analyze verify "ball@$USER.service"
+# 若该实例此前已在运行，重启后才会使用新的 ExecStart：
+sudo systemctl restart "ball@$USER.service"
+```
+
+生成的 drop-in 先用空 `ExecStart=` 清除模板命令，再设置外部订阅命令；不借助 shell 执行。
+默认的 `enable --now` 不会重启已运行的实例，因此切换模式或更新路径后应手动重启。
+如果还有其他自定义 drop-in，应通过 `systemctl cat` 检查最终合并配置。
 
 - `--collector-socket` 与 `--socktrail-bin` **互斥**：前者只订阅，后者才 spawn。
 - 这条模式下 ball **不会**启动或停止采集器，采集器进程的生死由它的 unit 决定。
@@ -341,6 +364,8 @@ cmake --preset release && cmake --build --preset release
 ```
 
 测试不依赖桌面会话与 root；GUI 测试在 `QT_QPA_PLATFORM=offscreen` 下运行。
+`ball_install` 用 Python 标准库和临时目录模拟提权命令、安装与 systemctl，不访问真实 `/etc`
+或启停服务；覆盖外部配置、重装、模式切换、卸载保护、路径转义与失败清理。
 UI 回归覆盖独立详情窗口的反复开关、失焦保留、Esc、系统标题栏、列宽拖动、布局切换、三套配色、位置恢复、
 全部统计列、数值排序和搜索、命令行悬停与转义、历史进程记录，以及进程质量提示不影响网卡速率。
 采集器订阅与快照协议的回归还覆盖 IP 两个可选字段：缺失为 0、非法取值拒绝整帧、

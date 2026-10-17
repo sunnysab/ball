@@ -44,10 +44,72 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+# The user name becomes part of a unit instance name and of the drop-in path.
+case "$user" in
+  '' | *[!A-Za-z0-9_.-]*)
+    echo "invalid user '$user': only letters, digits, '_', '.' and '-' are allowed" >&2
+    exit 2 ;;
+esac
+
+# Both paths are written verbatim into a unit file, so they must be absolute
+# and free of control characters.
+check_path() {
+  case "$2" in
+    /*) ;;
+    *) echo "$1 must be an absolute path: $2" >&2; exit 2 ;;
+  esac
+  case "$2" in
+    *[[:cntrl:]]*) echo "$1 contains a control character" >&2; exit 2 ;;
+  esac
+}
+check_path --prefix "$prefix"
+if [ -n "$collector_socket" ]; then
+  check_path --collector-socket "$collector_socket"
+fi
+
 here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 build_dir=${build_dir:-$here/build/release}
 unit=ball@$user.service
 autostart_file=$HOME/.config/autostart/ball.desktop
+# External collector mode overrides the unit's ExecStart through a drop-in,
+# which a later `cmake --install` never touches.
+dropin_dir=/etc/systemd/system/$unit.d
+dropin_file=$dropin_dir/collector.conf
+
+# A drop-in belongs to this script only when it is a regular file carrying the
+# exact marker line; anything else is someone else's configuration.
+dropin_exists() {
+  sudo test -e "$dropin_file" || sudo test -L "$dropin_file"
+}
+dropin_is_mine() {
+  if sudo test -L "$dropin_file" || ! sudo test -f "$dropin_file"; then
+    return 1
+  fi
+  sudo grep -qx '# X-Ball-Managed=true' "$dropin_file"
+}
+# systemd does not run ExecStart through a shell, so quoting is the whole
+# protection: escape the quote characters and the % / $ markers.
+unit_arg() {
+  printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/%/%%/g' -e 's/\$/$$/g'
+}
+write_dropin() {
+  exec_start="\"$(unit_arg "$prefix/bin/ball")\" --daemon --socket /run/ball-%i/gui.sock"
+  exec_start="$exec_start --collector-socket \"$(unit_arg "$collector_socket")\""
+  tmp=$(mktemp) || exit 1
+  # The local copy goes away on success and on failure alike.
+  trap 'rm -f "$tmp"' EXIT
+  trap 'exit 1' HUP INT TERM
+  {
+    echo '# X-Ball-Managed=true'
+    echo '[Service]'
+    echo 'ExecStart='
+    # printf, not echo: dash would interpret the backslashes of the escaped path.
+    printf '%s\n' "ExecStart=$exec_start"
+  } > "$tmp"
+  sudo install -D -m 0644 "$tmp" "$dropin_file"
+  rm -f "$tmp"
+  trap - EXIT HUP INT TERM
+}
 
 if [ "$(uname -s)" != Linux ]; then
   echo 'ball supports Linux only' >&2
@@ -68,6 +130,16 @@ if [ "$uninstall" = yes ]; then
   sudo rm -f "$prefix/bin/ball"
   sudo rm -f "$prefix/libexec/ball/socktrail"
   sudo rmdir "$prefix/libexec/ball" 2>/dev/null || true
+  # Only a drop-in this script wrote is removed; a custom file stays, since it
+  # is the only record of how that instance finds its collector.
+  if dropin_exists; then
+    if dropin_is_mine; then
+      sudo rm -f "$dropin_file"
+      sudo rmdir "$dropin_dir" 2>/dev/null || true
+    else
+      echo "kept $dropin_file: it was not written by this script" >&2
+    fi
+  fi
   # The GUI autostart entry is the user's own file; only a managed one is removed.
   if [ -f "$autostart_file" ] && grep -q '^X-Ball-Managed=true' "$autostart_file"; then
     rm -f "$autostart_file"
@@ -79,7 +151,7 @@ fi
 
 # --- prerequisites -------------------------------------------------------
 if ! command -v systemctl >/dev/null 2>&1; then
-  echo 'systemd is required: ball installs two systemd units' >&2
+  echo 'systemd is required: ball runs its backend as a systemd service instance' >&2
   exit 1
 fi
 # Group=%i needs a private group named after the user; without it the unit
@@ -91,23 +163,34 @@ if ! getent group "$user" >/dev/null 2>&1; then
   exit 1
 fi
 
+# Refuse a mode switch before touching anything when the drop-in at our path is
+# not ours: spawn mode must not claim a switch it cannot make.
+if dropin_exists && ! dropin_is_mine; then
+  echo "$dropin_file already exists and was not written by this script" >&2
+  if [ -n "$collector_socket" ]; then
+    echo "move it aside to use --collector-socket" >&2
+  else
+    echo "this instance keeps using the collector configured there" >&2
+  fi
+  exit 1
+fi
+
 # --- build ---------------------------------------------------------------
 if [ "$build" = yes ]; then
-  cmake_args="-DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=$prefix -DBUILD_TESTING=OFF"
+  set -- -DCMAKE_BUILD_TYPE=Release "-DCMAKE_INSTALL_PREFIX=$prefix" -DBUILD_TESTING=OFF
   # Bundle the collector unless the caller wants an external one.
   if [ -n "$collector_socket" ]; then
     echo "using the external collector at $collector_socket"
   elif [ -x "$here/build/socktrail-new" ]; then
-    cmake_args="$cmake_args -DBALL_SOCKTRAIL_BINARY=$here/build/socktrail-new"
+    set -- "$@" "-DBALL_SOCKTRAIL_BINARY=$here/build/socktrail-new"
   elif [ -x "$here/build/socktrail" ]; then
-    cmake_args="$cmake_args -DBALL_SOCKTRAIL_BINARY=$here/build/socktrail"
+    set -- "$@" "-DBALL_SOCKTRAIL_BINARY=$here/build/socktrail"
   else
     echo "no collector binary found in $here/build; pass --collector-socket PATH" >&2
     echo "for an external collector, or build socktrail first" >&2
     exit 1
   fi
-  # shellcheck disable=SC2086
-  cmake -S "$here" -B "$build_dir" -G Ninja $cmake_args
+  cmake -S "$here" -B "$build_dir" -G Ninja "$@"
   cmake --build "$build_dir"
 fi
 
@@ -120,11 +203,15 @@ fi
 # installing the files somewhere else is exactly what a staged test wants.
 sudo cmake --install "$build_dir" --prefix "$prefix"
 
-# An external collector means the packaged unit must not spawn its own.
+# An external collector means the packaged unit must not spawn its own; the
+# drop-in overrides ExecStart and survives a reinstall of the template.
 if [ -n "$collector_socket" ]; then
-  unit_path=$prefix/lib/systemd/system/ball@.service
-  echo "rewriting ExecStart to subscribe to $collector_socket"
-  sudo sed -i "s|--socktrail-bin \"[^\"]*\"|--collector-socket \"$collector_socket\"|" "$unit_path"
+  echo "installing $dropin_file to subscribe to $collector_socket"
+  write_dropin
+elif dropin_exists; then
+  echo "removing $dropin_file to spawn the bundled collector again"
+  sudo rm -f "$dropin_file"
+  sudo rmdir "$dropin_dir" 2>/dev/null || true
 fi
 
 command -v systemctl >/dev/null 2>&1 && sudo systemctl daemon-reload

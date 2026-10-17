@@ -187,11 +187,12 @@ ball 目前**只有**网卡和进程两个视图。`flow` 帧、`--socket-sniff`
 外部采集器给非 root 消费方使用时，需要 unit 的 `--socket-mode 0660` 加一个共享组，
 并确保 socket 目录组可进入。当前文档已说明，未做实际部署验证。
 
-### 7.4 让 ball 的 unit 也支持外部采集器
+### 7.4 让 ball 的 unit 也支持外部采集器（已完成）
 
-`packaging/ball@.service.in` 目前写死 `--socktrail-bin`。若要默认走外部采集器，
-需要给 unit 加一个可选的 `--collector-socket`（例如按环境文件或 drop-in 选择），
-并相应调整「关闭后台不留下采集子进程」的验收项。
+`install.sh --collector-socket` 使用实例级 drop-in 覆盖 `ExecStart`，保留模板的
+`--socktrail-bin` 默认值，重新安装模板不覆盖外部配置。隔离安装测试与 systemd
+配置语法验证通过，尚未启停真实系统服务；详见 `docs/next-steps-handoff.md` §3.2。
+外部采集器不属于 ball 子进程，停止 ball 时不应终止它。
 
 ## 8. 相关文件
 
