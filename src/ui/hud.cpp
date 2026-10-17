@@ -420,6 +420,8 @@ void Hud::applyStatus() {
     m_statusLabel->setText(marker);
     m_statusLabel->setAccessibleName(summary.isEmpty() ? QStringLiteral("采集正常") : summary);
     m_details->setStatus(summary, reasons);
+    // Explanations are shown separately and never turn into a gap marker.
+    m_details->setInfo(snapshot.has_value() ? snapshot->processStatus.info : QStringList{});
 
     QStringList tip{QStringLiteral("所选网卡：%1")
                         .arg(m_selectedInterfaces.isEmpty()

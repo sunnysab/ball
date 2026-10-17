@@ -38,6 +38,7 @@
 #include <QStandardPaths>
 #include <QTabWidget>
 #include <QTableView>
+#include <QTableWidget>
 #include <QTemporaryDir>
 #include <QTest>
 #include <QTimer>
@@ -70,7 +71,7 @@ QDateTime isoAt(const QString& text) { return QDateTime::fromString(text, Qt::IS
 // decoder against what the daemon actually writes.
 Snapshot makeSnapshot(const QDateTime& at = isoAt(u"2026-10-14T14:30:02+08:00"_s),
                       bool interfacesAvailable = true, bool processAvailable = true,
-                      bool processStale = false) {
+                      bool processStale = false, const QStringList& processInfo = {}) {
     Snapshot snapshot;
     snapshot.version = 1;
     snapshot.started = isoAt(u"2026-10-14T14:30:00+08:00"_s);
@@ -78,7 +79,8 @@ Snapshot makeSnapshot(const QDateTime& at = isoAt(u"2026-10-14T14:30:02+08:00"_s
     snapshot.interfacesAvailable = interfacesAvailable;
     snapshot.interfaceError =
         interfacesAvailable ? QString() : QStringLiteral("rtnetlink dump failed");
-    snapshot.processStatus = ProcessStatus{processAvailable, processStale, false, QString(), {}};
+    snapshot.processStatus =
+        ProcessStatus{processAvailable, processStale, false, QString(), {}, processInfo};
     // The collector-run IP totals: a byte count no process here can produce,
     // plus a value whose low bits only survive as an integer. Both are shown as
     // their own calibre, never added to the interface or process totals.
@@ -124,16 +126,50 @@ Snapshot makeSnapshot(const QDateTime& at = isoAt(u"2026-10-14T14:30:02+08:00"_s
         process(42, 1, u"code"_s, true, 99, 99, 9.0, 9.0),
         process(7, 2, u"dead"_s, false, 7, 7, 0.0, 0.0),
     };
+
+    // Synthetic connections, one per participant source, so the drilldown from
+    // the process table can be checked end to end. The 2^53+1 start_ns matches
+    // firefox's identity, which a double would round to a neighbouring value.
+    const auto connection = [](quint64 id, const QString& protocol, const QString& name,
+                               const QString& app, const QString& source, const QString& target,
+                               double rxBps) {
+        ball::ConnectionSnapshot row;
+        row.id = id;
+        row.protocol = protocol;
+        row.name = name;
+        row.app = app;
+        row.state = QStringLiteral("established");
+        row.direction = QStringLiteral("outbound");
+        row.source = source;
+        row.target = target;
+        row.firstSeen = isoAt(u"2026-10-14T14:30:01+08:00"_s);
+        row.lastSeen = isoAt(u"2026-10-14T14:30:02+08:00"_s);
+        row.rxBps = rxBps;
+        return row;
+    };
+    ball::ConnectionSnapshot firefoxRow =
+        connection(1, u"tcp"_s, u"example.org"_s, u"firefox"_s, u"10.0.0.2:51000"_s,
+                   u"93.184.216.34:443"_s, 900.0);
+    firefoxRow.client = ball::ConnectionProcess{1234, 9007199254740993ULL, u"firefox"_s, 1024, 128};
+    ball::ConnectionSnapshot codeRow = connection(2, u"udp"_s, u"api.example.com"_s, u"code"_s,
+                                                  u"10.0.0.2:53000"_s, u"203.0.113.7:53"_s, 50.0);
+    codeRow.server = ball::ConnectionProcess{42, 1, u"code"_s, 99, 99};
+    ball::ConnectionSnapshot unknownRow =
+        connection(3, u"quic"_s, u"cdn.example.net"_s, QString(), u"10.0.0.2:54000"_s,
+                   u"198.51.100.9:443"_s, 10.0);
+    snapshot.connections = {firefoxRow, codeRow, unknownRow};
+    snapshot.connectionStatus.available = true;
+    snapshot.connectionStatus.stale = false;
     return snapshot;
 }
 
 // The frame bytes of `makeSnapshot`, which is what a socket write carries.
 QByteArray snapshotFrame(const QDateTime& at = isoAt(u"2026-10-14T14:30:02+08:00"_s),
                          bool interfacesAvailable = true, bool processAvailable = true,
-                         bool processStale = false) {
+                         bool processStale = false, const QStringList& processInfo = {}) {
     bool ok = false;
     const QByteArray frame = ball::encodeSnapshot(
-        makeSnapshot(at, interfacesAvailable, processAvailable, processStale), ok);
+        makeSnapshot(at, interfacesAvailable, processAvailable, processStale, processInfo), ok);
     Q_ASSERT(ok);
     return frame;
 }
@@ -205,6 +241,8 @@ private Q_SLOTS:
     // Widgets
     void showsDigitsFromSnapshot();
     void switchesTabsAndSortsProcesses();
+    void drillsProcessRowIntoConnectionsTab();
+    void processInfoIsNeutralPlainTextWithoutWarning();
     void filtersIdleProcessesAndSearch();
     void interfaceSelectionExcludesLoopback();
     void clickOpensIndependentDetailsAndDragDoesNot();
@@ -873,6 +911,8 @@ void TestUi::switchesTabsAndSortsProcesses() {
     QVERIFY(table != nullptr);
     QCOMPARE(tabs->tabText(0), u"进程"_s);
     QCOMPARE(tabs->tabText(1), u"网卡"_s);
+    QCOMPARE(tabs->tabText(2), u"连接"_s);
+    QCOMPARE(tabs->count(), 3);
 
     // firefox (512 B/s) sorts above code (9 B/s) with the real rate column.
     QAbstractItemModel* model = table->model();
@@ -909,6 +949,98 @@ void TestUi::filtersIdleProcessesAndSearch() {
     search->clear();
     showIdle->setChecked(false);
     QCOMPARE(table->model()->rowCount(), 2);
+}
+
+void TestUi::drillsProcessRowIntoConnectionsTab() {
+    QSettings settings(m_settingsPath, QSettings::IniFormat);
+    Hud hud(startServer(), settings);
+    QVERIFY(acceptConnection() != nullptr);
+    send(snapshotFrame());
+    auto* details = hud.detailsWindow();
+    auto* tabs = details->findChild<QTabWidget*>(u"details.tabs"_s);
+    auto* table = details->findChild<QTableView*>(u"details.processTable"_s);
+    auto* search = details->findChild<QLineEdit*>(u"details.search"_s);
+    auto* viewConnections = details->findChild<QToolButton*>(u"details.viewConnections"_s);
+    auto* clearProcess = details->findChild<QToolButton*>(u"connections.clearProcess"_s);
+    auto* connTable = details->findChild<QTableWidget*>(u"connections.table"_s);
+    QVERIFY(tabs && table && search && viewConnections && clearProcess && connTable);
+    QVERIFY(waitFor([table] { return table->model()->rowCount() == 2; }));
+    // The connection page rebuilds on show, so the window must be visible for
+    // its table to be populated.
+    hud.showDetails();
+    QCoreApplication::processEvents();
+
+    // Sort ascending by rate: "code" (9 B/s) is shown first, but it is the
+    // second row of the original insertion order (firefox, code). Drilling by
+    // the raw list index would pick firefox; the identity must come from the
+    // model row the view index actually points at.
+    table->sortByColumn(3, Qt::AscendingOrder);
+    QCOMPARE(findText(table->model(), 0, 1), u"42"_s);
+    table->selectRow(0);
+    QCOMPARE(findText(table->model(), 0, 1), u"42"_s);
+
+    // The button is disabled until a row is selected, then enables.
+    QVERIFY(viewConnections->isEnabled());
+    viewConnections->click();
+    QCoreApplication::processEvents();
+    QCOMPARE(tabs->currentIndex(), 2);
+    // Only code's own connection matches (pid 42, start_ns 1).
+    QCOMPARE(connTable->rowCount(), 1);
+    QCOMPARE(connTable->item(0, 3)->text(), u"203.0.113.7:53"_s);
+
+    // Clearing the filter restores every process's connections.
+    clearProcess->click();
+    QCOMPARE(connTable->rowCount(), 3);
+    QVERIFY(clearProcess->isHidden());
+
+    // The double-click path picks the selected row without pressing the button.
+    tabs->setCurrentIndex(0);
+    search->setText(u"firefox"_s);
+    QCOMPARE(table->model()->rowCount(), 1);
+    table->selectRow(0);
+    // Emitting the view's own signal drives the real double-click handler.
+    table->doubleClicked(table->model()->index(0, 0));
+    QCoreApplication::processEvents();
+    QCOMPARE(tabs->currentIndex(), 2);
+    QCOMPARE(connTable->rowCount(), 1);
+    QCOMPARE(connTable->item(0, 3)->text(), u"93.184.216.34:443"_s);
+    // The active process filter names the drilled process, not a stale one.
+    auto* processFilter = details->findChild<QLabel*>(u"connections.processFilter"_s);
+    QVERIFY(processFilter->text().contains(u"1234"_s));
+
+    // Switching tabs must not discard the connection page's own query.
+    auto* connSearch = details->findChild<QLineEdit*>(u"connections.search"_s);
+    QVERIFY(connSearch != nullptr);
+    connSearch->setText(u"example.org"_s);
+    tabs->setCurrentIndex(0);
+    tabs->setCurrentIndex(2);
+    QCOMPARE(connSearch->text(), u"example.org"_s);
+    clearProcess->click();
+}
+
+void TestUi::processInfoIsNeutralPlainTextWithoutWarning() {
+    QSettings settings(m_settingsPath, QSettings::IniFormat);
+    Hud hud(startServer(), settings);
+    QVERIFY(acceptConnection() != nullptr);
+
+    // Only info[] is set: a diagnostic, not a loss. It must show as plain text
+    // in the details window and must not become a quality warning or a gap.
+    const QString diagnostic = u"<b>unmatched</b> sockets on eth0"_s;
+    send(snapshotFrame(isoAt(u"2026-10-14T14:30:02+08:00"_s), true, true, false, {diagnostic}));
+    auto* details = hud.detailsWindow();
+    auto* info = details->findChild<QLabel*>(u"details.info"_s);
+    auto* quality = details->findChild<QLabel*>(u"details.quality"_s);
+    auto* status = hud.findChild<QLabel*>(u"hud.status"_s);
+    QVERIFY(info && quality && status);
+    QVERIFY(waitFor([info] { return !info->text().isEmpty(); }));
+    // External text is never rendered as HTML.
+    QCOMPARE(info->textFormat(), Qt::PlainText);
+    QCOMPARE(info->text(), diagnostic);
+    // The markup survives verbatim: it was never interpreted as HTML.
+    QVERIFY(info->text().contains(u"<b>"_s));
+    // The diagnostic alone is not a quality problem: no ! marker, no warning.
+    QVERIFY(quality->text().isEmpty());
+    QVERIFY(status->text().isEmpty());
 }
 
 void TestUi::interfaceSelectionExcludesLoopback() {

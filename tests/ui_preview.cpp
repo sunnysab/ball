@@ -16,6 +16,8 @@
 #include <QPainter>
 #include <QPixmap>
 #include <QSettings>
+#include <QTabWidget>
+#include <QTableWidget>
 #include <QTemporaryDir>
 #include <QTimer>
 
@@ -26,7 +28,8 @@ using namespace Qt::StringLiterals;
 namespace {
 
 // The samples the preview renders. The values are chosen to exercise the HUD:
-// byte rates, a stopped process and a quality note.
+// byte rates, a stopped process, a quality note and three synthetic
+// connections with distinct protocols, names and processes.
 ball::Snapshot mockSnapshot() {
     const auto at = [](const QString& text) { return QDateTime::fromString(text, Qt::ISODate); };
     const auto interface = [](quint32 index, const QString& name, ball::InterfaceKind kind,
@@ -87,6 +90,50 @@ ball::Snapshot mockSnapshot() {
         process(733, 1500000000000000000ULL, u"systemd-networkd"_s, false, 1048576ULL, 262144ULL,
                 0.0, 0.0),
     };
+
+    const auto connection = [&at](quint64 id, const QString& protocol, const QString& name,
+                                  const QString& app, const QString& source, const QString& target,
+                                  const QString& direction, double rx, double tx) {
+        ball::ConnectionSnapshot row;
+        row.id = id;
+        row.protocol = protocol;
+        row.name = name;
+        row.app = app;
+        row.state = u"established"_s;
+        row.direction = direction;
+        row.source = source;
+        row.target = target;
+        row.firstSeen = at(u"2026-10-15T09:40:00+08:00"_s);
+        row.lastSeen = at(u"2026-10-15T09:41:07+08:00"_s);
+        row.rxBps = rx;
+        row.txBps = tx;
+        return row;
+    };
+    ball::ConnectionSnapshot https =
+        connection(1, u"tcp"_s, u"example.org"_s, u"firefox"_s, u"10.0.0.2:51000"_s,
+                   u"93.184.216.34:443"_s, u"outbound"_s, 1500000.0, 51200.0);
+    https.client = {4821, 9007199254740993ULL, u"firefox"_s, 966367641ULL, 52428800ULL};
+    https.interfaces = {u"eno1"_s};
+    https.packets = 51234;
+    https.rttUs = 12000;
+    https.rttSource = u"tcp_info"_s;
+    https.detail = u"TLS SNI: example.org"_s;
+    ball::ConnectionSnapshot dns =
+        connection(2, u"udp"_s, u"api.example.com"_s, u"code-insiders"_s, u"10.0.0.2:53000"_s,
+                   u"203.0.113.7:53"_s, u"outbound"_s, 24000.0, 18000.0);
+    dns.server = {9134, 1770000000000000000ULL, u"code-insiders"_s, 268435456ULL, 10485760ULL};
+    dns.interfaces = {u"eno1"_s};
+    dns.packets = 320;
+    ball::ConnectionSnapshot quic =
+        connection(3, u"quic"_s, u"cdn.example.net"_s, QString(), u"10.0.0.2:54000"_s,
+                   u"198.51.100.9:443"_s, u"outbound"_s, 380000.0, 42000.0);
+    quic.io.append({2210, 1600000000000000000ULL, u"mpv"_s, 2147483648ULL, 2097152ULL});
+    quic.interfaces = {u"eno1"_s};
+    quic.packets = 2048;
+    quic.retransmits = 3;
+    snapshot.connections = {https, dns, quic};
+    snapshot.connectionStatus.available = true;
+    snapshot.connectionStatus.stale = false;
     return snapshot;
 }
 
@@ -163,6 +210,30 @@ int main(int argc, char* argv[]) {
             app.exit(1);
             return;
         }
+        // The connection tab needs its own screenshot. It is switched to and a
+        // row is selected so the details pane is visible; the process and
+        // interface screenshots above are untouched.
+        auto* details = hud.detailsWindow();
+        auto* tabs = details->findChild<QTabWidget*>(u"details.tabs"_s);
+        auto* table = details->findChild<QTableWidget*>(u"connections.table"_s);
+        if (tabs != nullptr) {
+            tabs->setCurrentIndex(2);
+            QCoreApplication::processEvents();
+            if (table != nullptr && table->rowCount() > 0) {
+                table->selectRow(0);
+                QCoreApplication::processEvents();
+            }
+        }
+        const QPixmap connectionShot = details->grab();
+        const QString connectionsOutput = file.absolutePath() + QLatin1Char('/') +
+                                          file.completeBaseName() +
+                                          QStringLiteral("-connections.png");
+        if (!connectionShot.save(connectionsOutput)) {
+            std::fprintf(stderr, "preview: cannot write %s\n", qPrintable(connectionsOutput));
+            app.exit(1);
+            return;
+        }
+        std::fprintf(stdout, "%s\n", qPrintable(connectionsOutput));
         std::fprintf(stdout, "%s\n", qPrintable(output));
         app.exit(0);
     });

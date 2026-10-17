@@ -11,8 +11,11 @@ class QLabel;
 class QLineEdit;
 class QTabWidget;
 class QTableView;
+class QToolButton;
 
 namespace ball::ui {
+
+class ConnectionsView;
 
 class Details : public QWidget {
     Q_OBJECT
@@ -22,6 +25,9 @@ public:
     void setSnapshot(const std::optional<Snapshot>& snapshot, bool fresh,
                      const QStringList& selectedInterfaces);
     void setStatus(const QString& summary, const QStringList& reasons);
+    // Explanations only (process_status.info). Displayed as neutral plain text;
+    // never drives the quality warning or the HUD gap marker.
+    void setInfo(const QStringList& info);
     void setTheme(Theme theme);
 
 protected:
@@ -30,6 +36,9 @@ protected:
 private:
     void rebuildTables();
     void filterTables();
+    // Drills into the connection tab using the selected row's real identity,
+    // never its position in the original (unsorted) list.
+    void openConnectionsForCurrentRow();
 
     std::optional<Snapshot> m_snapshot;
     bool m_fresh = false;
@@ -38,14 +47,19 @@ private:
     QLabel* m_upLabels[3]{};
     QLabel* m_ipLabel = nullptr;
     QLabel* m_startedLabel = nullptr;
+    // Explanations from process_status.info. Neutral, plain text, never a warning.
+    QLabel* m_infoLabel = nullptr;
     QWidget* m_quality = nullptr;
     QLabel* m_qualitySummary = nullptr;
     QLabel* m_qualityReasons = nullptr;
+    QWidget* m_tools = nullptr;
     QLineEdit* m_search = nullptr;
     QCheckBox* m_showIdle = nullptr;
+    QToolButton* m_viewConnections = nullptr;
     QTabWidget* m_tabs = nullptr;
     QTableView* m_processTable = nullptr;
     QTableView* m_interfaceTable = nullptr;
+    ConnectionsView* m_connections = nullptr;
 };
 
 } // namespace ball::ui

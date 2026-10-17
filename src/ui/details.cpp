@@ -2,6 +2,7 @@
 #include "ui/details.h"
 
 #include "process.h"
+#include "ui/connections.h"
 #include "ui/format.h"
 #include "ui/traffic_model.h"
 
@@ -11,6 +12,7 @@
 #include <QFrame>
 #include <QHBoxLayout>
 #include <QHeaderView>
+#include <QItemSelectionModel>
 #include <QKeyEvent>
 #include <QLabel>
 #include <QLineEdit>
@@ -38,6 +40,7 @@ struct TableRow {
     QList<double> keys;
     bool idle = false;
     QString search;
+    QString name;
     int pid = 0;
     quint64 startNs = 0;
 };
@@ -70,6 +73,10 @@ public:
     int rowCount(const QModelIndex& parent = {}) const override {
         return parent.isValid() ? 0 : int(m_visible.size());
     }
+    // The row a view index points at after filtering and sorting. The exact
+    // (pid, startNs) identity is kept as an integer here, so a caller never has
+    // to read it back from a formatted cell or a pre-sort list position.
+    const TableRow& visibleRow(int viewRow) const { return m_rows.at(m_visible.at(viewRow)); }
     int columnCount(const QModelIndex& parent = {}) const override {
         return parent.isValid() ? 0 : int(m_headers.size());
     }
@@ -263,16 +270,35 @@ Details::Details() : QWidget(nullptr, Qt::Window) {
     qualityLayout->addWidget(m_qualityReasons);
     layout->addWidget(m_quality);
 
-    auto* tools = new QHBoxLayout;
-    m_search = new QLineEdit(this);
+    // Diagnostics from process_status.info. It is an explanation, not a quality
+    // problem: it never makes the HUD show a gap marker and is plain text.
+    m_infoLabel = new QLabel(this);
+    m_infoLabel->setObjectName(QStringLiteral("details.info"));
+    m_infoLabel->setProperty("role", "muted");
+    m_infoLabel->setTextFormat(Qt::PlainText);
+    m_infoLabel->setWordWrap(true);
+    m_infoLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    m_infoLabel->setVisible(false);
+    layout->addWidget(m_infoLabel);
+
+    m_tools = new QWidget(this);
+    auto* tools = new QHBoxLayout(m_tools);
+    tools->setContentsMargins(0, 0, 0, 0);
+    m_search = new QLineEdit(m_tools);
     m_search->setObjectName(QStringLiteral("details.search"));
     m_search->setPlaceholderText(QStringLiteral("搜索进程名或 PID"));
     m_search->setClearButtonEnabled(true);
     tools->addWidget(m_search, 1);
-    m_showIdle = new QCheckBox(QStringLiteral("显示空闲"), this);
+    m_showIdle = new QCheckBox(QStringLiteral("显示空闲"), m_tools);
     m_showIdle->setObjectName(QStringLiteral("details.showIdle"));
     tools->addWidget(m_showIdle);
-    layout->addLayout(tools);
+    m_viewConnections = new QToolButton(m_tools);
+    m_viewConnections->setObjectName(QStringLiteral("details.viewConnections"));
+    m_viewConnections->setText(QStringLiteral("查看连接"));
+    m_viewConnections->setToolTip(QStringLiteral("用当前选中的进程筛选连接页"));
+    m_viewConnections->setEnabled(false);
+    tools->addWidget(m_viewConnections);
+    layout->addWidget(m_tools);
 
     m_tabs = new QTabWidget(this);
     m_tabs->setObjectName(QStringLiteral("details.tabs"));
@@ -280,8 +306,11 @@ Details::Details() : QWidget(nullptr, Qt::Window) {
     m_processTable->setObjectName(QStringLiteral("details.processTable"));
     m_interfaceTable = new QTableView(m_tabs);
     m_interfaceTable->setObjectName(QStringLiteral("details.interfaceTable"));
+    m_connections = new ConnectionsView(m_tabs);
+    m_connections->setObjectName(QStringLiteral("details.connections"));
     m_tabs->addTab(m_processTable, QStringLiteral("进程"));
     m_tabs->addTab(m_interfaceTable, QStringLiteral("网卡"));
+    m_tabs->addTab(m_connections, QStringLiteral("连接"));
     layout->addWidget(m_tabs, 1);
 
     m_processTable->setModel(new TrafficTableModel(
@@ -319,10 +348,25 @@ Details::Details() : QWidget(nullptr, Qt::Window) {
     }
     connect(m_search, &QLineEdit::textChanged, this, &Details::filterTables);
     connect(m_showIdle, &QCheckBox::toggled, this, &Details::filterTables);
+    connect(m_viewConnections, &QToolButton::clicked, this, &Details::openConnectionsForCurrentRow);
+    connect(m_processTable, &QTableView::doubleClicked, this,
+            [this] { openConnectionsForCurrentRow(); });
+    connect(m_processTable->selectionModel(), &QItemSelectionModel::selectionChanged, this, [this] {
+        const bool hasRow = !m_processTable->selectionModel()->selectedRows().isEmpty() ||
+                            m_processTable->currentIndex().isValid();
+        m_viewConnections->setEnabled(hasRow);
+    });
     connect(m_tabs, &QTabWidget::currentChanged, this, [this](int index) {
+        // The process/interface search and idle filter do not apply to the
+        // connection page, which owns its own filters; hide the duplicates.
+        m_tools->setVisible(index != 2);
         m_search->setPlaceholderText(index == 0 ? QStringLiteral("搜索进程名或 PID")
                                                 : QStringLiteral("搜索网卡名"));
-        m_search->clear();
+        if (index != 2) {
+            m_search->clear();
+        }
+        // Switching tabs must not discard the connection page's own query state.
+        m_connections->setSnapshot(m_snapshot, m_fresh);
     });
 
     m_startedLabel = new QLabel(this);
@@ -339,6 +383,13 @@ void Details::setStatus(const QString& summary, const QStringList& reasons) {
     m_qualitySummary->setText(summary);
     m_qualityReasons->setText(reasons.join(QLatin1Char('\n')));
     m_quality->setVisible(!summary.isEmpty());
+}
+
+void Details::setInfo(const QStringList& info) {
+    // Explanations only: shown as neutral plain text and never triggers the
+    // quality warning, the HUD gap marker or an "incomplete" state.
+    m_infoLabel->setText(info.join(QLatin1Char('\n')));
+    m_infoLabel->setVisible(!info.isEmpty());
 }
 
 void Details::setSnapshot(const std::optional<Snapshot>& snapshot, bool fresh,
@@ -375,6 +426,9 @@ void Details::setSnapshot(const std::optional<Snapshot>& snapshot, bool fresh,
             : placeholder();
     m_startedLabel->setText(
         QStringLiteral("本次监测开始于 %1 · 统计仅保存在后台内存，后台重启后清零").arg(started));
+    // The connection page is fed by the same snapshot. A connection failure
+    // therefore never touches the interface or process values above.
+    m_connections->setSnapshot(snapshot, fresh);
     rebuildTables();
 }
 
@@ -414,6 +468,7 @@ void Details::rebuildTables() {
                 item.idle = true;
             }
             item.search = displayName + QLatin1Char(' ') + QString::number(row.pid);
+            item.name = displayName;
             item.pid = row.pid;
             item.startNs = row.startNs;
             processes.append(item);
@@ -437,6 +492,26 @@ void Details::filterTables() {
         static_cast<TrafficTableModel*>(table->model())
             ->setFilter(m_search->text(), !m_showIdle->isChecked());
     }
+}
+
+void Details::openConnectionsForCurrentRow() {
+    auto* model = static_cast<TrafficTableModel*>(m_processTable->model());
+    // A selected row is authoritative; fall back to the current index for a
+    // keyboard-driven cursor. Either way the view index is resolved through the
+    // model, so sorting or filtering cannot make the original list position
+    // select a different process.
+    QModelIndex index = m_processTable->currentIndex();
+    const auto selected = m_processTable->selectionModel()->selectedRows();
+    if (!selected.isEmpty()) {
+        index = selected.first();
+    }
+    if (!index.isValid() || index.row() < 0 || index.row() >= model->rowCount() ||
+        model->columnCount() == 0) {
+        return;
+    }
+    const TableRow& row = model->visibleRow(index.row());
+    m_connections->setProcessFilter(row.pid, row.startNs, row.name);
+    m_tabs->setCurrentIndex(2);
 }
 
 void Details::keyPressEvent(QKeyEvent* event) {
