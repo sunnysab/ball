@@ -13,14 +13,16 @@ ball 由一个后台采集守护进程和一个桌面悬浮窗组成：后台以
 - 后台需要 root：AF_PACKET 抓包、eBPF/BTF 程序挂载、读取其他用户的 `/proc/<pid>`
   都要求特权；悬浮窗本身不需要 root，也不做任何特权操作。
 - 流量采集由外部 Go 程序 [socktrail](https://github.com/jimyag/socktrail) 完成，
-  ball 不抓包，只管理该子进程并订阅它的 NDJSON 输出。
+  ball 不抓包，只管理该子进程并订阅它的 MessagePack 输出。
 
 ## 依赖
 
 - CMake ≥ 3.25、Ninja
 - 支持 C++23 的编译器
 - Qt 6（Core / Gui / Widgets / Network）与 LayerShellQt 的 CMake 包
-- 可执行的外部采集器 `socktrail`（见下节）
+- [msgpack-cxx](https://github.com/msgpack/msgpack-c)（Arch: `msgpack-cxx`；CMake 包名
+  `msgpack-cxx`）。后台与界面之间的快照协议和采集器订阅协议都使用 MessagePack。
+- 可执行的外部采集器 `socktrail`（见下节），需要以 `--output msgpack` 输出。
 
 以上全部来自发行版包，构建过程不联网、不下载任何依赖。
 
@@ -75,6 +77,23 @@ cmake --build build/release
 
 ### 3. 安装
 
+推荐用 `install.sh`：它负责构建、安装文件、启用开机自启的后台服务，并写入当前用户的
+GUI 登录自启条目。
+
+```sh
+./install.sh                     # 构建 + 安装 + 启用开机自启（当前用户）
+./install.sh --prefix /usr       # 装到发行版风格前缀
+./install.sh --no-enable         # 只安装文件，不启用服务
+./install.sh --no-gui-autostart  # 只装后台，不写 GUI 登录自启
+./install.sh --uninstall         # 停用并移除本脚本添加的文件
+```
+
+前提：存在与用户名同名的私有组（见「socket 权限与私有组」），脚本会在缺失时报错并给出
+修复命令。脚本会自动使用 `build/socktrail-new` 或 `build/socktrail` 作为采集器；也可以用
+`--collector-socket <路径>` 让后台改为订阅一个已经常驻的采集器（见下文「使用外部采集器」）。
+
+也可以手工安装：
+
 ```sh
 # 先暂存验证安装内容，不写系统目录
 DESTDIR=/tmp/ball-stage cmake --install build/release
@@ -95,6 +114,16 @@ sudo cmake --install build/release
 ```
 
 ## 运行
+
+ball 有两层「自启」，职责不同：
+
+- **后台服务开机自启**：systemd 模板 `ball@<user>.service`，`WantedBy=multi-user.target`，
+  开机就起，与是否登录桌面无关。`install.sh` 默认启用它。
+- **GUI 登录自启**：当前用户的 `~/.config/autostart/ball.desktop`，只在登录 KDE 会话时
+  拉起悬浮窗。`install.sh` 默认写入，也可以之后用托盘/右键菜单的「登录时启动界面」开关。
+
+只装后台不装 GUI 自启，用 `./install.sh --no-gui-autostart`。想临时停掉 GUI 自启而不动
+后台，用界面里的开关即可（它只写用户自己的 autostart 文件，不碰 systemd）。
 
 ### 后台服务（root，systemd）
 
@@ -117,6 +146,26 @@ unit 以 `User=root Group=%i` 启动，创建运行目录 `/run/ball-%i`（`0750
 运行。停止时先给守护进程发 SIGTERM，由它自己清理采集子进程；`TimeoutStopSec=10`
 之后才会强杀整个进程组。
 
+#### 使用外部采集器（可选）
+
+默认由后台自己拉起并看管采集器。如果采集器已经作为独立服务常驻（例如
+socktrail 的 `install-service.sh` 装的 `socktrail.service`），可以让 ball 只订阅它，
+不再自己启动一个：
+
+```sh
+ball --daemon --socket /run/ball-$USER/gui.sock \
+     --collector-socket /run/socktrail/collector.sock
+```
+
+- `--collector-socket` 与 `--socktrail-bin` **互斥**：前者只订阅，后者才 spawn。
+- 这条模式下 ball **不会**启动或停止采集器，采集器进程的生死由它的 unit 决定。
+  因此「关闭后台不留下采集子进程」的保证不适用——采集器本来就不属于 ball。
+- 采集器的 socket 必须对运行后台的用户可读写。systemd 常驻采集器默认是 `0660` +
+  组 root，而 ball 后台以 root 运行，所以直接用即可；若消费方在别的账号，需要在
+  采集器侧把 socket 组改成共享组。
+- 采集器需要以 `--socket-kinds stats` 运行，或把该参数写进 unit 的 drop-in：
+  ball 只使用按进程流量，跳过全部 `flow` 帧能显著降低采集器 CPU 与 socket 带宽。
+
 ### GUI（普通用户）
 
 普通用户直接启动桌面程序即可，它默认连接 `/run/ball-<当前用户名>/gui.sock`：
@@ -133,14 +182,15 @@ ball              # 或从应用菜单启动「ball 流量悬浮窗」
 - 左键点击流量条：打开独立的「流量详情」窗口；再次点击唤回同一个窗口，不改变流量条大小和位置。
 - 详情窗口是普通非模态窗口，可移动、缩放、最小化，并通过任务栏 / Alt-Tab 找回。
   点击其他应用不会自动关闭；Esc 或标题栏关闭只关闭详情，不影响流量条和后台。
-  窗口内的「置顶」只作用于详情；原来的「固定展开」已移除。
+  保留系统默认标题栏及窗口控制，不提供「置顶」或「固定展开」开关。
 - 拖动流量条：移动位置，靠近边缘时吸附；右键「锁定流量条位置」只禁止移动，不禁止点击。
 - 右键「外观」提供三套皮肤：**瓷白**（默认）、**暖纸**、**石墨**；可选择**双行**（默认，上下行各一行）
   或**单行**布局。字号使用系统 UI 字体，数字使用等宽字体；切换皮肤不会更改统计口径。
 - 「外观 → 背景不透明度」只改变流量条背景，文字保持不透明；详情保持实色，提高表格可读性。
 - 详情顶部按「当前速率 / 今日累计 / 本次累计」分组。进程与网卡表格同时显示当前上下行速率、
   今日上下行累计、本次上下行累计，不需要切换下拉框。可按各数值列排序，按进程名 / PID 或网卡名搜索；
-  默认隐藏空闲或历史进程，「显示空闲」可查看其累计记录。窗口较窄时可横向滚动。
+  默认隐藏空闲或历史进程，「显示空闲」可查看其累计记录。所有列均可拖动表头分隔线调整宽度，
+  实时刷新不会重置手动列宽；窗口较窄时可横向滚动。
 - 进程名称优先取经过 PID + 启动时间核验的 `/proc/<pid>/stat`，避免把 `tokio-rt-worker` 等线程名
   当作进程名。后台保留已核验的名称，进程退出后不退回线程名称；无法核验时保留采集器原始名称。
 - 鼠标悬停进程行时显示命令行及参数。命令行由普通用户 GUI 按自身权限读取，不经 root 后台转发，
@@ -152,7 +202,8 @@ ball              # 或从应用菜单启动「ball 流量悬浮窗」
   **进程归属缺口不代表网卡速率不可用**。采集连接中断 / 数据过期时，速率显示 `—` 而不是零。
   历史缺口可能在恢复采集后继续提示，因为缺失的累计数据无法补回；「查看原因」展开诊断信息。
 - 悬停流量条可查看所选网卡、今日累计和状态摘要。皮肤、布局、背景不透明度、网卡选择、
-  流量条位置及详情窗口几何信息会保存；Wayland 下普通详情窗口的最终位置由合成器决定。
+  流量条位置及详情窗口几何信息会保存；关闭、退出时会同步位置，重新打开恢复最后的请求位置。
+  显示器布局改变时会将流量条限制在可见区域；Wayland 下普通详情窗口的最终位置由合成器决定。
 - 右键或托盘菜单的「登录时启动界面」控制当前用户 GUI 登录自启，默认不自行开启。
   它不停止或禁用独立后台服务；操作失败会显示错误并恢复开关状态。
   自启文件位于 `~/.config/autostart/ball.desktop`，不会写系统自启目录。
@@ -222,6 +273,12 @@ ball 只把统计放在内存中，不落盘、不保存历史，因此：
 
 ## 诊断
 
+`QLocalSocket: Remote closed` 需要区分连接层级：GUI 到 ball 后台、ball 后台到采集器。
+若网卡快照持续刷新，而 `process_status.available=false`、`stale=true`，错误来自采集器订阅，
+不能通过隐藏界面提示来修复。新版本分别报告 `backend connection closed` 和
+`collector connection closed`；界面会解释哪一层断开，保持不可用速率并自动重连。
+连接成功不等于数据恢复，只有有效新快照 / stats 才清除错误；主动拒绝坏帧时保留具体解析原因。
+
 后台日志：
 
 ```sh
@@ -274,7 +331,7 @@ cmake --preset release && cmake --build --preset release
 ```
 
 测试不依赖桌面会话与 root；GUI 测试在 `QT_QPA_PLATFORM=offscreen` 下运行。
-UI 回归覆盖独立详情窗口的反复开关、失焦保留、Esc、置顶、布局切换、三套配色、偏好恢复、
+UI 回归覆盖独立详情窗口的反复开关、失焦保留、Esc、系统标题栏、列宽拖动、布局切换、三套配色、位置恢复、
 全部统计列、数值排序和搜索、命令行悬停与转义、历史进程记录，以及进程质量提示不影响网卡速率。
 
 使用假数据和临时偏好生成预览，不会连接真实采集器或改写用户配置：
@@ -308,6 +365,8 @@ CMakePresets.json       dev / release 的 configure、build、test presets
 packaging/              ball@.service.in、ball.desktop.in、ball.svg
 docs/protocol.md        后台与 GUI 之间的本地快照协议
 src/main.cpp            程序入口：CLI 解析与 layer-shell 窗口/Daemon 模式
+src/messagepack.*       增量 MessagePack 读取器与严格字段读取
+src/snapshot.*          快照结构、线格式字段名，以及编码器与解码器
 src/process.*           PID / 启动时间核验与有界 Linux 进程元数据读取
 src/daemon/             流量核心：网卡读取、内存累计、socktrail 订阅、快照服务
 src/ui/                 流量条、独立详情窗口、内置配色、托盘与偏好
