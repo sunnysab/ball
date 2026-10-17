@@ -1,6 +1,6 @@
 # ball 交接文档：安装脚本、开机自启与后续计划
 
-**状态**：安装脚本已完成并验证；3.1（IP 计数展示）已完成，构建与自动化测试通过，真实采集器未测；3.2（外部采集器 drop-in）已完成并通过隔离测试；其余后续计划未开始
+**状态**：安装脚本已完成并验证；3.1（IP 计数展示）已完成，构建与自动化测试通过，真实环境部署已验证；3.2（外部采集器 drop-in）已完成并通过隔离测试；其余后续计划未开始
 **涉及仓库**：`ball`（本仓库）、`socktrail`（`~/Code/0-Cloned/0-Internet/socktrail`）
 **相关文档**：`docs/collector-service-handoff.md`（采集器常驻服务化，已完成）
 
@@ -53,10 +53,10 @@
 | `--uninstall` | 移除已安装文件，残留为空 |
 | 未知参数 | 退出码 2 |
 
-### 1.3 未验证
+### 1.3 部署验证与剩余限制
 
-- 真实的 `systemctl enable --now ball@<user>.service`（我全程避免动用户正在跑的服务，
-  只验证到 `--no-enable` 与 unit 语法）。
+- 已在真实环境执行安装、启用与启动：`socktrail.service` 和当前用户的 `ball@<user>.service`
+  均为 enabled / active，GUI 已启动，登录自启指向 `/usr/local/bin/ball`。
 - 为**另一个用户**（`--user alice`）安装的完整流程。
 - 脚本在 `/usr` 前缀下的真实安装（只用临时前缀验证过；`/usr` 需要额外注意
   desktop 文件的 `Icon=ball` 依赖图标装到 `/usr/share/icons`）。
@@ -82,7 +82,7 @@
 ### 3.1 ball 消费 `ip_packets` / `ip_bytes`（已完成）
 
 **状态**：代码、测试与文档已完成；开发构建与 9 组自动化测试通过。
-真实采集器下的端到端未测。
+真实采集器下的端到端已验证：普通用户可读 GUI 快照，IP 两字段正常传递。
 
 **动机**：此前 ball 未读取 `stats` 帧里的这两个字段。它们是与进程 socket I/O
 **并列的另一种口径**（采集点的 IP 报文），需要独立展示并解释差异。
@@ -109,8 +109,9 @@
 - 本地 socket 测试覆盖最新帧覆盖、同毫秒延迟应用、坏帧不部分更新、采集器重启。
 - UI 测试覆盖 IP 与网卡/进程口径不相加、网卡选择不影响 IP 值、不可用时显示占位符。
 
-**尚未验证**：真实采集器（socktrail）下的端到端；自动化测试使用假采集器与本地 socket，
-不需要 root，也不修改正在运行的系统服务。
+**真实环境验证**（2026-10-17）：独立 socktrail 服务 → ball 后台 → 普通用户快照读取成功，
+实际包含 4 个网卡、30 多个进程和非零 IP 计数；GUI 已打开。采集器上报了
+`unmatched socket I/O`，因此数据仍有不完整标记，不将其隐藏或误报为完整。
 
 **风险**：低。属于纯展示扩展，不影响累积逻辑。
 
@@ -141,8 +142,17 @@
 - 真实 `systemd-analyze verify` 在临时 unit 搜索路径中合并实际模板与 drop-in，
   外部与内置模式均通过，包含特殊字符参数。
 
-**未验证**：真实 `/etc` 部署、`systemctl cat` 及两种模式的实际服务进程树。
-未启停正在运行的系统服务。环境未安装 ShellCheck，未运行该静态检查器。
+**真实环境验证**（2026-10-17）：
+
+- 通用 socktrail unit 安装到 `/etc/systemd/system/socktrail.service`；本机单独使用
+  `socktrail.service.d/ball.conf` 选择 stats-only 并关闭 `socket-sniff` / `openssl-probe`。
+- ball 的 `collector.conf` 生效，`systemd-analyze verify` 通过；两个服务均 enabled / active，
+  ball 进程树不含采集器子进程，socktrail 只有一个实例。
+- 停止并重新启动 ball 不影响独立采集器，采集器 PID 未改变；重连后普通用户重新读到健康快照。
+- socktrail 提示 kTLS 内核探针不可用，但可继续采集；socket I/O 归属缺口仍作为质量提示展示。
+- GUI 启动和登录自启配置完成；未进行真实机器重启或重新登录验证。
+
+**剩余限制**：其他用户与共享组组合未验证；ShellCheck 不可用，未运行该静态检查器。
 
 **风险**：其他管理员 drop-in 仍可能覆盖本脚本生成的命令，应检查最终合并配置；
 更新已安装的模板不影响外部模式，但重新运行 `install.sh` 时须明确选择采集器模式。
@@ -205,7 +215,7 @@ DESTDIR=/tmp/ball-stage cmake --install build/dev
 find /tmp/ball-stage -type f | sort
 ```
 
-实际安装（会写系统级配置，默认启用开机自启；尚未执行真实部署验证）：
+实际安装（会写系统级配置，默认启用开机自启；已在当前用户环境验证）：
 
 ```sh
 ./install.sh --collector-socket /run/socktrail/collector.sock

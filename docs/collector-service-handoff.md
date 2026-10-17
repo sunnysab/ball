@@ -100,10 +100,18 @@ unit 要点：`Type=simple`、`RuntimeDirectory=socktrail`、`Restart=on-failure
 - 参数校验：`--collector-socket` 的相对路径、非 daemon 用法、与 `--socktrail-bin`
   同时出现，三种情况都以退出码 2 拒绝。
 
+2026-10-17 补充真实部署验证：
+
+- `socktrail.service` 与 `ball@<当前用户>.service` 已安装、enabled / active，实际 unit 与
+  drop-in 通过 `systemd-analyze verify`，GUI 已启动。
+- 独立采集器使用本机 drop-in 选择 stats-only、关闭两类连接探针；通用模板保留默认能力。
+- 普通用户成功读取真实快照（4 个网卡、30 多个进程、非零 IP 计数），进程速率可用、错误为空。
+- 停止、启动 ball 后采集器 PID 不变，ball 能重新订阅；真实进程树没有额外采集器实例。
+- 仍有 `unmatched socket I/O` 质量缺口与 kTLS 探针不可用的非致命警告，不能声称观测完全无缺口。
+
 未验证：
 
-- 真实的 `systemctl start socktrail.service`（本机以脚本方式起进程代替；unit 语法
-  未用 `systemd-analyze verify` 检查）。
+- 机器真实重启后的自启，以及注销、登录后的 GUI 自启。
 - socket 组为共享组、消费方在别的账号的组合。
 - 采集器侧 `--socket-kinds` 在极高连接数（>10k）下的降幅。
 
@@ -191,7 +199,7 @@ ball 目前**只有**网卡和进程两个视图。`flow` 帧、`--socket-sniff`
 
 `install.sh --collector-socket` 使用实例级 drop-in 覆盖 `ExecStart`，保留模板的
 `--socktrail-bin` 默认值，重新安装模板不覆盖外部配置。隔离安装测试与 systemd
-配置语法验证通过，尚未启停真实系统服务；详见 `docs/next-steps-handoff.md` §3.2。
+配置语法与真实服务部署验证通过；详见 `docs/next-steps-handoff.md` §3.2。
 外部采集器不属于 ball 子进程，停止 ball 时不应终止它。
 
 ## 8. 相关文件
