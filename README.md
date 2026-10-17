@@ -31,18 +31,19 @@ ball 由一个后台采集守护进程和一个桌面悬浮窗组成：后台以
 
 ### 1. 准备采集器 socktrail
 
-ball 使用本地分支 `perf/wildcard-index`，其中包含两个独立补丁：
+当前连接页要求采集器发布 `stats,flow`。本次验证使用本地 socktrail 仓库提交
+`cee76b6`，包含四参数 `recvmsg` 探针、采集热点优化、socket 帧类型选择，以及
+`hello.kinds` / `probes.ktls.status` 能力说明。旧采集器未声明 kinds 时，ball 仍能
+根据实际收到的合法 flow 确认连接支持，但不会凭空推断 kTLS 探针状态。
 
-- `db7df63`：为本机 Linux 7.2 新增四参数 `recvmsg` 探针。
-- `c3a6892`：每轮只索引一次通配连接候选，避免逐条扫描全部流记录。
-
-原检出目录的 `main` 不变。已在本地缓存准备好的 Go 1.27 环境中验证真实 TCP/UDP、
-订阅数据及索引优化的单元测试；新版本应用后仍需观察实际 CPU。可在 ball 根目录执行：
+以下命令假设 Go 1.27 与依赖缓存已经准备好，不联网下载依赖。默认使用本机检出目录，
+也可以通过 `SOCKTRAIL_DIR` 指定其他包含这些功能的检出：
 
 ```sh
 BALL_DIR="$PWD"
+SOCKTRAIL_DIR="${SOCKTRAIL_DIR:-$HOME/Code/0-Cloned/0-Internet/socktrail}"
 mkdir -p "$BALL_DIR/build"
-cd ../ball-worktrees/socktrail-perf
+cd "$SOCKTRAIL_DIR"
 GOTOOLCHAIN=local GOPROXY=off GOSUMDB=off CGO_ENABLED=0 \
   go build -trimpath -o "$BALL_DIR/build/socktrail" .
 "$BALL_DIR/build/socktrail" --version
@@ -189,7 +190,7 @@ sudo systemctl restart "ball@$USER.service"
 - 采集器需要以 `--socket-kinds stats,flow` 运行，或把该参数写进 unit 的 drop-in：
   连接页依赖 `flow` 帧；只给 `stats` 时进程与网卡照常工作，连接页明确显示「未收到 flow
   数据」。订阅 kinds 是启动参数，切换 kind **必须重配并重启**正在运行的外部采集器，
-  并让它重新订阅 ball 的 socket；ball 不会自动改动或重启任何正在运行的服务。
+  随后由 ball 后台自动重连采集器的 socket；ball 不会自动改动或重启任何正在运行的服务。
   ball 本身也不会自动部署或升级任何采集器：管理员需要显式更新采集器二进制、加上
   `flow` kind 并重配/重启现有服务，连接页才会出现数据。
 
