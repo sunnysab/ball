@@ -32,7 +32,7 @@ ball 由一个后台采集守护进程和一个桌面悬浮窗组成：后台以
 ### 1. 准备采集器 socktrail
 
 当前连接页要求采集器发布 `stats,flow`。本次验证使用本地 socktrail 仓库提交
-`cee76b6`，包含四参数 `recvmsg` 探针、采集热点优化、socket 帧类型选择，以及
+`2fa3b7e`，包含大连接表刷新背压修复、四参数 `recvmsg` 探针、采集热点优化、socket 帧类型选择，以及
 `hello.kinds` / `probes.ktls.status` 能力说明。旧采集器未声明 kinds 时，ball 仍能
 根据实际收到的合法 flow 确认连接支持，但不会凭空推断 kTLS 探针状态。
 
