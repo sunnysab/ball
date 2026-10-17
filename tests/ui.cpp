@@ -242,6 +242,8 @@ private Q_SLOTS:
     void showsDigitsFromSnapshot();
     void switchesTabsAndSortsProcesses();
     void drillsProcessRowIntoConnectionsTab();
+    void processSelectionSurvivesSnapshotRefresh();
+    void connectionPagePrioritizesQuerySpace();
     void processInfoIsNeutralPlainTextWithoutWarning();
     void filtersIdleProcessesAndSearch();
     void interfaceSelectionExcludesLoopback();
@@ -1016,6 +1018,45 @@ void TestUi::drillsProcessRowIntoConnectionsTab() {
     tabs->setCurrentIndex(2);
     QCOMPARE(connSearch->text(), u"example.org"_s);
     clearProcess->click();
+}
+
+void TestUi::processSelectionSurvivesSnapshotRefresh() {
+    ball::ui::Details details;
+    details.show();
+    Snapshot first = makeSnapshot();
+    details.setSnapshot(first, true, {u"eno1"_s});
+    auto* table = details.findChild<QTableView*>(u"details.processTable"_s);
+    table->selectRow(0);
+    QCOMPARE(table->model()->index(0, 1).data().toInt(), 1234);
+    first.processes[0].rxBps = 1;
+    first.processes[1].rxBps = 9000;
+    details.setSnapshot(first, true, {u"eno1"_s});
+    const auto selected = table->selectionModel()->selectedRows();
+    QCOMPARE(selected.size(), 1);
+    QCOMPARE(table->model()->index(selected.first().row(), 1).data().toInt(), 1234);
+    auto* open = details.findChild<QToolButton*>(u"details.viewConnections"_s);
+    QVERIFY(open->isEnabled());
+    open->click();
+    QVERIFY(details.findChild<QLabel*>(u"connections.processFilter"_s)->text().contains(u"1234"_s));
+}
+
+void TestUi::connectionPagePrioritizesQuerySpace() {
+    ball::ui::Details details;
+    details.show();
+    details.setSnapshot(makeSnapshot(), true, {u"eno1"_s});
+    auto* tabs = details.findChild<QTabWidget*>(u"details.tabs"_s);
+    auto* current = details.findChild<QLabel*>(u"details.currentDown"_s);
+    auto* ip = details.findChild<QLabel*>(u"details.ipTotals"_s);
+    QVERIFY(current->isVisible());
+    tabs->setCurrentIndex(2);
+    QVERIFY(!current->isVisible());
+    QVERIFY(!ip->isVisible());
+    tabs->setCurrentIndex(1);
+    QVERIFY(current->isVisible());
+    QVERIFY(ip->isVisible());
+    QVERIFY(!details.findChild<QToolButton*>(u"details.viewConnections"_s)->isVisible());
+    tabs->setCurrentIndex(0);
+    QVERIFY(details.findChild<QToolButton*>(u"details.viewConnections"_s)->isVisible());
 }
 
 void TestUi::processInfoIsNeutralPlainTextWithoutWarning() {

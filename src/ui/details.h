@@ -53,6 +53,7 @@ private:
     QLabel* m_qualitySummary = nullptr;
     QLabel* m_qualityReasons = nullptr;
     QWidget* m_tools = nullptr;
+    QWidget* m_totals = nullptr;
     QLineEdit* m_search = nullptr;
     QCheckBox* m_showIdle = nullptr;
     QToolButton* m_viewConnections = nullptr;

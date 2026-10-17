@@ -200,7 +200,9 @@ Details::Details() : QWidget(nullptr, Qt::Window) {
     m_selectionLabel->setTextFormat(Qt::PlainText);
     layout->addWidget(m_selectionLabel);
 
-    auto* totals = new QHBoxLayout;
+    m_totals = new QWidget(this);
+    auto* totals = new QHBoxLayout(m_totals);
+    totals->setContentsMargins(0, 0, 0, 0);
     const QStringList titles{QStringLiteral("当前速率"), QStringLiteral("今日累计"),
                              QStringLiteral("本次累计")};
     for (int column = 0; column < 3; ++column) {
@@ -229,7 +231,7 @@ Details::Details() : QWidget(nullptr, Qt::Window) {
     m_upLabels[1]->setObjectName(QStringLiteral("details.todayUp"));
     m_downLabels[2]->setObjectName(QStringLiteral("details.sessionDown"));
     m_upLabels[2]->setObjectName(QStringLiteral("details.sessionUp"));
-    layout->addLayout(totals);
+    layout->addWidget(m_totals);
 
     m_ipLabel = new QLabel(this);
     m_ipLabel->setObjectName(QStringLiteral("details.ipTotals"));
@@ -360,6 +362,11 @@ Details::Details() : QWidget(nullptr, Qt::Window) {
         // The process/interface search and idle filter do not apply to the
         // connection page, which owns its own filters; hide the duplicates.
         m_tools->setVisible(index != 2);
+        m_viewConnections->setVisible(index == 0);
+        // Connection queries need the table space, not unrelated NIC totals.
+        m_totals->setVisible(index != 2);
+        m_ipLabel->setVisible(index != 2);
+        m_selectionLabel->setVisible(index != 2);
         m_search->setPlaceholderText(index == 0 ? QStringLiteral("搜索进程名或 PID")
                                                 : QStringLiteral("搜索网卡名"));
         if (index != 2) {
@@ -433,6 +440,15 @@ void Details::setSnapshot(const std::optional<Snapshot>& snapshot, bool fresh,
 }
 
 void Details::rebuildTables() {
+    auto* processModel = static_cast<TrafficTableModel*>(m_processTable->model());
+    int selectedPid = 0;
+    quint64 selectedStart = 0;
+    const auto selected = m_processTable->selectionModel()->selectedRows();
+    if (!selected.isEmpty() && selected.first().row() < processModel->rowCount()) {
+        const TableRow& previous = processModel->visibleRow(selected.first().row());
+        selectedPid = previous.pid;
+        selectedStart = previous.startNs;
+    }
     QList<TableRow> processes;
     QList<TableRow> interfaces;
     if (m_snapshot.has_value()) {
@@ -485,6 +501,15 @@ void Details::rebuildTables() {
     static_cast<TrafficTableModel*>(m_processTable->model())->setRows(processes);
     static_cast<TrafficTableModel*>(m_interfaceTable->model())->setRows(interfaces);
     filterTables();
+    if (selectedPid > 0) {
+        for (int i = 0; i < processModel->rowCount(); ++i) {
+            const TableRow& row = processModel->visibleRow(i);
+            if (row.pid == selectedPid && row.startNs == selectedStart) {
+                m_processTable->selectRow(i);
+                break;
+            }
+        }
+    }
 }
 
 void Details::filterTables() {

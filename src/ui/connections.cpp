@@ -177,6 +177,8 @@ void ConnectionsView::buildUi() {
     m_summary->setObjectName(QStringLiteral("connections.summary"));
     m_summary->setTextFormat(Qt::PlainText);
     m_summary->setWordWrap(true);
+    m_summary->setToolTip(QStringLiteral("连接来自采集器捕获范围，不受统计网卡选择影响；"
+                                         "RX/TX 是采集方向，不等于应用下载/上传。"));
 
     m_table = new QTableWidget(this);
     m_table->setObjectName(QStringLiteral("connections.table"));
