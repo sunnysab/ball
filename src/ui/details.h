@@ -61,6 +61,8 @@ private:
     QTableView* m_processTable = nullptr;
     QTableView* m_interfaceTable = nullptr;
     ConnectionsView* m_connections = nullptr;
+    int m_resetPid = 0;
+    quint64 m_resetStartNs = 0;
 };
 
 } // namespace ball::ui

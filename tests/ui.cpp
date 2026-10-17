@@ -243,6 +243,8 @@ private Q_SLOTS:
     void switchesTabsAndSortsProcesses();
     void drillsProcessRowIntoConnectionsTab();
     void processSelectionSurvivesSnapshotRefresh();
+    void processSelectionSurvivesHeaderSorting();
+    void processCounterSortingKeepsIntegerPrecision();
     void connectionPagePrioritizesQuerySpace();
     void processInfoIsNeutralPlainTextWithoutWarning();
     void filtersIdleProcessesAndSearch();
@@ -1038,6 +1040,35 @@ void TestUi::processSelectionSurvivesSnapshotRefresh() {
     QVERIFY(open->isEnabled());
     open->click();
     QVERIFY(details.findChild<QLabel*>(u"connections.processFilter"_s)->text().contains(u"1234"_s));
+}
+
+void TestUi::processSelectionSurvivesHeaderSorting() {
+    ball::ui::Details details;
+    details.show();
+    details.setSnapshot(makeSnapshot(), true, {u"eno1"_s});
+    auto* table = details.findChild<QTableView*>(u"details.processTable"_s);
+    table->selectRow(0);
+    table->sortByColumn(5, Qt::AscendingOrder);
+    const auto selected = table->selectionModel()->selectedRows();
+    QCOMPARE(selected.size(), 1);
+    QCOMPARE(table->model()->index(selected.first().row(), 1).data().toInt(), 1234);
+    auto* button = details.findChild<QToolButton*>(u"details.viewConnections"_s);
+    QVERIFY(button->isEnabled());
+    button->click();
+    QVERIFY(details.findChild<QLabel*>(u"connections.processFilter"_s)->text().contains(u"1234"_s));
+}
+
+void TestUi::processCounterSortingKeepsIntegerPrecision() {
+    ball::ui::Details details;
+    auto snapshot = makeSnapshot();
+    snapshot.processes[0].today.rxBytes = 9'007'199'254'740'992ULL;
+    snapshot.processes[1].today.rxBytes = 9'007'199'254'740'993ULL;
+    details.setSnapshot(snapshot, true, {u"eno1"_s});
+    auto* table = details.findChild<QTableView*>(u"details.processTable"_s);
+    table->sortByColumn(5, Qt::DescendingOrder);
+    QCOMPARE(table->model()->index(0, 1).data().toInt(), 42);
+    QCOMPARE(table->model()->index(0, 5).data(Qt::UserRole + 1).toULongLong(),
+             quint64(9'007'199'254'740'993ULL));
 }
 
 void TestUi::connectionPagePrioritizesQuerySpace() {

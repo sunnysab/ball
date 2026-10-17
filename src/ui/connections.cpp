@@ -600,6 +600,9 @@ void ConnectionsView::updateSummary(int visibleCount, int matchedCount, int tota
     if (m_applied && m_applied->connectionStatus.truncated) {
         parts.append(QStringLiteral("缓存已截断，非全量历史"));
     }
+    if (m_applied) {
+        parts.append(m_applied->connectionStatus.notes);
+    }
     m_summary->setText(parts.join(QStringLiteral(" · ")));
 }
 

@@ -38,7 +38,7 @@ I/O 的进程；进程查询三种来源都匹配 `(pid, start_ns)`，绝不退�
 - 达到上限时优先回收最早结束的连接，否则最久未更新者；不增长到无界，不改变进程总量。
 - 缓存发生 reclaim / 拒绝时摘要显示「缓存已截断，非全量历史」；不承诺无限历史。
 - 各阶段状态：收到 hello 且声明 `flow`，或实际收到合法 flow 帧之前，连接状态为不可用/未确认；
-  连接与统计独立新鲜度，断线立即让连接状态过期，连接缓存速率只在成功应用 stats 时统一 sample。
+  连接可用性单独声明；连接速率只在成功应用 stats 时推进，stats 过期即整表标记过期，断线立即过期。
 - `process_status.info` 只作中性纯文本说明单独显示，不驱动 `incomplete` 或 HUD 感叹号；
   外部文本始终按纯文本呈现。
 
@@ -53,7 +53,7 @@ I/O 的进程；进程查询三种来源都匹配 `(pid, start_ns)`，绝不退�
 
 - `ConnectionProcess`：`int pid=0; quint64 startNs=0; QString name; quint64 rxBytes=0, txBytes=0;`
 - `ConnectionSnapshot`：`quint64 id=0; QString protocol, app, state, direction, source, target, name, detail, end; QStringList interfaces; QDateTime firstSeen, lastSeen; quint64 rxBytes=0, txBytes=0, packets=0, retransmits=0; double rxBps=0, txBps=0; qint64 rttUs=0; QString rttSource; ConnectionProcess client, server; QList<ConnectionProcess> io;`
-- `ConnectionStatus`：`bool available=false, stale=true, truncated=false; QStringList notes;`
+- `ConnectionStatus`：`bool available=false, stale=true, truncated=false; QStringList notes; quint64 generation=0;`
 - `Snapshot` 增加 `QList<ConnectionSnapshot> connections; ConnectionStatus connectionStatus;`
 - `ProcessStatus` 增加 `QStringList info;`，仅作说明，不驱动 incomplete 或 HUD 感叹号。
 
@@ -115,3 +115,6 @@ kTLS 能力从可选 probes.ktls.status 读取，加入说明；不承诺无 kTL
 - 连接选择按后台 started、订阅 generation、连接 ID 区分，重连与重启不会沿用旧选择。
 - 进程表刷新按 PID 与启动时间恢复选择，不随速率排序串行；连接页收起无关网卡卡片。
 - 查询结果是当前有界缓存中的结果；结束记录可能被淘汰，不是持久化连接历史。
+
+审查收尾：连接状态原因按纯文本展示；进程选择在表头排序、过滤和快照刷新时按身份恢复。
+进程与网卡累计排序使用原始 uint64，避免超过 2^53 后被浮点舍入；速率仍使用 double。

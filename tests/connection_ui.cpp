@@ -89,6 +89,7 @@ private slots:
     void removingSelectionClearsDetails();
     void absentProtocolKeepsFilter();
     void subscriptionChangesClearSelection();
+    void connectionStatusNotesAreVisible();
 };
 
 void ConnectionUiTest::filtersThenRanksThenLimits() {
@@ -438,6 +439,17 @@ void ConnectionUiTest::subscriptionChangesClearSelection() {
     next.started = next.started.addSecs(1);
     view.setSnapshot(next, true);
     QVERIFY(details->toPlainText().isEmpty());
+}
+
+void ConnectionUiTest::connectionStatusNotesAreVisible() {
+    ConnectionsView view;
+    view.show();
+    auto snapshot = snapshotOf({});
+    snapshot.connectionStatus.notes = {QStringLiteral("precise <b>diagnostic</b>")};
+    view.setSnapshot(snapshot, true);
+    auto* summary = view.findChild<QLabel*>(QStringLiteral("connections.summary"));
+    QCOMPARE(summary->textFormat(), Qt::PlainText);
+    QVERIFY(summary->text().contains(QStringLiteral("precise <b>diagnostic</b>")));
 }
 
 QTEST_MAIN(ConnectionUiTest)

@@ -37,7 +37,7 @@ QString placeholder() { return QStringLiteral("—"); }
 
 struct TableRow {
     QStringList texts;
-    QList<double> keys;
+    QList<QVariant> keys;
     bool idle = false;
     QString search;
     QString name;
@@ -55,9 +55,11 @@ public:
           m_numericColumns(std::move(numericColumns)) {}
 
     void setRows(QList<TableRow> rows) {
+        beginResetModel();
         m_rows = std::move(rows);
         applyForcedSort();
         refilter();
+        endResetModel();
     }
 
     void setFilter(const QString& needle, bool hideIdle) {
@@ -65,9 +67,11 @@ public:
         if (m_needle == trimmed && m_hideIdle == hideIdle) {
             return;
         }
+        beginResetModel();
         m_needle = trimmed;
         m_hideIdle = hideIdle;
         refilter();
+        endResetModel();
     }
 
     int rowCount(const QModelIndex& parent = {}) const override {
@@ -126,10 +130,12 @@ public:
         if (!m_numericColumns.contains(column)) {
             return;
         }
+        beginResetModel();
         m_sortColumn = column;
         m_sortOrder = order;
         applyForcedSort();
         refilter();
+        endResetModel();
     }
 
 private:
@@ -141,14 +147,18 @@ private:
         const Qt::SortOrder order = m_sortOrder;
         std::stable_sort(m_rows.begin(), m_rows.end(),
                          [column, order](const TableRow& a, const TableRow& b) {
-                             const double left = a.keys.value(column);
-                             const double right = b.keys.value(column);
+                             if (column >= 5) {
+                                 const quint64 left = a.keys.value(column).toULongLong();
+                                 const quint64 right = b.keys.value(column).toULongLong();
+                                 return order == Qt::AscendingOrder ? left < right : left > right;
+                             }
+                             const double left = a.keys.value(column).toDouble();
+                             const double right = b.keys.value(column).toDouble();
                              return order == Qt::AscendingOrder ? left < right : left > right;
                          });
     }
 
     void refilter() {
-        beginResetModel();
         m_visible.clear();
         for (int i = 0; i < m_rows.size(); ++i) {
             const TableRow& row = m_rows.at(i);
@@ -160,7 +170,6 @@ private:
             }
             m_visible.append(i);
         }
-        endResetModel();
     }
 
     QStringList m_headers;
@@ -348,6 +357,29 @@ Details::Details() : QWidget(nullptr, Qt::Window) {
         }
         table->sortByColumn(3, Qt::DescendingOrder);
     }
+    auto* processModel = static_cast<TrafficTableModel*>(m_processTable->model());
+    connect(processModel, &QAbstractItemModel::modelAboutToBeReset, this, [this, processModel] {
+        m_resetPid = 0;
+        m_resetStartNs = 0;
+        const auto selected = m_processTable->selectionModel()->selectedRows();
+        if (!selected.isEmpty() && selected.first().row() < processModel->rowCount()) {
+            const TableRow& row = processModel->visibleRow(selected.first().row());
+            m_resetPid = row.pid;
+            m_resetStartNs = row.startNs;
+        }
+    });
+    connect(processModel, &QAbstractItemModel::modelReset, this, [this, processModel] {
+        if (m_resetPid <= 0) {
+            return;
+        }
+        for (int i = 0; i < processModel->rowCount(); ++i) {
+            const TableRow& row = processModel->visibleRow(i);
+            if (row.pid == m_resetPid && row.startNs == m_resetStartNs) {
+                m_processTable->selectRow(i);
+                break;
+            }
+        }
+    });
     connect(m_search, &QLineEdit::textChanged, this, &Details::filterTables);
     connect(m_showIdle, &QCheckBox::toggled, this, &Details::filterTables);
     connect(m_viewConnections, &QToolButton::clicked, this, &Details::openConnectionsForCurrentRow);
@@ -440,15 +472,6 @@ void Details::setSnapshot(const std::optional<Snapshot>& snapshot, bool fresh,
 }
 
 void Details::rebuildTables() {
-    auto* processModel = static_cast<TrafficTableModel*>(m_processTable->model());
-    int selectedPid = 0;
-    quint64 selectedStart = 0;
-    const auto selected = m_processTable->selectionModel()->selectedRows();
-    if (!selected.isEmpty() && selected.first().row() < processModel->rowCount()) {
-        const TableRow& previous = processModel->visibleRow(selected.first().row());
-        selectedPid = previous.pid;
-        selectedStart = previous.startNs;
-    }
     QList<TableRow> processes;
     QList<TableRow> interfaces;
     if (m_snapshot.has_value()) {
@@ -466,10 +489,10 @@ void Details::rebuildTables() {
                            0,
                            row.rxBps,
                            row.txBps,
-                           double(row.today.rxBytes),
-                           double(row.today.txBytes),
-                           double(row.session.rxBytes),
-                           double(row.session.txBytes)};
+                           QVariant::fromValue(row.today.rxBytes),
+                           QVariant::fromValue(row.today.txBytes),
+                           QVariant::fromValue(row.session.rxBytes),
+                           QVariant::fromValue(row.session.txBytes)};
             target.idle = row.rxBps == 0.0 && row.txBps == 0.0;
         };
         for (const auto& row : m_snapshot->processes) {
@@ -501,15 +524,6 @@ void Details::rebuildTables() {
     static_cast<TrafficTableModel*>(m_processTable->model())->setRows(processes);
     static_cast<TrafficTableModel*>(m_interfaceTable->model())->setRows(interfaces);
     filterTables();
-    if (selectedPid > 0) {
-        for (int i = 0; i < processModel->rowCount(); ++i) {
-            const TableRow& row = processModel->visibleRow(i);
-            if (row.pid == selectedPid && row.startNs == selectedStart) {
-                m_processTable->selectRow(i);
-                break;
-            }
-        }
-    }
 }
 
 void Details::filterTables() {
