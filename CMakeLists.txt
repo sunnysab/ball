@@ -110,6 +110,11 @@ if(BUILD_TESTING)
     qt_add_executable(ball_socktrail_test tests/socktrail.cpp)
     target_link_libraries(ball_socktrail_test PRIVATE Qt6::Test ball_daemon ball_testkit)
 
+    # The connection snapshot section is protocol-only: the test drives the
+    # shared codec directly, so it needs no daemon target.
+    qt_add_executable(ball_connections_test tests/connections.cpp)
+    target_link_libraries(ball_connections_test PRIVATE Qt6::Test ball_protocol ball_testkit)
+
     qt_add_executable(ball_service_test tests/service.cpp)
     target_link_libraries(ball_service_test PRIVATE Qt6::Test ball_daemon)
     # The fake collector is a separate process, exactly like the real external
@@ -162,6 +167,9 @@ if(BUILD_TESTING)
 
     add_test(NAME ball_socktrail COMMAND ball_socktrail_test)
     set_tests_properties(ball_socktrail PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
+    add_test(NAME ball_connections COMMAND ball_connections_test)
+    set_tests_properties(ball_connections PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 
     add_test(NAME ball_service COMMAND ball_service_test)
     set_tests_properties(ball_service PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen"

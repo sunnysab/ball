@@ -166,6 +166,244 @@ bool readProcesses(const msgpack::object& parent, QList<ProcessSnapshot>& out) {
     return true;
 }
 
+// Reads a list of bounded strings. `required` separates the note list the schema
+// has always carried from a newer optional one: a missing optional list stays
+// empty, while a missing required list is a broken frame. A present list is
+// always validated, because these strings are shown verbatim.
+bool readTextList(const msgpack::object& parent, QLatin1StringView key, QStringList& out,
+                  quint32 maxCount, bool required) {
+    const msgpack::object* const value = mp::member(parent, key);
+    if (value == nullptr) {
+        return !required;
+    }
+    const msgpack::object* entries = nullptr;
+    quint32 size = 0;
+    if (!mp::arrayEntries(*value, entries, size) || size > maxCount) {
+        return false;
+    }
+    for (quint32 i = 0; i < size; ++i) {
+        bool ok = false;
+        const QString text = mp::ascii(entries[i], ok);
+        if (!ok || text.toUtf8().size() > connection::kMaxTextBytes) {
+            return false;
+        }
+        out.append(text);
+    }
+    return true;
+}
+
+// One optional text field. A missing key leaves the default (empty) value and a
+// present one must be a bounded, control-free string.
+bool readText(const msgpack::object& parent, QLatin1StringView key, QString& out) {
+    const msgpack::object* const value = mp::member(parent, key);
+    if (value == nullptr) {
+        return true;
+    }
+    bool ok = false;
+    const QString text = mp::ascii(*value, ok);
+    if (!ok || text.toUtf8().size() > connection::kMaxTextBytes) {
+        return false;
+    }
+    out = text;
+    return true;
+}
+
+// One optional counter. Absent means zero; present must be an exact uint64.
+bool readOptionalCount(const msgpack::object& parent, QLatin1StringView key, quint64& out) {
+    const msgpack::object* const value = mp::member(parent, key);
+    return value == nullptr || mp::readCount(*value, out);
+}
+
+// One optional instant. A present value must be a real MessagePack timestamp.
+bool readOptionalTimestamp(const msgpack::object& parent, QLatin1StringView key, QDateTime& out) {
+    const msgpack::object* const value = mp::member(parent, key);
+    if (value == nullptr) {
+        return true;
+    }
+    mp::Instant instant;
+    if (!mp::readInstant(*value, instant)) {
+        return false;
+    }
+    out = mp::timestampToLocalTime(instant);
+    return out.isValid();
+}
+
+// One optional rate map. Absent means zero; a present one must be finite and
+// non-negative in both directions, exactly like an interface or process rate.
+bool readOptionalRate(const msgpack::object& parent, double& rxBps, double& txBps) {
+    return mp::member(parent, field::kRate) == nullptr || readRate(parent, rxBps, txBps);
+}
+
+// A PID inside a connection row. `client`/`server` may be 0 (unknown) or -1
+// (the collector says the process is ambiguous); `io[]` only names a real
+// process, so it accepts positive PIDs only. Anything else, including a
+// fractional value, is refused rather than rounded.
+bool readPid(const msgpack::object& value, int& out, bool allowUnknown) {
+    if (value.type == msgpack::type::NEGATIVE_INTEGER) {
+        if (!allowUnknown || value.via.i64 != -1) {
+            return false;
+        }
+        out = -1;
+        return true;
+    }
+    quint64 pid = 0;
+    if (!mp::readCount(value, pid) || pid > kIntMax || (!allowUnknown && pid == 0)) {
+        return false;
+    }
+    out = int(pid);
+    return true;
+}
+
+// RTT is non-negative and must fit the signed field used by the UI.
+bool readOptionalSignedCount(const msgpack::object& parent, QLatin1StringView key, qint64& out) {
+    const msgpack::object* const value = mp::member(parent, key);
+    if (value == nullptr) {
+        return true;
+    }
+    quint64 count = 0;
+    if (!mp::readCount(*value, count) || count > quint64(std::numeric_limits<qint64>::max())) {
+        return false;
+    }
+    out = qint64(count);
+    return true;
+}
+
+bool readConnectionProcess(const msgpack::object& parent, ConnectionProcess& process,
+                           bool allowUnknownPid) {
+    if (parent.type != msgpack::type::MAP) {
+        return false;
+    }
+    // The PID carries the identity. It may be absent, which is 0 (unknown):
+    // `client`/`server` accept that and the -1 "ambiguous" sentinel, `io[]` only
+    // a positive PID because an io entry exists to name one real process.
+    const msgpack::object* const pid = mp::member(parent, field::kPid);
+    if (pid != nullptr && !readPid(*pid, process.pid, allowUnknownPid)) {
+        return false;
+    }
+    if (!allowUnknownPid && process.pid <= 0) {
+        return false;
+    }
+    return readOptionalCount(parent, field::kStartNs, process.startNs) &&
+           readText(parent, field::kName, process.name) &&
+           readOptionalCount(parent, field::kRxBytes, process.rxBytes) &&
+           readOptionalCount(parent, field::kTxBytes, process.txBytes);
+}
+
+// One optional process object: `client` and `server` are absent when the
+// collector could not name them, which is not the same as a process with PID 0.
+bool readConnectionProcessMember(const msgpack::object& parent, QLatin1StringView key,
+                                 ConnectionProcess& out, bool allowUnknownPid) {
+    const msgpack::object* const value = mp::member(parent, key);
+    if (value == nullptr) {
+        return true;
+    }
+    return readConnectionProcess(*value, out, allowUnknownPid);
+}
+
+// A member that is an array of connection-process objects, with a bound on both
+// the element count and the PID rules of each context. Absent is a legal empty
+// list; present must be a well-formed array of usable rows.
+bool readConnectionProcessList(const msgpack::object& parent, QLatin1StringView key,
+                               QList<ConnectionProcess>& out, bool allowUnknownPid) {
+    const msgpack::object* const value = mp::member(parent, key);
+    if (value == nullptr) {
+        return true;
+    }
+    const msgpack::object* entries = nullptr;
+    quint32 size = 0;
+    if (!mp::arrayEntries(*value, entries, size) || size > quint32(connection::kMaxIo)) {
+        return false;
+    }
+    for (quint32 i = 0; i < size; ++i) {
+        ConnectionProcess process;
+        if (!readConnectionProcess(entries[i], process, allowUnknownPid)) {
+            return false;
+        }
+        out.append(process);
+    }
+    return true;
+}
+
+// One connection row. `id` is the row's identity and must be present and
+// nonzero; every other field is optional on the wire but strictly validated
+// when it appears, so a partially filled row is still readable while a wrong
+// value is refused whole.
+bool readConnection(const msgpack::object& row, ConnectionSnapshot& out) {
+    const msgpack::object* const id = mp::member(row, field::kId);
+    quint64 value = 0;
+    if (id == nullptr || !mp::readCount(*id, value) || value == 0) {
+        return false;
+    }
+    out.id = value;
+    return readText(row, field::kProtocol, out.protocol) && readText(row, field::kApp, out.app) &&
+           readText(row, field::kState, out.state) &&
+           readText(row, field::kDirection, out.direction) &&
+           readText(row, field::kSource, out.source) && readText(row, field::kTarget, out.target) &&
+           readText(row, field::kName, out.name) && readText(row, field::kDetail, out.detail) &&
+           readText(row, field::kEnd, out.end) &&
+           readTextList(row, field::kInterfaces, out.interfaces,
+                        quint32(connection::kMaxInterfaces), false) &&
+           readOptionalTimestamp(row, field::kFirstSeen, out.firstSeen) &&
+           readOptionalTimestamp(row, field::kLastSeen, out.lastSeen) &&
+           readOptionalCount(row, field::kRxBytes, out.rxBytes) &&
+           readOptionalCount(row, field::kTxBytes, out.txBytes) &&
+           readOptionalCount(row, field::kPackets, out.packets) &&
+           readOptionalCount(row, field::kRetransmits, out.retransmits) &&
+           readOptionalRate(row, out.rxBps, out.txBps) &&
+           readOptionalSignedCount(row, field::kRttUs, out.rttUs) &&
+           readText(row, field::kRttSource, out.rttSource) &&
+           readConnectionProcessMember(row, field::kClient, out.client, true) &&
+           readConnectionProcessMember(row, field::kServer, out.server, true) &&
+           readConnectionProcessList(row, field::kIo, out.io, false);
+}
+
+// The connection table and its status. Both are absent on an older daemon, and
+// an absent table means "connections are not supported", never an empty list
+// pretending to be available.
+bool readConnections(const msgpack::object& parent, QList<ConnectionSnapshot>& out) {
+    const msgpack::object* const value = mp::member(parent, field::kConnections);
+    if (value == nullptr) {
+        return true;
+    }
+    const msgpack::object* entries = nullptr;
+    quint32 size = 0;
+    if (!mp::arrayEntries(*value, entries, size) || size > quint32(connection::kMaxRows)) {
+        return false;
+    }
+    QSet<quint64> identities;
+    out.reserve(qsizetype(size));
+    for (quint32 i = 0; i < size; ++i) {
+        ConnectionSnapshot row;
+        if (!readConnection(entries[i], row)) {
+            return false;
+        }
+        // Two rows with one ID are ambiguous: the cache is keyed by it, so a
+        // duplicate could hide a row or make an update overwrite the wrong one.
+        if (identities.contains(row.id)) {
+            return false;
+        }
+        identities.insert(row.id);
+        out.append(row);
+    }
+    return true;
+}
+
+bool readConnectionStatus(const msgpack::object& parent, ConnectionStatus& status) {
+    const msgpack::object* const value = mp::member(parent, field::kConnectionStatus);
+    if (value == nullptr) {
+        return true; // the whole section is newer than the daemon that wrote this
+    }
+    const msgpack::object* const available = mp::member(*value, field::kAvailable);
+    const msgpack::object* const stale = mp::member(*value, field::kStale);
+    const msgpack::object* const truncated = mp::member(*value, field::kTruncated);
+    if (available == nullptr || stale == nullptr || truncated == nullptr ||
+        !mp::readBool(*available, status.available) || !mp::readBool(*stale, status.stale) ||
+        !mp::readBool(*truncated, status.truncated)) {
+        return false;
+    }
+    return readTextList(*value, field::kNotes, status.notes, quint32(connection::kMaxNotes), true);
+}
+
 bool readProcessStatus(const msgpack::object& parent, ProcessStatus& status) {
     const msgpack::object* const value = mp::member(parent, field::kProcessStatus);
     if (value == nullptr) {
@@ -185,19 +423,12 @@ bool readProcessStatus(const msgpack::object& parent, ProcessStatus& status) {
     if (!ok) {
         return false;
     }
-    const msgpack::object* const notes = mp::member(*value, field::kNotes);
-    const msgpack::object* entries = nullptr;
-    quint32 size = 0;
-    if (notes == nullptr || !mp::arrayEntries(*notes, entries, size)) {
-        return false;
-    }
-    for (quint32 i = 0; i < size; ++i) {
-        status.notes.append(mp::ascii(entries[i], ok));
-        if (!ok) {
-            return false;
-        }
-    }
-    return true;
+    // `notes` is required; `info` explains quality problems without touching
+    // `incomplete` and is newer, so a frame without it is still valid and simply
+    // carries no explanations.
+    return readTextList(*value, field::kNotes, status.notes, quint32(connection::kMaxNotes),
+                        true) &&
+           readTextList(*value, field::kInfo, status.info, quint32(connection::kMaxNotes), false);
 }
 
 } // namespace
@@ -283,6 +514,18 @@ SnapshotParseResult decodeSnapshot(const msgpack::object& frame) {
     if (!readProcesses(frame, snapshot.processes)) {
         return reject("bad processes");
     }
+    // Both keys form one optional section; half a section cannot claim an
+    // available empty table when the connection rows are actually missing.
+    if ((mp::member(frame, field::kConnections) == nullptr) !=
+        (mp::member(frame, field::kConnectionStatus) == nullptr)) {
+        return reject("incomplete connection section");
+    }
+    if (!readConnections(frame, snapshot.connections)) {
+        return reject("bad connections");
+    }
+    if (!readConnectionStatus(frame, snapshot.connectionStatus)) {
+        return reject("bad connection_status");
+    }
 
     return SnapshotParseResult{std::move(snapshot), QString()};
 }
@@ -306,6 +549,8 @@ public:
         m_packer.pack_str_body(utf8.constData(), uint32_t(utf8.size()));
     }
     void count(quint64 value) { m_packer.pack(value); }
+    // Counters are unsigned, but a sentinel like pid -1 must keep its sign.
+    void signedCount(qint64 value) { m_packer.pack(value); }
     void boolean(bool value) { m_packer.pack(value); }
     void number(double value) { m_packer.pack(finite(value)); }
     void timestamp(const QDateTime& value) {
@@ -329,6 +574,7 @@ public:
     // False when a value could not be represented; the frame is then discarded
     // rather than sent without it.
     bool ok() const { return m_ok; }
+    qsizetype size() const { return qsizetype(m_buffer.size()); }
     QByteArray take() { return QByteArray(m_buffer.data(), qsizetype(m_buffer.size())); }
 
 private:
@@ -351,10 +597,104 @@ void writeCounters(SnapshotWriter& writer, const ByteCounters& counters) {
     writer.count(counters.txBytes);
 }
 
+// One connection-process object. A name is always written (possibly empty) so a
+// reader needs no default; the PID keeps its sign so -1 stays -1.
+void writeConnectionProcess(SnapshotWriter& writer, const ConnectionProcess& process) {
+    writer.beginMap(5);
+    writer.key(field::kPid);
+    writer.signedCount(qint64(process.pid));
+    writer.key(field::kStartNs);
+    writer.count(process.startNs);
+    writer.key(field::kName);
+    writer.string(process.name);
+    writer.key(field::kRxBytes);
+    writer.count(process.rxBytes);
+    writer.key(field::kTxBytes);
+    writer.count(process.txBytes);
+}
+
+// One connection row. Every field is written explicitly, including the empty
+// strings and lists, so the decoder's optional-field rules are only needed for a
+// frame from an older daemon. The two instants are the exception: an unset time
+// has no wire form, so it is omitted rather than failing the whole snapshot.
+void writeConnection(SnapshotWriter& writer, const ConnectionSnapshot& row) {
+    quint32 fields = 21;
+    if (row.firstSeen.isValid()) {
+        ++fields;
+    }
+    if (row.lastSeen.isValid()) {
+        ++fields;
+    }
+    writer.beginMap(fields);
+    writer.key(field::kId);
+    writer.count(row.id);
+    writer.key(field::kProtocol);
+    writer.string(row.protocol);
+    writer.key(field::kApp);
+    writer.string(row.app);
+    writer.key(field::kState);
+    writer.string(row.state);
+    writer.key(field::kDirection);
+    writer.string(row.direction);
+    writer.key(field::kSource);
+    writer.string(row.source);
+    writer.key(field::kTarget);
+    writer.string(row.target);
+    writer.key(field::kName);
+    writer.string(row.name);
+    writer.key(field::kDetail);
+    writer.string(row.detail);
+    writer.key(field::kEnd);
+    writer.string(row.end);
+    writer.key(field::kInterfaces);
+    writer.beginArray(quint32(row.interfaces.size()));
+    for (const QString& name : row.interfaces) {
+        writer.string(name);
+    }
+    if (row.firstSeen.isValid()) {
+        writer.key(field::kFirstSeen);
+        writer.timestamp(row.firstSeen);
+    }
+    if (row.lastSeen.isValid()) {
+        writer.key(field::kLastSeen);
+        writer.timestamp(row.lastSeen);
+    }
+    writer.key(field::kRxBytes);
+    writer.count(row.rxBytes);
+    writer.key(field::kTxBytes);
+    writer.count(row.txBytes);
+    writer.key(field::kPackets);
+    writer.count(row.packets);
+    writer.key(field::kRetransmits);
+    writer.count(row.retransmits);
+    writer.key(field::kRate);
+    writer.beginMap(2);
+    writer.key(field::kRxBps);
+    writer.number(row.rxBps);
+    writer.key(field::kTxBps);
+    writer.number(row.txBps);
+    writer.key(field::kRttUs);
+    writer.signedCount(row.rttUs);
+    writer.key(field::kRttSource);
+    writer.string(row.rttSource);
+    writer.key(field::kClient);
+    writeConnectionProcess(writer, row.client);
+    writer.key(field::kServer);
+    writeConnectionProcess(writer, row.server);
+    writer.key(field::kIo);
+    writer.beginArray(quint32(row.io.size()));
+    for (const ConnectionProcess& process : row.io) {
+        writeConnectionProcess(writer, process);
+    }
+}
+
 } // namespace
 
 QByteArray encodeSnapshot(const Snapshot& snapshot, bool& ok) {
-    SnapshotWriter writer(11);
+    // The connection section is one unit, so its two keys are always written
+    // together; an older reader ignores both, and a current one never sees a
+    // half-written pair.
+    SnapshotWriter writer(13);
     writer.key(field::kVersion);
     writer.count(uint64_t(snapshot.version));
     writer.key(field::kKind);
@@ -374,7 +714,7 @@ QByteArray encodeSnapshot(const Snapshot& snapshot, bool& ok) {
     writer.count(snapshot.ipBytes);
 
     writer.key(field::kProcessStatus);
-    writer.beginMap(5);
+    writer.beginMap(6);
     writer.key(field::kAvailable);
     writer.boolean(snapshot.processStatus.available);
     writer.key(field::kStale);
@@ -386,6 +726,13 @@ QByteArray encodeSnapshot(const Snapshot& snapshot, bool& ok) {
     writer.key(field::kNotes);
     writer.beginArray(quint32(snapshot.processStatus.notes.size()));
     for (const QString& note : snapshot.processStatus.notes) {
+        writer.string(note);
+    }
+    // Explanations are written even when empty, so the decoder's optional rule
+    // is only needed for a frame from an older daemon.
+    writer.key(field::kInfo);
+    writer.beginArray(quint32(snapshot.processStatus.info.size()));
+    for (const QString& note : snapshot.processStatus.info) {
         writer.string(note);
     }
 
@@ -437,7 +784,32 @@ QByteArray encodeSnapshot(const Snapshot& snapshot, bool& ok) {
         writer.number(row.txBps);
     }
 
+    writer.key(field::kConnections);
+    writer.beginArray(quint32(snapshot.connections.size()));
+    for (const ConnectionSnapshot& row : snapshot.connections) {
+        writeConnection(writer, row);
+    }
+    writer.key(field::kConnectionStatus);
+    writer.beginMap(4);
+    writer.key(field::kAvailable);
+    writer.boolean(snapshot.connectionStatus.available);
+    writer.key(field::kStale);
+    writer.boolean(snapshot.connectionStatus.stale);
+    writer.key(field::kTruncated);
+    writer.boolean(snapshot.connectionStatus.truncated);
+    writer.key(field::kNotes);
+    writer.beginArray(quint32(snapshot.connectionStatus.notes.size()));
+    for (const QString& note : snapshot.connectionStatus.notes) {
+        writer.string(note);
+    }
+
     ok = writer.ok();
+    // The finished size is what decides: the field caps are a sanity bound, not
+    // a proof, so an oversized frame is refused whole rather than trimmed or
+    // sent in pieces. A receiver would reject it anyway at its own 16 MiB cap.
+    if (ok && writer.size() > qsizetype(mp::kMaxFrameBytes)) {
+        ok = false;
+    }
     return ok ? writer.take() : QByteArray();
 }
 
