@@ -254,9 +254,8 @@ SocktrailFrame parseStats(const msgpack::object& stats) {
         return reject("bad io_unmatched_bytes");
     }
     if (expiredCount != 0 || expiredRx != 0 || expiredTx != 0) {
-        // Expired PID I/O is socket I/O the collector could not attribute, but
-        // the bytes are still present in the process table's history; it is an
-        // explanation, not a hole in the totals.
+        // The collector reclaimed idle PID details; totals already observed
+        // by ball remain in its history. Reclamation alone is not event loss.
         frame.infoNotes.append(QStringLiteral("expired PIDs: %1 identities, RX %2, TX %3")
                                    .arg(expiredCount)
                                    .arg(expiredRx)
@@ -269,15 +268,19 @@ SocktrailFrame parseStats(const msgpack::object& stats) {
     if (unmatchedBytes != 0) {
         // Socket I/O that matched no connection is not missing from the
         // process table, so it is an explanation and not a data gap.
-        frame.infoNotes.append(QStringLiteral("unmatched socket I/O: %1 bytes (outside process_io)")
-                                   .arg(unmatchedBytes));
+        frame.infoNotes.append(
+            QStringLiteral("unmatched socket I/O: %1 bytes (already included in process_io; "
+                           "association counter only)")
+                .arg(unmatchedBytes));
     }
 
-    // The kTLS probe reports a load status, not a counter. A non-active status
-    // only explains that some TLS traffic may lack decryption keys; it is not a
-    // reason to distrust the totals.
+    // Missing kTLS hooks limit kernel-TLS socket byte coverage. This is not
+    // TLS decryption and does not explain the unmatched association counter.
     const msgpack::object* const ktls = mp::member(*probesValue, QLatin1StringView("ktls"));
     if (ktls != nullptr) {
+        if (ktls->type != msgpack::type::MAP) {
+            return reject("bad probes.ktls");
+        }
         const msgpack::object* const ktlsStatus = mp::member(*ktls, QLatin1StringView("status"));
         if (ktlsStatus != nullptr) {
             bool statusOk = false;
@@ -285,8 +288,10 @@ SocktrailFrame parseStats(const msgpack::object& stats) {
             if (!statusOk) {
                 return reject("bad probes.ktls.status");
             }
-            if (!status.isEmpty() && status != QLatin1String("active")) {
-                frame.infoNotes.append(QStringLiteral("kTLS probe: %1").arg(status));
+            if (!status.isEmpty() && status != QLatin1String("kernel TLS probes active")) {
+                frame.infoNotes.append(
+                    QStringLiteral("kTLS probe: %1 (kernel TLS socket bytes may be missing)")
+                        .arg(status));
             }
         }
     }

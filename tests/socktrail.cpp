@@ -1111,6 +1111,7 @@ void TestSocktrail::qualityNotesMakeObservationIncomplete() {
     QCOMPARE(frame.infoNotes.size(), 2);
     QVERIFY(frame.infoNotes.first().contains(u"expired PIDs"_s));
     QVERIFY(frame.infoNotes.last().contains(u"unmatched socket I/O"_s));
+    QVERIFY(frame.infoNotes.last().contains(u"already included in process_io"_s));
     QVERIFY(frame.infoNotes.last().contains(u"7777"_s));
 
     // Lost events are never added to a process total, and the notes mark the
@@ -1160,7 +1161,7 @@ void TestSocktrail::diagnosticsAreNotDataLoss() {
     QCOMPARE(frame.infoNotes.size(), 2);
 
     // The kTLS probe status is an explanation too, and a missing probes.ktls
-    // object or an "active" status adds nothing.
+    // object or the collector's canonical active status adds nothing.
     const auto withKtls = [](const QString& status) {
         return decode(statsFrame([&](ball::test::Writer& writer) {
             msgpack::packer<msgpack::sbuffer>& packer = writer.packer();
@@ -1172,7 +1173,7 @@ void TestSocktrail::diagnosticsAreNotDataLoss() {
             writeQuality(writer, 0, 0, 0, 0, 0, 0, 0, status);
         }));
     };
-    QVERIFY(withKtls(QStringLiteral("active")).infoNotes.isEmpty());
+    QVERIFY(withKtls(QStringLiteral("kernel TLS probes active")).infoNotes.isEmpty());
     QVERIFY(withKtls(QStringLiteral("missing")).infoNotes.last().contains(u"kTLS"_s));
     QVERIFY(withKtls(QStringLiteral("missing")).infoNotes.last().contains(u"missing"_s));
 

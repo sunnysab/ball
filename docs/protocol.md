@@ -136,7 +136,7 @@
 - 进程页是否实时可用须同时检查 `available` 和 `!stale`；不完整标记及原因可见。
   `process_status.notes` 是真实数据缺口（PID 事件丢失、unindexed 字节），会进入
   `incomplete`；`process_status.info` 只是解释（unmatched socket I/O、已过期 PID、
-  非 active 的 kTLS 探针），不驱动 `incomplete`。
+  非 `kernel TLS probes active` 的 kTLS 探针状态），不驱动 `incomplete`。
 - 连接页由独立的 `connections` 与 `connection_status` 描述：`available` 表示采集器
   声明或实际发送了 flow，`stale` 与 stats 新鲜度一致，`truncated` 表示有界缓存发生
   了淘汰。字段缺失视为旧后台不支持连接，不伪装成可用的空表。连接速率只在成功应用
@@ -169,3 +169,8 @@ stats 的字符串诊断允许包含多行，读取时把控制字符归一为�
 坏帧与缓冲上限。IP 两字段另需覆盖：读入与缺失为 0、超过 2^53 与 `UINT64_MAX` 不失真、
 非法取值拒绝整帧、坏帧不部分更新、采集器重启后覆盖而非累加。部署验收须确认普通用户
 GUI 能读取允许访问的 socket，关闭 GUI 不终止后台，关闭后台不留下采集子进程。
+
+连接关联计数 `io_unmatched_bytes` 中的字节已经计入 `process_io`，不能作为进程漏采量；
+上游目前还存在依赖首个采集接口的汇总口径限制。kTLS 探针状态不是解密能力：缺少探针
+会限制内核 TLS socket 字节覆盖，与 unmatched 计数无直接因果。状态中的原始加载错误
+用于诊断权限、模块 BTF 或内核兼容性，不自动推断为缺少某一项 capability。
