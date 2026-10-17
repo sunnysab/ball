@@ -4,15 +4,13 @@
 // protocol and writes only generated data, never user preferences or traffic.
 //
 // Usage: ball_ui_preview [output.png]
+#include "snapshot.h"
 #include "ui/details.h"
 #include "ui/hud.h"
 
 #include <QApplication>
 #include <QByteArray>
 #include <QFileInfo>
-#include <QJsonArray>
-#include <QJsonDocument>
-#include <QJsonObject>
 #include <QLocalServer>
 #include <QLocalSocket>
 #include <QPainter>
@@ -27,83 +25,75 @@ using namespace Qt::StringLiterals;
 
 namespace {
 
-QByteArray mockSnapshot() {
-    const QJsonArray interfaces{
-        QJsonObject{{u"index"_s, 2},
-                    {u"name"_s, u"eno1"_s},
-                    {u"kind"_s, u"physical"_s},
-                    {u"up"_s, true},
-                    {u"today"_s, QJsonObject{{u"rx_bytes"_s, u"3221225472"_s},
-                                             {u"tx_bytes"_s, u"536870912"_s}}},
-                    {u"session"_s, QJsonObject{{u"rx_bytes"_s, u"1073741824"_s},
-                                               {u"tx_bytes"_s, u"268435456"_s}}},
-                    {u"rate"_s, QJsonObject{{u"rx_bps"_s, 1625292.8}, {u"tx_bps"_s, 231424.0}}}},
-        QJsonObject{{u"index"_s, 3},
-                    {u"name"_s, u"wlan0"_s},
-                    {u"kind"_s, u"physical"_s},
-                    {u"up"_s, true},
-                    {u"today"_s,
-                     QJsonObject{{u"rx_bytes"_s, u"268435456"_s}, {u"tx_bytes"_s, u"10485760"_s}}},
-                    {u"session"_s,
-                     QJsonObject{{u"rx_bytes"_s, u"104857600"_s}, {u"tx_bytes"_s, u"5242880"_s}}},
-                    {u"rate"_s, QJsonObject{{u"rx_bps"_s, 524288.0}, {u"tx_bps"_s, 20480.0}}}},
-        QJsonObject{
-            {u"index"_s, 4},
-            {u"name"_s, u"wg0"_s},
-            {u"kind"_s, u"virtual"_s},
-            {u"up"_s, true},
-            {u"today"_s, QJsonObject{{u"rx_bytes"_s, u"4194304"_s}, {u"tx_bytes"_s, u"1048576"_s}}},
-            {u"session"_s,
-             QJsonObject{{u"rx_bytes"_s, u"2097152"_s}, {u"tx_bytes"_s, u"524288"_s}}},
-            {u"rate"_s, QJsonObject{{u"rx_bps"_s, 12000.0}, {u"tx_bps"_s, 4000.0}}}},
-        QJsonObject{
-            {u"index"_s, 1},
-            {u"name"_s, u"lo"_s},
-            {u"kind"_s, u"loopback"_s},
-            {u"up"_s, true},
-            {u"today"_s, QJsonObject{{u"rx_bytes"_s, u"1048576"_s}, {u"tx_bytes"_s, u"1048576"_s}}},
-            {u"session"_s,
-             QJsonObject{{u"rx_bytes"_s, u"1048576"_s}, {u"tx_bytes"_s, u"1048576"_s}}},
-            {u"rate"_s, QJsonObject{{u"rx_bps"_s, 900.0}, {u"tx_bps"_s, 900.0}}}}};
-
-    const auto process = [](int pid, const QString& startNs, const QString& name, bool present,
-                            qint64 rxToday, qint64 txToday, double rx, double tx) {
-        return QJsonObject{
-            {u"pid"_s, pid},
-            {u"start_ns"_s, startNs},
-            {u"name"_s, name},
-            {u"present"_s, present},
-            {u"today"_s, QJsonObject{{u"rx_bytes"_s, QString::number(rxToday)},
-                                     {u"tx_bytes"_s, QString::number(txToday)}}},
-            {u"session"_s, QJsonObject{{u"rx_bytes"_s, QString::number(rxToday / 2)},
-                                       {u"tx_bytes"_s, QString::number(txToday / 2)}}},
-            {u"rate"_s, QJsonObject{{u"rx_bps"_s, rx}, {u"tx_bps"_s, tx}}}};
+// The samples the preview renders. The values are chosen to exercise the HUD:
+// byte rates, a stopped process and a quality note.
+ball::Snapshot mockSnapshot() {
+    const auto at = [](const QString& text) { return QDateTime::fromString(text, Qt::ISODate); };
+    const auto interface = [](quint32 index, const QString& name, ball::InterfaceKind kind,
+                              quint64 todayRx, quint64 todayTx, quint64 sessionRx,
+                              quint64 sessionTx, double rx, double tx) {
+        ball::InterfaceSnapshot row;
+        row.index = index;
+        row.name = name;
+        row.kind = kind;
+        row.up = true;
+        row.today = {todayRx, todayTx};
+        row.session = {sessionRx, sessionTx};
+        row.rxBps = rx;
+        row.txBps = tx;
+        return row;
     };
-    const QJsonArray processes{process(4821, u"9007199254740993"_s, u"firefox"_s, true, 966367641,
-                                       52428800, 1509949.44, 52428.8),
-                               process(9134, u"1770000000000000000"_s, u"code-insiders"_s, true,
-                                       268435456, 10485760, 262144.0, 10485.76),
-                               process(2210, u"1600000000000000000"_s, u"mpv"_s, true, 2147483648,
-                                       2097152, 3145728.0, 1024.0),
-                               process(733, u"1500000000000000000"_s, u"systemd-networkd"_s, false,
-                                       1048576, 262144, 0.0, 0.0)};
 
-    const QJsonObject snapshot{
-        {u"version"_s, 1},
-        {u"kind"_s, u"snapshot"_s},
-        {u"started"_s, u"2026-10-14T14:30:00+08:00"_s},
-        {u"at"_s, u"2026-10-15T09:41:07+08:00"_s},
-        {u"interfaces_available"_s, true},
-        {u"interface_error"_s, u""_s},
-        {u"process_status"_s, QJsonObject{{u"available"_s, true},
-                                          {u"stale"_s, false},
-                                          {u"incomplete"_s, true},
-                                          {u"error"_s, u""_s},
-                                          {u"notes"_s, QJsonArray{u"PID events: dropped 3"_s}}}}};
-    QJsonObject result = snapshot;
-    result[u"interfaces"_s] = interfaces;
-    result[u"processes"_s] = processes;
-    return QJsonDocument(result).toJson(QJsonDocument::Compact);
+    ball::Snapshot snapshot;
+    snapshot.version = 1;
+    snapshot.started = at(u"2026-10-14T14:30:00+08:00"_s);
+    snapshot.at = at(u"2026-10-15T09:41:07+08:00"_s);
+    snapshot.interfacesAvailable = true;
+    snapshot.interfaceError.clear();
+    snapshot.processStatus = {true, false, true, QString(), {u"PID events: dropped 3"_s}};
+    snapshot.interfaces = {
+        interface(2, u"eno1"_s, ball::InterfaceKind::Physical, 3221225472ULL, 536870912ULL,
+                  1073741824ULL, 268435456ULL, 1625292.8, 231424.0),
+        interface(3, u"wlan0"_s, ball::InterfaceKind::Physical, 268435456ULL, 10485760ULL,
+                  104857600ULL, 5242880ULL, 524288.0, 20480.0),
+        interface(4, u"wg0"_s, ball::InterfaceKind::Virtual, 4194304ULL, 1048576ULL, 2097152ULL,
+                  524288ULL, 12000.0, 4000.0),
+        interface(1, u"lo"_s, ball::InterfaceKind::Loopback, 1048576ULL, 1048576ULL, 1048576ULL,
+                  1048576ULL, 900.0, 900.0),
+    };
+
+    const auto process = [](int pid, quint64 startNs, const QString& name, bool present,
+                            quint64 rxToday, quint64 txToday, double rx, double tx) {
+        ball::ProcessSnapshot row;
+        row.pid = pid;
+        row.startNs = startNs;
+        row.name = name;
+        row.present = present;
+        row.today = {rxToday, txToday};
+        row.session = {rxToday / 2, txToday / 2};
+        row.rxBps = rx;
+        row.txBps = tx;
+        return row;
+    };
+    snapshot.processes = {
+        process(4821, 9007199254740993ULL, u"firefox"_s, true, 966367641ULL, 52428800ULL,
+                1509949.44, 52428.8),
+        process(9134, 1770000000000000000ULL, u"code-insiders"_s, true, 268435456ULL, 10485760ULL,
+                262144.0, 10485.76),
+        process(2210, 1600000000000000000ULL, u"mpv"_s, true, 2147483648ULL, 2097152ULL, 3145728.0,
+                1024.0),
+        process(733, 1500000000000000000ULL, u"systemd-networkd"_s, false, 1048576ULL, 262144ULL,
+                0.0, 0.0),
+    };
+    return snapshot;
+}
+
+// The frame bytes the GUI socket carries.
+QByteArray mockSnapshotFrame() {
+    bool ok = false;
+    const QByteArray frame = ball::encodeSnapshot(mockSnapshot(), ok);
+    Q_ASSERT(ok);
+    return frame;
 }
 
 } // namespace
@@ -125,8 +115,7 @@ int main(int argc, char* argv[]) {
 
     QObject::connect(&server, &QLocalServer::newConnection, &app, [&server] {
         if (auto* peer = server.nextPendingConnection()) {
-            peer->write(mockSnapshot());
-            peer->write("\n");
+            peer->write(mockSnapshotFrame());
             peer->flush();
         }
     });

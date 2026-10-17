@@ -95,7 +95,9 @@ void printUsage(std::FILE* out) {
                "      --version           show the version and exit\n"
                "      --daemon            run the sampling daemon\n"
                "      --socket <path>     snapshot socket (required with --daemon)\n"
-               "      --socktrail-bin <path>  collector binary (daemon mode only)\n",
+               "      --socktrail-bin <path>  collector binary (daemon mode only)\n"
+               "      --collector-socket <path>  subscribe to an already running collector\n"
+               "                          instead of spawning one (daemon mode only)\n",
                out);
 }
 
@@ -131,6 +133,11 @@ int main(int argc, char* argv[]) {
         QStringLiteral("socktrail-bin"),
         QStringLiteral("absolute path of the socktrail collector (daemon mode only)"),
         QStringLiteral("path")));
+    parser.addOption(QCommandLineOption(
+        QStringLiteral("collector-socket"),
+        QStringLiteral("absolute path of an already running collector socket; the daemon "
+                       "subscribes to it and never starts one (daemon mode only)"),
+        QStringLiteral("path")));
 
     // The explicit QStringList keeps option values from being mistaken for a
     // mode flag; Qt never treats an argument as both an option and its value.
@@ -162,6 +169,8 @@ int main(int argc, char* argv[]) {
     const QString socket = parser.value(QStringLiteral("socket"));
     const bool hasCollector = parser.isSet(QStringLiteral("socktrail-bin"));
     const QString collector = parser.value(QStringLiteral("socktrail-bin"));
+    const bool hasCollectorSocket = parser.isSet(QStringLiteral("collector-socket"));
+    const QString collectorSocket = parser.value(QStringLiteral("collector-socket"));
 
     if (hasSocket && !isAbsolutePath(socket)) {
         return fail(QStringLiteral("--socket requires an absolute path"), 2);
@@ -169,11 +178,22 @@ int main(int argc, char* argv[]) {
     if (!daemon && hasCollector) {
         return fail(QStringLiteral("--socktrail-bin is only valid with --daemon"), 2);
     }
+    if (!daemon && hasCollectorSocket) {
+        return fail(QStringLiteral("--collector-socket is only valid with --daemon"), 2);
+    }
     if (daemon && (!hasSocket || socket.isEmpty())) {
         return fail(QStringLiteral("--daemon requires --socket <absolute-path>"), 2);
     }
     if (hasCollector && !isAbsolutePath(collector)) {
         return fail(QStringLiteral("--socktrail-bin requires an absolute path"), 2);
+    }
+    if (hasCollectorSocket && !isAbsolutePath(collectorSocket)) {
+        return fail(QStringLiteral("--collector-socket requires an absolute path"), 2);
+    }
+    if (hasCollector && hasCollectorSocket) {
+        return fail(QStringLiteral("--socktrail-bin and --collector-socket are mutually "
+                                   "exclusive"),
+                    2);
     }
 
     if (daemon) {
@@ -187,8 +207,14 @@ int main(int argc, char* argv[]) {
         ball::Service service;
         ball::ServiceOptions options;
         options.socketPath = socket;
-        options.collectorBinary =
-            hasCollector ? collector : QStringLiteral(BALL_DEFAULT_COLLECTOR_PATH);
+        if (hasCollectorSocket) {
+            // Only the socket is taken: an external unit owns the collector
+            // process and its capture scope.
+            options.collectorSocketPath = collectorSocket;
+        } else {
+            options.collectorBinary =
+                hasCollector ? collector : QStringLiteral(BALL_DEFAULT_COLLECTOR_PATH);
+        }
         if (!service.start(options)) {
             return fail(service.error(), 1);
         }

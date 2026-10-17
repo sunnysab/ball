@@ -1,8 +1,8 @@
 // ball: compact, translucent network traffic HUD for KDE Wayland.
 #pragma once
 
+#include "snapshot.h"
 #include "ui/preferences.h"
-#include "ui/snapshot.h"
 
 #include <QIcon>
 #include <QPoint>
@@ -69,6 +69,7 @@ Q_SIGNALS:
 protected:
     void paintEvent(QPaintEvent* event) override;
     void showEvent(QShowEvent* event) override;
+    void closeEvent(QCloseEvent* event) override;
     void moveEvent(QMoveEvent* event) override;
     void mousePressEvent(QMouseEvent* event) override;
     void mouseMoveEvent(QMouseEvent* event) override;
@@ -118,8 +119,8 @@ private:
     bool m_dragging = false;
     bool m_locked = false;
     bool m_hiddenByUser = false;
+    bool m_surfaceShown = false;
     bool m_layerShellApplied = false;
-    bool m_layerShellActive = false;
 };
 
 } // namespace ball::ui

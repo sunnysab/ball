@@ -13,6 +13,7 @@
 #include <QAction>
 #include <QActionGroup>
 #include <QApplication>
+#include <QCloseEvent>
 #include <QCoreApplication>
 #include <QEvent>
 #include <QFontMetrics>
@@ -99,6 +100,10 @@ Hud::Hud(const QString& socketPath, QSettings& settings, QWidget* parent)
     connect(qApp, &QGuiApplication::screenRemoved, this,
             [this](QScreen*) { clampIntoVisibleArea(); });
 
+    connect(qApp, &QCoreApplication::aboutToQuit, this, [this] {
+        savePreferences();
+        m_settings->sync();
+    });
     applySnapshot();
     applyStatus();
     m_client->start(socketPath);
@@ -107,6 +112,7 @@ Hud::Hud(const QString& socketPath, QSettings& settings, QWidget* parent)
 Hud::~Hud() {
     // Persist whatever the user last chose; the backend is not touched.
     savePreferences();
+    m_settings->sync();
 }
 
 void Hud::buildUi() {
@@ -373,7 +379,9 @@ void Hud::applyStatus() {
         summary = QStringLiteral("部分所选网卡缺失；当前仅汇总可用网卡");
     }
     if (!m_client->error().isEmpty()) {
-        reasons.append(m_client->error());
+        reasons.append(m_client->error() == QStringLiteral("backend connection closed")
+                           ? QStringLiteral("后台连接已关闭，界面正在自动重连")
+                           : m_client->error());
     }
     if (snapshot.has_value()) {
         if (!snapshot->interfaceError.isEmpty()) {
@@ -398,7 +406,11 @@ void Hud::applyStatus() {
             reasons.append(QStringLiteral("进程统计与网卡统计口径不同；缺失的累计数据无法补回。"));
         }
         if (!process.error.isEmpty()) {
-            reasons.append(QStringLiteral("进程采集：%1").arg(process.error));
+            reasons.append(
+                process.error == QStringLiteral("collector connection closed") ||
+                        process.error.contains(QStringLiteral("Remote closed"))
+                    ? QStringLiteral("采集器关闭了订阅连接，后台正在重连；进程速率暂不可用")
+                    : QStringLiteral("进程采集：%1").arg(process.error));
         }
         reasons.append(process.notes);
     }
@@ -520,7 +532,13 @@ QString Hud::currentScreenName() const {
 }
 
 void Hud::applyPosition(const QPoint& globalTopLeft, bool persist) {
-    const QScreen* screen = currentScreen();
+    const QScreen* screen = QGuiApplication::screenAt(globalTopLeft);
+    if (screen == nullptr) {
+        screen = currentScreen();
+    }
+    if (screen != nullptr) {
+        m_screenName = screen->name();
+    }
     const QRect screenRect = screen != nullptr ? screen->geometry() : QRect(m_position, size());
     const QRect clamped = clampRectInto(QRect(globalTopLeft, size()), screenRect);
     m_position = clamped.topLeft();
@@ -577,16 +595,26 @@ bool Hud::updateLayerShell() {
     if (screen != nullptr) {
         shell->setScreen(const_cast<QScreen*>(screen));
     }
-    m_layerShellActive = true;
     return true;
 }
 
-bool Hud::compositorOwnsPosition() const { return m_layerShellActive; }
+bool Hud::compositorOwnsPosition() const {
+    // Wayland positions are never authoritative, including before the first
+    // layer-shell configure; adopting that startup move overwrites saved state.
+    return QGuiApplication::platformName() == QLatin1String("wayland");
+}
 
 void Hud::showEvent(QShowEvent* event) {
     QWidget::showEvent(event);
     clampIntoVisibleArea();
     updateLayerShell();
+    m_surfaceShown = true;
+}
+
+void Hud::closeEvent(QCloseEvent* event) {
+    savePreferences();
+    m_settings->sync();
+    QWidget::closeEvent(event);
 }
 
 void Hud::moveEvent(QMoveEvent* event) {
@@ -595,7 +623,7 @@ void Hud::moveEvent(QMoveEvent* event) {
     // anchors/margins we request, so QWidget::pos() is a layout by-product and
     // never the requested position. Adopting it here is what made a drag snap
     // back (or to the origin) on Wayland; m_position stays authoritative there.
-    if (compositorOwnsPosition() || m_dragging) {
+    if (!m_surfaceShown || compositorOwnsPosition() || m_dragging) {
         return;
     }
     m_position = pos();
@@ -676,6 +704,9 @@ void Hud::mouseReleaseEvent(QMouseEvent* event) {
 
 bool Hud::event(QEvent* event) {
     switch (event->type()) {
+    case QEvent::Hide:
+        m_surfaceShown = false;
+        break;
     case QEvent::FontChange:
         if (m_statusLabel != nullptr) {
             updateBarLayout();
@@ -683,7 +714,9 @@ bool Hud::event(QEvent* event) {
         break;
     case QEvent::ScreenChangeInternal:
     case QEvent::Resize:
-        clampIntoVisibleArea();
+        if (isVisible() && m_bar != nullptr) {
+            clampIntoVisibleArea();
+        }
         break;
     default:
         break;

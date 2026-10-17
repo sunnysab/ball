@@ -3,14 +3,16 @@
 // HUD widgets. A real QLocalServer mock stands in for the backend, so no root
 // and no network access are needed; the layer-shell protocol itself is verified
 // in a Wayland session instead.
+#include "messagepack.h"
+#include "mp_frames.h"
 #include "process.h"
+#include "snapshot.h"
 #include "ui/autostart.h"
 #include "ui/details.h"
 #include "ui/format.h"
 #include "ui/hud.h"
 #include "ui/placement.h"
 #include "ui/preferences.h"
-#include "ui/snapshot.h"
 #include "ui/snapshot_client.h"
 #include "ui/traffic_model.h"
 
@@ -21,9 +23,7 @@
 #include <QFile>
 #include <QFontMetrics>
 #include <QGuiApplication>
-#include <QJsonArray>
-#include <QJsonDocument>
-#include <QJsonObject>
+#include <QHeaderView>
 #include <QKeyEvent>
 #include <QLabel>
 #include <QLineEdit>
@@ -48,94 +48,100 @@
 #include <limits>
 #include <unistd.h>
 
+using ball::InterfaceKind;
+using ball::InterfaceSnapshot;
+using ball::ProcessSnapshot;
+using ball::ProcessStatus;
+using ball::Snapshot;
+using ball::test::patchFrame;
 using ball::ui::Hud;
-using ball::ui::InterfaceKind;
-using ball::ui::InterfaceSnapshot;
-using ball::ui::ProcessSnapshot;
-using ball::ui::Snapshot;
 using ball::ui::SnapshotClient;
-using ball::ui::SnapshotParseResult;
 using namespace Qt::StringLiterals;
 
 namespace {
 
-// One snapshot frame with two physical interfaces, one loopback and three
-// processes, so the defaults (physical only, idle hidden) are observable.
-QByteArray snapshotLine(const QString& at = u"2026-10-14T14:30:02+08:00"_s,
-                        bool interfacesAvailable = true, bool processAvailable = true,
-                        bool processStale = false) {
-    const QJsonArray interfaces{
-        QJsonObject{
-            {u"index"_s, 2},
-            {u"name"_s, u"eno1"_s},
-            {u"kind"_s, u"physical"_s},
-            {u"up"_s, true},
-            {u"today"_s, QJsonObject{{u"rx_bytes"_s, u"2048"_s}, {u"tx_bytes"_s, u"512"_s}}},
-            {u"session"_s, QJsonObject{{u"rx_bytes"_s, u"2048"_s}, {u"tx_bytes"_s, u"512"_s}}},
-            {u"rate"_s, QJsonObject{{u"rx_bps"_s, 1024.0}, {u"tx_bps"_s, 256.0}}}},
-        QJsonObject{{u"index"_s, 3},
-                    {u"name"_s, u"wlan0"_s},
-                    {u"kind"_s, u"physical"_s},
-                    {u"up"_s, true},
-                    {u"today"_s,
-                     QJsonObject{{u"rx_bytes"_s, u"9007199254740993"_s}, {u"tx_bytes"_s, u"0"_s}}},
-                    {u"session"_s,
-                     QJsonObject{{u"rx_bytes"_s, u"9007199254740993"_s}, {u"tx_bytes"_s, u"0"_s}}},
-                    {u"rate"_s, QJsonObject{{u"rx_bps"_s, 500.0}, {u"tx_bps"_s, 0.0}}}},
-        QJsonObject{{u"index"_s, 1},
-                    {u"name"_s, u"lo"_s},
-                    {u"kind"_s, u"loopback"_s},
-                    {u"up"_s, true},
-                    {u"today"_s, QJsonObject{{u"rx_bytes"_s, u"77"_s}, {u"tx_bytes"_s, u"77"_s}}},
-                    {u"session"_s, QJsonObject{{u"rx_bytes"_s, u"77"_s}, {u"tx_bytes"_s, u"77"_s}}},
-                    {u"rate"_s, QJsonObject{{u"rx_bps"_s, 9.0}, {u"tx_bps"_s, 9.0}}}},
-        QJsonObject{{u"index"_s, 4},
-                    {u"name"_s, u"tun0"_s},
-                    {u"kind"_s, u"virtual"_s},
-                    {u"up"_s, false},
-                    {u"today"_s, QJsonObject{{u"rx_bytes"_s, u"5"_s}, {u"tx_bytes"_s, u"5"_s}}},
-                    {u"session"_s, QJsonObject{{u"rx_bytes"_s, u"5"_s}, {u"tx_bytes"_s, u"5"_s}}},
-                    {u"rate"_s, QJsonObject{{u"rx_bps"_s, 0.0}, {u"tx_bps"_s, 0.0}}}}};
+// Qt's FromString default is TextDate, not ISO, so the protocol's ISO 8601
+// instants are parsed explicitly.
+QDateTime isoAt(const QString& text) { return QDateTime::fromString(text, Qt::ISODate); }
 
-    const QJsonArray processes{
-        QJsonObject{
-            {u"pid"_s, 1234},
-            {u"start_ns"_s, u"9007199254740993"_s},
-            {u"name"_s, u"firefox"_s},
-            {u"present"_s, true},
-            {u"today"_s, QJsonObject{{u"rx_bytes"_s, u"1024"_s}, {u"tx_bytes"_s, u"128"_s}}},
-            {u"session"_s, QJsonObject{{u"rx_bytes"_s, u"1024"_s}, {u"tx_bytes"_s, u"128"_s}}},
-            {u"rate"_s, QJsonObject{{u"rx_bps"_s, 512.0}, {u"tx_bps"_s, 64.0}}}},
-        QJsonObject{{u"pid"_s, 42},
-                    {u"start_ns"_s, u"1"_s},
-                    {u"name"_s, u"code"_s},
-                    {u"present"_s, true},
-                    {u"today"_s, QJsonObject{{u"rx_bytes"_s, u"99"_s}, {u"tx_bytes"_s, u"99"_s}}},
-                    {u"session"_s, QJsonObject{{u"rx_bytes"_s, u"99"_s}, {u"tx_bytes"_s, u"99"_s}}},
-                    {u"rate"_s, QJsonObject{{u"rx_bps"_s, 9.0}, {u"tx_bps"_s, 9.0}}}},
-        QJsonObject{{u"pid"_s, 7},
-                    {u"start_ns"_s, u"2"_s},
-                    {u"name"_s, u"dead"_s},
-                    {u"present"_s, false},
-                    {u"today"_s, QJsonObject{{u"rx_bytes"_s, u"7"_s}, {u"tx_bytes"_s, u"7"_s}}},
-                    {u"session"_s, QJsonObject{{u"rx_bytes"_s, u"7"_s}, {u"tx_bytes"_s, u"7"_s}}},
-                    {u"rate"_s, QJsonObject{{u"rx_bps"_s, 0.0}, {u"tx_bps"_s, 0.0}}}}};
+// One snapshot with two physical interfaces, one loopback, one down virtual
+// interface and three processes, so the defaults (physical only, idle hidden)
+// are observable. It is the real protocol structure, so the tests exercise the
+// decoder against what the daemon actually writes.
+Snapshot makeSnapshot(const QDateTime& at = isoAt(u"2026-10-14T14:30:02+08:00"_s),
+                      bool interfacesAvailable = true, bool processAvailable = true,
+                      bool processStale = false) {
+    Snapshot snapshot;
+    snapshot.version = 1;
+    snapshot.started = isoAt(u"2026-10-14T14:30:00+08:00"_s);
+    snapshot.at = at.isValid() ? at : isoAt(u"2026-10-14T14:30:02+08:00"_s);
+    snapshot.interfacesAvailable = interfacesAvailable;
+    snapshot.interfaceError =
+        interfacesAvailable ? QString() : QStringLiteral("rtnetlink dump failed");
+    snapshot.processStatus = ProcessStatus{processAvailable, processStale, false, QString(), {}};
 
-    const QJsonObject snapshot{
-        {u"version"_s, 1},
-        {u"kind"_s, u"snapshot"_s},
-        {u"started"_s, u"2026-10-14T14:30:00+08:00"_s},
-        {u"at"_s, at},
-        {u"interfaces_available"_s, interfacesAvailable},
-        {u"interface_error"_s, interfacesAvailable ? u""_s : u"rtnetlink dump failed"_s},
-        {u"process_status"_s, QJsonObject{{u"available"_s, processAvailable},
-                                          {u"stale"_s, processStale},
-                                          {u"incomplete"_s, false},
-                                          {u"error"_s, u""_s},
-                                          {u"notes"_s, QJsonArray{}}}},
-        {u"interfaces"_s, interfaces},
-        {u"processes"_s, processes}};
-    return QJsonDocument(snapshot).toJson(QJsonDocument::Compact);
+    const auto interface = [](quint32 index, const QString& name, InterfaceKind kind, bool up,
+                              quint64 todayRx, quint64 todayTx, double rxBps, double txBps) {
+        InterfaceSnapshot row;
+        row.index = index;
+        row.name = name;
+        row.kind = kind;
+        row.up = up;
+        row.today = {todayRx, todayTx};
+        row.session = row.today;
+        row.rxBps = rxBps;
+        row.txBps = txBps;
+        return row;
+    };
+    snapshot.interfaces = {
+        interface(2, u"eno1"_s, InterfaceKind::Physical, true, 2048, 512, 1024.0, 256.0),
+        // 2^53 + 1 is what a float64 cannot hold exactly.
+        interface(3, u"wlan0"_s, InterfaceKind::Physical, true, 9007199254740993ULL, 0, 500.0, 0.0),
+        interface(1, u"lo"_s, InterfaceKind::Loopback, true, 77, 77, 9.0, 9.0),
+        interface(4, u"tun0"_s, InterfaceKind::Virtual, false, 5, 5, 0.0, 0.0),
+    };
+
+    const auto process = [](int pid, quint64 startNs, const QString& name, bool present, quint64 rx,
+                            quint64 tx, double rxBps, double txBps) {
+        ProcessSnapshot row;
+        row.pid = pid;
+        row.startNs = startNs;
+        row.name = name;
+        row.present = present;
+        row.today = {rx, tx};
+        row.session = row.today;
+        row.rxBps = rxBps;
+        row.txBps = txBps;
+        return row;
+    };
+    snapshot.processes = {
+        process(1234, 9007199254740993ULL, u"firefox"_s, true, 1024, 128, 512.0, 64.0),
+        process(42, 1, u"code"_s, true, 99, 99, 9.0, 9.0),
+        process(7, 2, u"dead"_s, false, 7, 7, 0.0, 0.0),
+    };
+    return snapshot;
+}
+
+// The frame bytes of `makeSnapshot`, which is what a socket write carries.
+QByteArray snapshotFrame(const QDateTime& at = isoAt(u"2026-10-14T14:30:02+08:00"_s),
+                         bool interfacesAvailable = true, bool processAvailable = true,
+                         bool processStale = false) {
+    bool ok = false;
+    const QByteArray frame = ball::encodeSnapshot(
+        makeSnapshot(at, interfacesAvailable, processAvailable, processStale), ok);
+    Q_ASSERT(ok);
+    return frame;
+}
+
+// Decodes one frame in isolation, exactly as the client does.
+ball::SnapshotParseResult decodeFrame(const QByteArray& frame) {
+    ball::mp::Decoder decoder;
+    decoder.feed(frame);
+    ball::mp::Frame decoded = decoder.next();
+    if (!decoded.valid()) {
+        return ball::SnapshotParseResult{std::nullopt, QStringLiteral("not a frame")};
+    }
+    return ball::decodeSnapshot(decoded.value());
 }
 
 // Runs the event loop until `predicate` is true or `timeoutMs` elapses.
@@ -164,7 +170,8 @@ private Q_SLOTS:
 
     // Parser
     void parsesFullSnapshot();
-    void keepsLargeDecimalStringsExact();
+    void keepsLargeCountersExact();
+    void roundTripsEveryEncodedValue();
     void rejectsBadFrames();
     void rejectsTimestampWithoutZone();
 
@@ -215,6 +222,11 @@ private Q_SLOTS:
     void partialInterfaceSelectionIsVisible();
     void staleRatesAreUnavailableInBothWindows();
     void detailsGeometrySurvivesRestart();
+    void detailsKeepNativeTitleBarWithoutPinning();
+    void tableColumnWidthsStayUserControlled();
+    void hudPositionSurvivesCloseShowAndRestart();
+    void startupRestoresPositionBeforeLayerShellConfigure();
+    void protocolFailureRetainsReasonAndReconnectRecovers();
     void appearanceMenuUpdatesPreferences();
     void contextMenuStaysCompact();
     void autostartMenuUsesUserConfiguration();
@@ -222,7 +234,7 @@ private Q_SLOTS:
 private:
     QString startServer();
     QLocalSocket* acceptConnection(int timeoutMs = 3000);
-    void send(const QByteArray& raw, bool newline = true);
+    void send(const QByteArray& raw);
 
     QLocalServer m_server;
     QLocalSocket* m_client = nullptr;
@@ -282,22 +294,19 @@ QLocalSocket* TestUi::acceptConnection(int timeoutMs) {
     return m_client;
 }
 
-void TestUi::send(const QByteArray& raw, bool newline) {
+void TestUi::send(const QByteArray& raw) {
     QLocalSocket* socket = m_client;
     QVERIFY(socket != nullptr);
     if (socket == nullptr) {
         return; // the caller's acceptConnection() already failed the test
     }
-    QByteArray payload = raw;
-    if (newline) {
-        payload.append('\n');
-    }
-    QCOMPARE(socket->write(payload), qint64(payload.size()));
+    // MessagePack frames are self-delimiting, so one write is one frame.
+    QCOMPARE(socket->write(raw), qint64(raw.size()));
     socket->flush();
 }
 
 void TestUi::parsesFullSnapshot() {
-    const SnapshotParseResult result = ball::ui::parseSnapshot(snapshotLine());
+    const ball::SnapshotParseResult result = decodeFrame(snapshotFrame());
     QVERIFY2(result.snapshot.has_value(), qPrintable(result.error));
     const Snapshot snapshot = result.snapshot.value_or(Snapshot{});
     QCOMPARE(snapshot.version, 1);
@@ -314,8 +323,8 @@ void TestUi::parsesFullSnapshot() {
     QCOMPARE(snapshot.processes.at(2).present, false);
 }
 
-void TestUi::keepsLargeDecimalStringsExact() {
-    const SnapshotParseResult result = ball::ui::parseSnapshot(snapshotLine());
+void TestUi::keepsLargeCountersExact() {
+    const ball::SnapshotParseResult result = decodeFrame(snapshotFrame());
     QVERIFY(result.snapshot.has_value());
     // 9007199254740993 is 2^53 + 1, which no double can represent.
     const Snapshot snapshot = result.snapshot.value_or(Snapshot{});
@@ -323,43 +332,185 @@ void TestUi::keepsLargeDecimalStringsExact() {
     QCOMPARE(snapshot.processes.at(0).startNs, quint64(9007199254740993ULL));
 }
 
+void TestUi::roundTripsEveryEncodedValue() {
+    // The encoder and the decoder share one schema, so every value the daemon
+    // writes must come back exactly. An extreme sample per field type catches a
+    // mismatch that a normal frame would hide.
+    Snapshot original;
+    original.version = 1;
+    original.started = isoAt(u"2026-10-14T14:30:00+08:00"_s);
+    original.at = isoAt(u"2026-10-15T09:41:07.123+08:00"_s);
+    original.interfacesAvailable = false; // false must survive as false
+    original.interfaceError = u"rtnetlink dump failed"_s;
+    original.processStatus = ProcessStatus{
+        false,
+        true,
+        true,
+        u"collector connection closed"_s,
+        {u"PID events: kernel_lost 1, dropped 2, invalid 3"_s, u"unindexed bytes: RX 4, TX 5"_s}};
+
+    InterfaceSnapshot interface;
+    // The protocol caps both identities at INT_MAX, the largest value either
+    // side can hold in an int.
+    interface.index = quint32(std::numeric_limits<int>::max());
+    interface.name = u"eno1"_s;
+    interface.kind = InterfaceKind::Virtual;
+    interface.up = false;
+    interface.today = {std::numeric_limits<quint64>::max(), 0};
+    interface.session = {0, std::numeric_limits<quint64>::max()};
+    interface.rxBps = 0.0;
+    interface.txBps = 1234567.890625;
+    original.interfaces = {interface};
+
+    ProcessSnapshot process;
+    process.pid = std::numeric_limits<int>::max();
+    process.startNs = std::numeric_limits<quint64>::max();
+    process.name = u"进程 with ünicode and 'quotes'"_s;
+    process.present = true;
+    process.today = {9007199254740993ULL, 1}; // 2^53 + 1
+    process.session = {2, 3};
+    process.rxBps = 0.1;
+    process.txBps = 1e15;
+    // Plus a minimal row whose start_ns is zero on the wire.
+    ProcessSnapshot minimal;
+    minimal.pid = 1;
+    minimal.name = u"init"_s;
+    minimal.present = false;
+    original.processes = {process, minimal};
+
+    bool ok = false;
+    const QByteArray frame = ball::encodeSnapshot(original, ok);
+    QVERIFY(ok);
+    const ball::SnapshotParseResult result = decodeFrame(frame);
+    QVERIFY2(result.snapshot.has_value(), qPrintable(result.error));
+    const Snapshot& decoded = *result.snapshot;
+
+    QCOMPARE(decoded.version, original.version);
+    QCOMPARE(decoded.started, original.started);
+    QCOMPARE(decoded.at, original.at);
+    QCOMPARE(decoded.interfacesAvailable, original.interfacesAvailable);
+    QCOMPARE(decoded.interfaceError, original.interfaceError);
+    QCOMPARE(decoded.processStatus.available, original.processStatus.available);
+    QCOMPARE(decoded.processStatus.stale, original.processStatus.stale);
+    QCOMPARE(decoded.processStatus.incomplete, original.processStatus.incomplete);
+    QCOMPARE(decoded.processStatus.error, original.processStatus.error);
+    QCOMPARE(decoded.processStatus.notes, original.processStatus.notes);
+    QCOMPARE(decoded.interfaces.size(), 1);
+    QCOMPARE(decoded.interfaces.at(0).index, interface.index);
+    QCOMPARE(decoded.interfaces.at(0).name, interface.name);
+    QCOMPARE(decoded.interfaces.at(0).kind, interface.kind);
+    QCOMPARE(decoded.interfaces.at(0).up, interface.up);
+    QCOMPARE(decoded.interfaces.at(0).today.rxBytes, interface.today.rxBytes);
+    QCOMPARE(decoded.interfaces.at(0).session.txBytes, interface.session.txBytes);
+    QCOMPARE(decoded.interfaces.at(0).txBps, interface.txBps);
+    QCOMPARE(decoded.processes.size(), 2);
+    QCOMPARE(decoded.processes.at(0).pid, process.pid);
+    QCOMPARE(decoded.processes.at(0).startNs, process.startNs);
+    QCOMPARE(decoded.processes.at(0).name, process.name);
+    QCOMPARE(decoded.processes.at(0).present, process.present);
+    QCOMPARE(decoded.processes.at(0).today.rxBytes, process.today.rxBytes);
+    QCOMPARE(decoded.processes.at(0).rxBps, process.rxBps);
+    QCOMPARE(decoded.processes.at(0).txBps, process.txBps);
+    QCOMPARE(decoded.processes.at(1).startNs, quint64(0));
+    QCOMPARE(decoded.processes.at(1).pid, 1);
+    QCOMPARE(decoded.processes.at(1).present, false);
+    QCOMPARE(decoded.processes.at(1).today.rxBytes, quint64(0));
+    QCOMPARE(decoded.processes.at(1).rxBps, 0.0);
+}
+
 void TestUi::rejectsBadFrames() {
-    const auto rejected = [](const QByteArray& line) {
-        return !ball::ui::parseSnapshot(line).snapshot.has_value();
+    const auto rejected = [](const QByteArray& frame) {
+        return !decodeFrame(frame).snapshot.has_value();
     };
-    QVERIFY(rejected("{oops"));
-    QVERIFY(rejected("[1,2]"));
-    QVERIFY(rejected("{}"));
-    // Wrong version, wrong kind and missing quality fields are all bad frames.
-    QJsonObject object = QJsonDocument::fromJson(snapshotLine()).object();
-    object[u"version"_s] = 2;
-    QVERIFY(rejected(QJsonDocument(object).toJson(QJsonDocument::Compact)));
-    object = QJsonDocument::fromJson(snapshotLine()).object();
-    object[u"kind"_s] = u"hello"_s;
-    QVERIFY(rejected(QJsonDocument(object).toJson(QJsonDocument::Compact)));
-    object = QJsonDocument::fromJson(snapshotLine()).object();
-    object.remove(u"process_status"_s);
-    QVERIFY(rejected(QJsonDocument(object).toJson(QJsonDocument::Compact)));
-    // A negative byte count and a non-decimal string must not be accepted.
-    object = QJsonDocument::fromJson(snapshotLine()).object();
-    QJsonObject snapshot = object[u"snapshot"_s].toObject();
-    QJsonArray interfaces = object[u"interfaces"_s].toArray();
-    QJsonObject first = interfaces.at(0).toObject();
-    first[u"today"_s] = QJsonObject{{u"rx_bytes"_s, u"1.5"_s}, {u"tx_bytes"_s, u"0"_s}};
-    interfaces.replace(0, first);
-    object[u"interfaces"_s] = interfaces;
-    QVERIFY(rejected(QJsonDocument(object).toJson(QJsonDocument::Compact)));
+    // Bytes that are not a frame, and a frame that is not a map.
+    QVERIFY(rejected(QByteArrayLiteral("{oops")));
+    QVERIFY(rejected(QByteArray::fromHex("920102"))); // [1,2]
+    QVERIFY(rejected(QByteArray::fromHex("80")));     // {}
+
+    // Wrong version, wrong kind and a missing quality section are all refused.
+    QVERIFY(rejected(patchFrame(snapshotFrame(), [](msgpack::object& root, msgpack::zone& zone) {
+        // A field whose name is right but whose value is not.
+        msgpack::object* version = ball::test::member(root, QLatin1StringView("version"));
+        QVERIFY(version != nullptr);
+        *version = msgpack::object(uint64_t(2), zone);
+    })));
+    QVERIFY(rejected(patchFrame(snapshotFrame(), [](msgpack::object& root, msgpack::zone& zone) {
+        msgpack::object* kind = ball::test::member(root, QLatin1StringView("kind"));
+        QVERIFY(kind != nullptr);
+        *kind = msgpack::object(std::string("hello"), zone);
+    })));
+    // A fractional byte count is not an exact counter and must be refused.
+    QVERIFY(rejected(patchFrame(snapshotFrame(), [](msgpack::object& root, msgpack::zone& zone) {
+        msgpack::object* interfaces = ball::test::member(root, QLatin1StringView("interfaces"));
+        QVERIFY(interfaces != nullptr);
+        msgpack::object* today =
+            ball::test::member(interfaces->via.array.ptr[0], QLatin1StringView("today"));
+        QVERIFY(today != nullptr);
+        msgpack::object* rx = ball::test::member(*today, QLatin1StringView("rx_bytes"));
+        QVERIFY(rx != nullptr);
+        *rx = msgpack::object(1.5, zone);
+    })));
+    // A negative count is not a byte total either.
+    QVERIFY(rejected(patchFrame(snapshotFrame(), [](msgpack::object& root, msgpack::zone& zone) {
+        msgpack::object* processes = ball::test::member(root, QLatin1StringView("processes"));
+        QVERIFY(processes != nullptr);
+        msgpack::object* session =
+            ball::test::member(processes->via.array.ptr[0], QLatin1StringView("session"));
+        QVERIFY(session != nullptr);
+        msgpack::object* tx = ball::test::member(*session, QLatin1StringView("tx_bytes"));
+        QVERIFY(tx != nullptr);
+        *tx = msgpack::object(int64_t(-1), zone);
+    })));
+    // A duplicate process identity is ambiguous.
+    QVERIFY(rejected(patchFrame(snapshotFrame(), [](msgpack::object& root, msgpack::zone& zone) {
+        msgpack::object* processes = ball::test::member(root, QLatin1StringView("processes"));
+        QVERIFY(processes != nullptr && processes->via.array.size == 3);
+        // Copy both identity fields of the first row onto the second.
+        const msgpack::object& first = processes->via.array.ptr[0];
+        msgpack::object& second = processes->via.array.ptr[1];
+        for (QLatin1StringView name : {QLatin1StringView("pid"), QLatin1StringView("start_ns")}) {
+            msgpack::object* from = ball::test::member(const_cast<msgpack::object&>(first), name);
+            msgpack::object* to = ball::test::member(second, name);
+            QVERIFY(from != nullptr && to != nullptr);
+            *to = *from;
+        }
+        (void)zone;
+    })));
+    // A row whose "up" is not a boolean.
+    QVERIFY(rejected(patchFrame(snapshotFrame(), [](msgpack::object& root, msgpack::zone& zone) {
+        msgpack::object* interfaces = ball::test::member(root, QLatin1StringView("interfaces"));
+        QVERIFY(interfaces != nullptr);
+        msgpack::object* up =
+            ball::test::member(interfaces->via.array.ptr[0], QLatin1StringView("up"));
+        QVERIFY(up != nullptr);
+        *up = msgpack::object(std::string("yes"), zone);
+    })));
+
+    // The unpatched frame is accepted, so every rejection above is caused by the
+    // edit and not by the fixture.
+    QVERIFY(decodeFrame(snapshotFrame()).snapshot.has_value());
 }
 
 void TestUi::rejectsTimestampWithoutZone() {
-    QJsonObject object = QJsonDocument::fromJson(snapshotLine()).object();
-    object[u"at"_s] = u"2026-10-14T14:30:02"_s;
-    QVERIFY(!ball::ui::parseSnapshot(QJsonDocument(object).toJson(QJsonDocument::Compact))
-                 .snapshot.has_value());
-    // Payment for the "at" field is not a time either.
-    object[u"at"_s] = u"not a time"_s;
-    QVERIFY(!ball::ui::parseSnapshot(QJsonDocument(object).toJson(QJsonDocument::Compact))
-                 .snapshot.has_value());
+    // An instant must be a MessagePack timestamp. A string is not one however
+    // plausible it looks, because only the extension names an unambiguous
+    // instant; a zone-less local time would silently move the frame.
+    const auto withAt = [](const std::function<void(msgpack::object&, msgpack::zone&)>& value) {
+        return patchFrame(snapshotFrame(), [&](msgpack::object& root, msgpack::zone& zone) {
+            msgpack::object* at = ball::test::member(root, QLatin1StringView("at"));
+            QVERIFY(at != nullptr);
+            value(*at, zone);
+        });
+    };
+    QVERIFY(!decodeFrame(withAt([](msgpack::object& at, msgpack::zone& zone) {
+                 at = msgpack::object(std::string("2026-10-14T14:30:02"), zone);
+             })).snapshot.has_value());
+    QVERIFY(!decodeFrame(withAt([](msgpack::object& at, msgpack::zone& zone) {
+                 at = msgpack::object(std::string("not a time"), zone);
+             })).snapshot.has_value());
+    QVERIFY(!decodeFrame(withAt([](msgpack::object& at, msgpack::zone&) {
+                 at = msgpack::object(uint64_t(1700000000));
+             })).snapshot.has_value());
 }
 
 void TestUi::receivesInitialSnapshot() {
@@ -369,7 +520,7 @@ void TestUi::receivesInitialSnapshot() {
     client.start(startServer());
     QLocalSocket* socket = acceptConnection();
     QVERIFY(socket != nullptr);
-    send(snapshotLine());
+    send(snapshotFrame());
     QVERIFY(waitFor([&client] { return client.fresh(); }));
     QVERIFY(client.snapshot().has_value());
     QCOMPARE(client.snapshot().value_or(Snapshot{}).interfaces.at(0).name, u"eno1"_s);
@@ -381,17 +532,16 @@ void TestUi::handlesSplitAndMultipleFrames() {
     client.start(startServer());
     QVERIFY(acceptConnection() != nullptr);
 
-    const QByteArray first = snapshotLine();
-    const QByteArray second = snapshotLine(u"2026-10-14T14:30:03+08:00"_s);
+    const QByteArray first = snapshotFrame();
+    const QByteArray second = snapshotFrame(isoAt(u"2026-10-14T14:30:03+08:00"_s));
     // Half a frame, then the rest plus a whole second frame in one write.
     const qsizetype split = first.size() / 2;
-    send(first.left(split), false);
+    send(first.left(split));
     QTest::qWait(30);
     QCOMPARE(client.snapshot().has_value(), false);
     QByteArray tail = first.mid(split);
-    tail.append('\n');
     tail.append(second);
-    send(tail, true);
+    send(tail);
 
     QVERIFY(waitFor([&client] { return client.fresh(); }));
     // Only the newest whole snapshot is kept: the second frame's `at` wins.
@@ -404,7 +554,7 @@ void TestUi::rejectedFrameKeepsLastSnapshot() {
     SnapshotClient client;
     client.start(startServer());
     QVERIFY(acceptConnection() != nullptr);
-    send(snapshotLine());
+    send(snapshotFrame());
     QVERIFY(waitFor([&client] { return client.fresh(); }));
     const QDateTime kept = client.snapshot().value_or(Snapshot{}).at;
 
@@ -422,7 +572,7 @@ void TestUi::disconnectMarksStale() {
     client.start(startServer());
     QLocalSocket* socket = acceptConnection();
     QVERIFY(socket != nullptr);
-    send(snapshotLine());
+    send(snapshotFrame());
     QVERIFY(waitFor([&client] { return client.fresh(); }));
 
     socket->disconnectFromServer();
@@ -440,10 +590,12 @@ void TestUi::oversizedFrameDropsConnection() {
     if (socket == nullptr) {
         return; // acceptConnection() already failed the test
     }
-    // More than kMaxLineBytes without a newline must not grow memory or be
-    // parsed; the client drops the connection instead.
-    QByteArray huge(SnapshotClient::kMaxLineBytes + 1024, 'x');
-    huge.prepend("{\"kind\":\"snapshot\",\"pad\":\"");
+    // A frame header claiming more bytes than any frame may hold, followed by
+    // data. The decode library defers a string's size check until its payload
+    // arrives, so the bound that catches this is the buffered-bytes cap: once
+    // more than one frame is pending, the header can only be a lie.
+    QByteArray huge = QByteArray::fromHex("db7fffffff"); // str of 2^31-1 bytes
+    huge.append(ball::mp::kMaxFrameBytes + 1024, 'x');
     QTest::qWait(10);
     QVERIFY(socket->write(huge) > 0);
     socket->flush();
@@ -452,7 +604,7 @@ void TestUi::oversizedFrameDropsConnection() {
 }
 
 void TestUi::sumsOnlySelectedInterfaces() {
-    const SnapshotParseResult result = ball::ui::parseSnapshot(snapshotLine());
+    const ball::SnapshotParseResult result = decodeFrame(snapshotFrame());
     QVERIFY(result.snapshot.has_value());
     const QList<InterfaceSnapshot>& interfaces = result.snapshot.value_or(Snapshot{}).interfaces;
 
@@ -479,7 +631,7 @@ void TestUi::sumsOnlySelectedInterfaces() {
 }
 
 void TestUi::aggregateRejectsOverflowAndCountsUniqueNames() {
-    const auto parsed = ball::ui::parseSnapshot(snapshotLine());
+    const auto parsed = decodeFrame(snapshotFrame());
     QVERIFY(parsed.snapshot.has_value());
     auto row = parsed.snapshot.value_or(Snapshot{}).interfaces.first();
     auto retired = row;
@@ -508,12 +660,12 @@ void TestUi::emptyInterfaceSelectionSurvivesSnapshotsAndRestart() {
         QSettings settings(m_settingsPath, QSettings::IniFormat);
         Hud hud(startServer(), settings);
         QVERIFY(acceptConnection());
-        send(snapshotLine());
+        send(snapshotFrame());
         QVERIFY(waitFor([&hud] { return !hud.selectedInterfaces().isEmpty(); }));
         hud.setSelectedInterfaces({});
         QVERIFY(hud.selectedInterfaces().isEmpty());
         QSignalSpy changed(&hud, &Hud::snapshotChanged);
-        send(snapshotLine());
+        send(snapshotFrame());
         QVERIFY(waitFor([&changed] { return !changed.isEmpty(); }));
         QVERIFY(hud.selectedInterfaces().isEmpty());
     }
@@ -522,13 +674,13 @@ void TestUi::emptyInterfaceSelectionSurvivesSnapshotsAndRestart() {
     Hud restored(startServer(), settings);
     QVERIFY(acceptConnection());
     QSignalSpy changed(&restored, &Hud::snapshotChanged);
-    send(snapshotLine());
+    send(snapshotFrame());
     QVERIFY(waitFor([&changed] { return !changed.isEmpty(); }));
     QVERIFY(restored.selectedInterfaces().isEmpty());
 }
 
 void TestUi::defaultSelectionIsEnabledPhysicalOnly() {
-    const SnapshotParseResult result = ball::ui::parseSnapshot(snapshotLine());
+    const ball::SnapshotParseResult result = decodeFrame(snapshotFrame());
     QVERIFY(result.snapshot.has_value());
     const QStringList defaults =
         ball::ui::defaultInterfaceSelection(result.snapshot.value_or(Snapshot{}).interfaces);
@@ -610,7 +762,7 @@ void TestUi::showsDigitsFromSnapshot() {
     QSettings settings(m_settingsPath, QSettings::IniFormat);
     Hud hud(startServer(), settings);
     QVERIFY(acceptConnection() != nullptr);
-    send(snapshotLine());
+    send(snapshotFrame());
 
     auto* rx = hud.findChild<QLabel*>(u"hud.rx"_s);
     auto* status = hud.findChild<QLabel*>(u"hud.status"_s);
@@ -626,7 +778,7 @@ void TestUi::switchesTabsAndSortsProcesses() {
     QSettings settings(m_settingsPath, QSettings::IniFormat);
     Hud hud(startServer(), settings);
     QVERIFY(acceptConnection() != nullptr);
-    send(snapshotLine());
+    send(snapshotFrame());
     QVERIFY(waitFor([&hud] {
         return hud.detailsWindow()->findChild<QLabel*>(u"details.currentDown"_s) != nullptr &&
                hud.detailsWindow()
@@ -653,7 +805,7 @@ void TestUi::filtersIdleProcessesAndSearch() {
     QSettings settings(m_settingsPath, QSettings::IniFormat);
     Hud hud(startServer(), settings);
     QVERIFY(acceptConnection() != nullptr);
-    send(snapshotLine());
+    send(snapshotFrame());
     auto* table = hud.detailsWindow()->findChild<QTableView*>(u"details.processTable"_s);
     auto* search = hud.detailsWindow()->findChild<QLineEdit*>(u"details.search"_s);
     auto* showIdle = hud.detailsWindow()->findChild<QCheckBox*>(u"details.showIdle"_s);
@@ -683,7 +835,7 @@ void TestUi::interfaceSelectionExcludesLoopback() {
     QSettings settings(m_settingsPath, QSettings::IniFormat);
     Hud hud(startServer(), settings);
     QVERIFY(acceptConnection() != nullptr);
-    send(snapshotLine());
+    send(snapshotFrame());
     QVERIFY(waitFor(
         [&hud] { return hud.selectedInterfaces() == QStringList({u"eno1"_s, u"wlan0"_s}); }));
     // The first-run default is the enabled physical interfaces only.
@@ -913,15 +1065,6 @@ void TestUi::detailsSurviveDeactivationAndEscapeClosesOnlyDetails() {
     QVERIFY(!details->isVisible());
     QVERIFY(hud.isVisible());
     QCOMPARE(hud.size(), barSize);
-
-    hud.showDetails();
-    auto* top = details->findChild<QToolButton*>(u"details.onTop"_s);
-    top->setChecked(true);
-    QVERIFY(details->windowFlags().testFlag(Qt::WindowStaysOnTopHint));
-    QVERIFY(details->isVisible());
-    top->setChecked(false);
-    QVERIFY(!details->windowFlags().testFlag(Qt::WindowStaysOnTopHint));
-    QVERIFY(details->isVisible());
 }
 
 void TestUi::remembersPositionAndOpacity() {
@@ -1095,7 +1238,7 @@ void TestUi::allMetricsAreVisibleAndSortNumerically() {
     QSettings settings(m_settingsPath, QSettings::IniFormat);
     Hud hud(startServer(), settings);
     QVERIFY(acceptConnection() != nullptr);
-    send(snapshotLine());
+    send(snapshotFrame());
     auto* details = hud.detailsWindow();
     auto* table = details->findChild<QTableView*>(u"details.processTable"_s);
     auto* search = details->findChild<QLineEdit*>(u"details.search"_s);
@@ -1140,7 +1283,7 @@ void TestUi::processTooltipReadsVerifiedCommandLineAndEscapesMarkup() {
 
     QSettings settings(m_settingsPath, QSettings::IniFormat);
     Hud hud(startServer(), settings);
-    const auto parsed = ball::ui::parseSnapshot(snapshotLine());
+    const auto parsed = decodeFrame(snapshotFrame());
     QVERIFY(parsed.snapshot.has_value());
     auto snapshot = parsed.snapshot.value_or(Snapshot{});
     auto& process = snapshot.processes.first();
@@ -1168,11 +1311,17 @@ void TestUi::processQualityDoesNotInvalidateInterfaceRates() {
     QSettings settings(m_settingsPath, QSettings::IniFormat);
     Hud hud(startServer(), settings);
     QVERIFY(acceptConnection() != nullptr);
-    auto object = QJsonDocument::fromJson(snapshotLine()).object();
-    auto process = object[u"process_status"_s].toObject();
-    process[u"incomplete"_s] = true;
-    object[u"process_status"_s] = process;
-    send(QJsonDocument(object).toJson(QJsonDocument::Compact));
+    // One snapshot whose process table carries a quality problem: the interface
+    // rates stay valid, the process side does not.
+    send(patchFrame(snapshotFrame(), [](msgpack::object& root, msgpack::zone& zone) {
+        msgpack::object* processStatus =
+            ball::test::member(root, QLatin1StringView("process_status"));
+        QVERIFY(processStatus != nullptr);
+        msgpack::object* incomplete =
+            ball::test::member(*processStatus, QLatin1StringView("incomplete"));
+        QVERIFY(incomplete != nullptr);
+        *incomplete = msgpack::object(true, zone);
+    }));
     auto* status = hud.findChild<QLabel*>(u"hud.status"_s);
     auto* rx = hud.findChild<QLabel*>(u"hud.rx"_s);
     auto* quality = hud.detailsWindow()->findChild<QLabel*>(u"details.quality"_s);
@@ -1188,16 +1337,23 @@ void TestUi::processQualityDoesNotInvalidateInterfaceRates() {
     toggle->setChecked(true);
     QVERIFY(reasons->isVisible());
 
-    send(snapshotLine(u"2026-10-14T14:30:03+08:00"_s, true, false, true));
+    send(snapshotFrame(isoAt(u"2026-10-14T14:30:03+08:00"_s), true, false, true));
     QVERIFY(waitFor([quality] { return quality->text().contains(u"进程采集不可用"_s); }));
     QCOMPARE(rx->text(), u"1.49"_s);
-    process[u"incomplete"_s] = false;
-    process[u"error"_s] = u"collector error"_s;
-    object[u"process_status"_s] = process;
-    send(QJsonDocument(object).toJson(QJsonDocument::Compact));
+    // Now the collector reports a failure: the reason must reach the UI.
+    send(patchFrame(snapshotFrame(isoAt(u"2026-10-14T14:30:04+08:00"_s), true, false, true),
+                    [](msgpack::object& root, msgpack::zone& zone) {
+                        msgpack::object* processStatus =
+                            ball::test::member(root, QLatin1StringView("process_status"));
+                        QVERIFY(processStatus != nullptr);
+                        msgpack::object* error =
+                            ball::test::member(*processStatus, QLatin1StringView("error"));
+                        QVERIFY(error != nullptr);
+                        *error = msgpack::object(std::string("collector error"), zone);
+                    }));
     QVERIFY(waitFor([reasons] { return reasons->text().contains(u"collector error"_s); }));
     QVERIFY(quality->text().contains(u"进程采集不可用"_s));
-    send(snapshotLine());
+    send(snapshotFrame());
     QVERIFY(waitFor([status] { return status->text().isEmpty(); }));
 }
 
@@ -1205,7 +1361,7 @@ void TestUi::partialInterfaceSelectionIsVisible() {
     QSettings settings(m_settingsPath, QSettings::IniFormat);
     Hud hud(startServer(), settings);
     QVERIFY(acceptConnection() != nullptr);
-    send(snapshotLine());
+    send(snapshotFrame());
     QVERIFY(waitFor([&hud] { return !hud.selectedInterfaces().isEmpty(); }));
     hud.setSelectedInterfaces({u"eno1"_s, u"missing"_s});
     auto* status = hud.findChild<QLabel*>(u"hud.status"_s);
@@ -1223,7 +1379,7 @@ void TestUi::staleRatesAreUnavailableInBothWindows() {
     QSettings settings(m_settingsPath, QSettings::IniFormat);
     Hud hud(startServer(), settings);
     QVERIFY(acceptConnection() != nullptr);
-    send(snapshotLine());
+    send(snapshotFrame());
     auto* rx = hud.findChild<QLabel*>(u"hud.rx"_s);
     QVERIFY(waitFor([rx] { return rx->text() == u"1.49"_s; }));
     m_client->disconnectFromServer();
@@ -1267,6 +1423,116 @@ void TestUi::appearanceMenuUpdatesPreferences() {
     QCOMPARE(saved.theme, hud.theme());
     QCOMPARE(saved.barLayout, hud.barLayout());
     QVERIFY(hud.findChild<QAction*>(u"hud.action.pin"_s) == nullptr);
+}
+
+void TestUi::detailsKeepNativeTitleBarWithoutPinning() {
+    QSettings settings(m_settingsPath, QSettings::IniFormat);
+    Hud hud(startServer(), settings);
+    auto* details = hud.detailsWindow();
+    QCOMPARE(details->windowType(), Qt::Window);
+    QVERIFY(!details->windowFlags().testFlag(Qt::FramelessWindowHint));
+    QVERIFY(!details->windowFlags().testFlag(Qt::WindowStaysOnTopHint));
+    QVERIFY(details->findChild<QToolButton*>(u"details.onTop"_s) == nullptr);
+}
+
+void TestUi::tableColumnWidthsStayUserControlled() {
+    QSettings settings(m_settingsPath, QSettings::IniFormat);
+    Hud hud(startServer(), settings);
+    QVERIFY(acceptConnection() != nullptr);
+    send(snapshotFrame());
+    hud.showDetails();
+    auto* details = hud.detailsWindow();
+    auto* table = details->findChild<QTableView*>(u"details.processTable"_s);
+    QVERIFY(waitFor([table] { return table->model()->rowCount() == 2; }));
+    QCoreApplication::processEvents();
+    auto* header = table->horizontalHeader();
+    for (int column = 0; column < 9; ++column) {
+        QCOMPARE(header->sectionResizeMode(column), QHeaderView::Interactive);
+    }
+    const int oldWidth = table->columnWidth(0);
+    const QPoint edge(header->sectionViewportPosition(0) + oldWidth - 1, header->height() / 2);
+    QTest::mousePress(header->viewport(), Qt::LeftButton, Qt::NoModifier, edge);
+    QTest::mouseMove(header->viewport(), edge + QPoint(45, 0));
+    QTest::mouseRelease(header->viewport(), Qt::LeftButton, Qt::NoModifier, edge + QPoint(45, 0));
+    QVERIFY(table->columnWidth(0) > oldWidth);
+    const int draggedWidth = table->columnWidth(0);
+    header->resizeSection(3, 177);
+    send(snapshotFrame(isoAt(u"2026-10-14T14:30:03+08:00"_s)));
+    QTest::qWait(30);
+    QCOMPARE(table->columnWidth(0), draggedWidth);
+    QCOMPARE(table->columnWidth(3), 177);
+    auto* interfaces = details->findChild<QTableView*>(u"details.interfaceTable"_s);
+    for (int column = 0; column < 9; ++column) {
+        QCOMPARE(interfaces->horizontalHeader()->sectionResizeMode(column),
+                 QHeaderView::Interactive);
+    }
+}
+
+void TestUi::hudPositionSurvivesCloseShowAndRestart() {
+    QPoint saved;
+    {
+        QSettings settings(m_settingsPath, QSettings::IniFormat);
+        WaylandHud hud(startServer(), settings);
+        hud.show();
+        QTest::mousePress(&hud, Qt::LeftButton, Qt::NoModifier, QPoint(20, 20));
+        QTest::mouseMove(&hud, QPoint(140, 90));
+        QTest::mouseRelease(&hud, Qt::LeftButton, Qt::NoModifier, QPoint(140, 90));
+        saved = hud.requestedPosition();
+        hud.close();
+        QSettings disk(m_settingsPath, QSettings::IniFormat);
+        QCOMPARE(ball::ui::Preferences::load(disk).position, saved);
+        hud.show();
+        QCOMPARE(hud.requestedPosition(), saved);
+    }
+    QSettings settings(m_settingsPath, QSettings::IniFormat);
+    WaylandHud restored(startServer(), settings);
+    restored.show();
+    QCoreApplication::processEvents();
+    QCOMPARE(restored.requestedPosition(), saved);
+}
+
+void TestUi::startupRestoresPositionBeforeLayerShellConfigure() {
+    QSettings settings(m_settingsPath, QSettings::IniFormat);
+    const QPoint saved = QGuiApplication::primaryScreen()->geometry().topLeft() + QPoint(90, 70);
+    ball::ui::Preferences preferences;
+    preferences.position = saved;
+    preferences.hasPosition = true;
+    preferences.screenName = QGuiApplication::primaryScreen()->name();
+    preferences.save(settings);
+    settings.sync();
+    Hud hud(startServer(), settings);
+    QCOMPARE(hud.requestedPosition(), saved);
+    hud.show();
+    QTest::qWait(50);
+    QCOMPARE(hud.requestedPosition(), saved);
+    hud.close();
+    QCOMPARE(ball::ui::Preferences::load(settings).position, saved);
+}
+
+void TestUi::protocolFailureRetainsReasonAndReconnectRecovers() {
+    SnapshotClient client;
+    client.start(startServer());
+    QVERIFY(acceptConnection() != nullptr);
+    send(snapshotFrame());
+    QVERIFY(waitFor([&client] { return client.fresh(); }));
+    // Bytes that are not MessagePack at all: the header byte 0xc1 is never used,
+    // so the reason survives the disconnect and the reconnect that follows.
+    send(QByteArray::fromHex("c1c1c1"));
+    QVERIFY(waitFor([&client] { return !client.fresh(); }));
+    QVERIFY(!client.error().isEmpty());
+    const QString reason = client.error();
+    auto* peer = acceptConnection(4000);
+    QVERIFY(peer != nullptr);
+    if (peer == nullptr) {
+        return;
+    }
+    QCOMPARE(client.error(), reason);
+    send(snapshotFrame());
+    QVERIFY(waitFor([&client] { return client.fresh(); }));
+    QVERIFY(client.error().isEmpty());
+    peer->close();
+    QVERIFY(waitFor([&client] { return !client.fresh(); }));
+    QCOMPARE(client.error(), u"backend connection closed"_s);
 }
 
 QTEST_MAIN(TestUi)

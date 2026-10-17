@@ -1,8 +1,8 @@
 // ball: a non-modal, normally managed window for live traffic details.
 #pragma once
 
+#include "snapshot.h"
 #include "ui/appearance.h"
-#include "ui/snapshot.h"
 
 #include <QWidget>
 

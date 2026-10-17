@@ -10,9 +10,6 @@
 #include <QFile>
 #include <QFileDevice>
 #include <QFileInfo>
-#include <QJsonArray>
-#include <QJsonDocument>
-#include <QJsonValue>
 #include <QLocalServer>
 #include <QLocalSocket>
 #include <QLockFile>
@@ -41,42 +38,6 @@ QString asciiBounded(const QString& text, int maxLength) {
                                                                              : QLatin1Char(' '));
     }
     return out.trimmed();
-}
-
-// QDateTime::toString(Qt::ISODate) omits the offset for a LocalTime date/time,
-// but the protocol requires RFC 3339 with a named offset. Converting to an
-// offset-from-UTC date/time makes Qt emit it.
-QString isoWithOffset(const QDateTime& dateTime) {
-    if (!dateTime.isValid()) {
-        return {};
-    }
-    return dateTime.toOffsetFromUtc(dateTime.offsetFromUtc()).toString(Qt::ISODateWithMs);
-}
-
-QString interfaceKindName(InterfaceKind kind) {
-    switch (kind) {
-    case InterfaceKind::Virtual:
-        return QStringLiteral("virtual");
-    case InterfaceKind::Loopback:
-        return QStringLiteral("loopback");
-    case InterfaceKind::Physical:
-        break;
-    }
-    return QStringLiteral("physical");
-}
-
-double finiteRate(double value) { return std::isfinite(value) && value >= 0.0 ? value : 0.0; }
-
-QJsonObject bytesObject(quint64 rxBytes, quint64 txBytes) {
-    // 64-bit counters travel as decimal strings so no JSON double can round
-    // them; the protocol requires exactly that.
-    return QJsonObject{{QStringLiteral("rx_bytes"), QString::number(rxBytes)},
-                       {QStringLiteral("tx_bytes"), QString::number(txBytes)}};
-}
-
-QJsonObject rateObject(double rxBytesPerSecond, double txBytesPerSecond) {
-    return QJsonObject{{QStringLiteral("rx_bps"), finiteRate(rxBytesPerSecond)},
-                       {QStringLiteral("tx_bps"), finiteRate(txBytesPerSecond)}};
 }
 
 // QString/QFileInfo have no portable "is a Unix socket" predicate, so stat()
@@ -121,6 +82,12 @@ bool Service::start(const ServiceOptions& options) {
     };
     if (m_options.socketPath.isEmpty()) {
         return fail(QStringLiteral("no socket path configured"));
+    }
+    if (!m_options.collectorSocketPath.isEmpty() && !m_options.collectorBinary.isEmpty()) {
+        // Spawning a second collector next to the external one would fight over
+        // /tmp/socktrail.lock and the capture interfaces.
+        return fail(QStringLiteral("collector binary and an external collector socket cannot "
+                                   "be combined"));
     }
 
     // The lock is taken before the socket is touched: it is what makes a
@@ -275,7 +242,9 @@ void Service::onNewConnection() {
                 [this, socket](QLocalSocket::LocalSocketError) { removeClient(socket); });
         m_clients.append(socket);
         // A connection is answered immediately with the current full snapshot.
-        if (!sendSnapshot(socket, snapshotLine())) {
+        bool ok = false;
+        const QByteArray frame = snapshotFrame(ok);
+        if (!ok || !sendSnapshot(socket, frame)) {
             removeClient(socket);
         }
     }
@@ -314,34 +283,38 @@ void Service::broadcastSnapshot() {
     if (m_clients.isEmpty()) {
         return;
     }
-    const QByteArray line = snapshotLine();
+    bool ok = false;
+    const QByteArray frame = snapshotFrame(ok);
+    if (!ok) {
+        // An unencodable snapshot is a daemon bug; serving the same state as a
+        // zero frame would be worse than skipping this tick.
+        return;
+    }
     const QList<QLocalSocket*> clients = m_clients;
     for (QLocalSocket* socket : clients) {
-        if (!sendSnapshot(socket, line)) {
+        if (!sendSnapshot(socket, frame)) {
             removeClient(socket);
         }
     }
 }
 
-bool Service::sendSnapshot(QLocalSocket* socket, const QByteArray& line) {
+QByteArray Service::snapshotFrame(bool& ok) const { return encodeSnapshot(snapshot(), ok); }
+
+bool Service::sendSnapshot(QLocalSocket* socket, const QByteArray& frame) {
     if (!m_clients.contains(socket) || socket->state() != QLocalSocket::ConnectedState) {
         return false;
     }
     // Bounded backlog: once a client is more than one snapshot behind, it is
     // disconnected instead of being allowed to grow the daemon's memory.
-    const qint64 limit = qMax(kMaxBacklogBytes, 2 * static_cast<qint64>(line.size()));
+    const qint64 limit = qMax(kMaxBacklogBytes, 2 * static_cast<qint64>(frame.size()));
     if (socket->bytesToWrite() > limit) {
         return false;
     }
-    if (socket->write(line) != line.size()) {
+    if (socket->write(frame) != frame.size()) {
         return false;
     }
     socket->flush();
     return true;
-}
-
-QByteArray Service::snapshotLine() const {
-    return QJsonDocument(snapshot()).toJson(QJsonDocument::Compact) + '\n';
 }
 
 void Service::removeClient(QLocalSocket* socket) {
@@ -352,55 +325,50 @@ void Service::removeClient(QLocalSocket* socket) {
     socket->deleteLater();
 }
 
-QJsonObject Service::snapshot() const {
-    QJsonObject root;
-    root.insert(QStringLiteral("version"), 1);
-    root.insert(QStringLiteral("kind"), QStringLiteral("snapshot"));
-    root.insert(QStringLiteral("started"), isoWithOffset(m_started));
-    root.insert(QStringLiteral("at"), isoWithOffset(QDateTime::currentDateTime()));
-    root.insert(QStringLiteral("interfaces_available"), m_interfacesAvailable);
-    root.insert(QStringLiteral("interface_error"), m_interfaceError);
+Snapshot Service::snapshot() const {
+    Snapshot snapshot;
+    snapshot.version = 1;
+    snapshot.started = m_started;
+    snapshot.at = QDateTime::currentDateTime();
+    snapshot.interfacesAvailable = m_interfacesAvailable;
+    snapshot.interfaceError = m_interfaceError;
 
     const bool collectorUp = collectorRunning();
     QStringList notes = m_socktrail->qualityNotes();
     if (!collectorUp) {
         notes.prepend(QStringLiteral("collector not running"));
     }
-    root.insert(QStringLiteral("process_status"),
-                QJsonObject{{QStringLiteral("available"), m_socktrail->available()},
-                            {QStringLiteral("stale"), !collectorUp || m_socktrail->stale()},
-                            {QStringLiteral("incomplete"), m_socktrail->incomplete()},
-                            {QStringLiteral("error"), processError()},
-                            {QStringLiteral("notes"), QJsonArray::fromStringList(notes)}});
+    snapshot.processStatus.available = m_socktrail->available();
+    snapshot.processStatus.stale = !collectorUp || m_socktrail->stale();
+    snapshot.processStatus.incomplete = m_socktrail->incomplete();
+    snapshot.processStatus.error = processError();
+    snapshot.processStatus.notes = notes;
 
-    QJsonArray interfaces;
     for (const InterfaceTraffic& row : m_traffic->rows()) {
-        interfaces.append(QJsonObject{
-            {QStringLiteral("index"), QJsonValue(qint64(row.index))},
-            {QStringLiteral("name"), row.name},
-            {QStringLiteral("kind"), interfaceKindName(row.kind)},
-            {QStringLiteral("up"), row.up},
-            {QStringLiteral("today"), bytesObject(row.today.rxBytes, row.today.txBytes)},
-            {QStringLiteral("session"), bytesObject(row.session.rxBytes, row.session.txBytes)},
-            {QStringLiteral("rate"),
-             rateObject(row.rate.rxBytesPerSecond, row.rate.txBytesPerSecond)}});
+        InterfaceSnapshot interface;
+        interface.index = row.index;
+        interface.name = row.name;
+        interface.kind = row.kind;
+        interface.up = row.up;
+        interface.today = ByteCounters{row.today.rxBytes, row.today.txBytes};
+        interface.session = ByteCounters{row.session.rxBytes, row.session.txBytes};
+        interface.rxBps = row.rate.rxBytesPerSecond;
+        interface.txBps = row.rate.txBytesPerSecond;
+        snapshot.interfaces.append(interface);
     }
-    root.insert(QStringLiteral("interfaces"), interfaces);
-
-    QJsonArray processes;
     for (const ProcessTraffic& row : m_socktrail->processes().rows()) {
-        processes.append(QJsonObject{
-            {QStringLiteral("pid"), row.pid},
-            {QStringLiteral("start_ns"), QString::number(row.startNs)},
-            {QStringLiteral("name"), row.name},
-            {QStringLiteral("present"), row.present},
-            {QStringLiteral("today"), bytesObject(row.today.rxBytes, row.today.txBytes)},
-            {QStringLiteral("session"), bytesObject(row.session.rxBytes, row.session.txBytes)},
-            {QStringLiteral("rate"),
-             rateObject(row.rate.rxBytesPerSecond, row.rate.txBytesPerSecond)}});
+        ProcessSnapshot process;
+        process.pid = row.pid;
+        process.startNs = row.startNs;
+        process.name = row.name;
+        process.present = row.present;
+        process.today = ByteCounters{row.today.rxBytes, row.today.txBytes};
+        process.session = ByteCounters{row.session.rxBytes, row.session.txBytes};
+        process.rxBps = row.rate.rxBytesPerSecond;
+        process.txBps = row.rate.txBytesPerSecond;
+        snapshot.processes.append(process);
     }
-    root.insert(QStringLiteral("processes"), processes);
-    return root;
+    return snapshot;
 }
 
 QString Service::error() const {
@@ -427,6 +395,12 @@ QString Service::processError() const {
 }
 
 bool Service::collectorRunning() const {
+    if (usesExternalCollector()) {
+        // No child to poll: the subscriber's own state is what says whether the
+        // external unit is serving, and a missing socket is exactly how it
+        // fails, so the reason comes from the stream rather than from here.
+        return true;
+    }
     // A pending restart means the collector is down right now, even if the
     // QProcess object for the next attempt already exists.
     return !m_restartTimer->isActive() && m_collector != nullptr &&
@@ -435,6 +409,14 @@ bool Service::collectorRunning() const {
 
 void Service::startCollector() {
     if (!m_running || m_collector != nullptr) {
+        return;
+    }
+    if (usesExternalCollector()) {
+        // Another unit owns the collector process: only subscribe. Its socket
+        // may not exist yet, and Socktrail retries until it appears.
+        m_collectorError.clear();
+        m_collectorStderr.clear();
+        m_socktrail->start(m_options.collectorSocketPath);
         return;
     }
     if (m_options.collectorBinary.isEmpty()) {
@@ -491,17 +473,22 @@ void Service::startCollector() {
     m_collector->start(
         m_options.collectorBinary,
         {QStringLiteral("--config"), QStringLiteral("none"), QStringLiteral("--output"),
-         QStringLiteral("ndjson"), QStringLiteral("--socket"), m_rawSocketPath,
+         QStringLiteral("msgpack"), QStringLiteral("--socket"), m_rawSocketPath,
          QStringLiteral("--socket-mode"), QStringLiteral("0600"), QStringLiteral("--refresh"),
          QStringLiteral("1s"), QStringLiteral("--openssl-probe=false"),
-         QStringLiteral("--socket-sniff=false")});
+         QStringLiteral("--socket-sniff=false"),
+         // Only the process totals are consumed here, so the collector skips
+         // every flow frame: no connection view exists in this UI, and the
+         // frames would otherwise be the bulk of the stream.
+         QStringLiteral("--socket-kinds"), QStringLiteral("stats")});
     // Subscribing before the socket exists is fine: Socktrail retries on its own
     // timer and connects as soon as the collector is listening.
     m_socktrail->start(m_rawSocketPath);
 }
 
 void Service::stopCollector() {
-    if (m_collector == nullptr) {
+    if (usesExternalCollector() || m_collector == nullptr) {
+        // An external collector is not ours to stop; the unit owns its life.
         return;
     }
     QProcess* collector = std::exchange(m_collector, nullptr);

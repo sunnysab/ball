@@ -7,6 +7,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 find_package(Qt6 REQUIRED COMPONENTS Widgets Network)
 find_package(LayerShellQt REQUIRED)
+find_package(msgpack-cxx REQUIRED)
 include(GNUInstallDirs)
 
 set(BALL_SOCKTRAIL_BINARY "" CACHE FILEPATH "External socktrail executable to install")
@@ -20,6 +21,16 @@ target_include_directories(ball_process PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_compile_options(ball_process PRIVATE -Wall -Wextra -Wpedantic)
 target_link_libraries(ball_process PUBLIC Qt6::Core)
 
+# The snapshot schema and its MessagePack codec are shared by the daemon's
+# encoder and the GUI's decoder, so they live in their own target.
+add_library(ball_protocol STATIC
+    src/messagepack.cpp
+    src/snapshot.cpp
+)
+target_include_directories(ball_protocol PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_compile_options(ball_protocol PRIVATE -Wall -Wextra -Wpedantic)
+target_link_libraries(ball_protocol PUBLIC Qt6::Core msgpack-cxx)
+
 add_library(ball_daemon STATIC
     src/daemon/interfaces.cpp
     src/daemon/traffic.cpp
@@ -29,10 +40,9 @@ add_library(ball_daemon STATIC
 )
 target_include_directories(ball_daemon PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_compile_options(ball_daemon PRIVATE -Wall -Wextra -Wpedantic)
-target_link_libraries(ball_daemon PUBLIC Qt6::Core Qt6::Network ball_process)
+target_link_libraries(ball_daemon PUBLIC Qt6::Core Qt6::Network ball_process ball_protocol)
 
 add_library(ball_ui STATIC
-    src/ui/snapshot.cpp
     src/ui/snapshot_client.cpp
     src/ui/format.cpp
     src/ui/traffic_model.cpp
@@ -45,7 +55,7 @@ add_library(ball_ui STATIC
 )
 target_include_directories(ball_ui PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_compile_options(ball_ui PRIVATE -Wall -Wextra -Wpedantic)
-target_link_libraries(ball_ui PUBLIC Qt6::Widgets Qt6::Network LayerShellQt::Interface ball_process)
+target_link_libraries(ball_ui PUBLIC Qt6::Widgets Qt6::Network LayerShellQt::Interface ball_process ball_protocol)
 
 add_executable(ball src/main.cpp)
 target_compile_definitions(ball PRIVATE
@@ -78,6 +88,13 @@ include(CTest)
 if(BUILD_TESTING)
     find_package(Qt6 REQUIRED COMPONENTS Test)
 
+    # The test suites drive real sockets, so their fixtures write the same
+    # frames a peer writes; tests/mp_frames.h is header-only.
+    add_library(ball_testkit INTERFACE)
+    target_include_directories(ball_testkit INTERFACE
+        ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(ball_testkit INTERFACE msgpack-cxx Qt6::Core)
+
     qt_add_executable(ball_traffic_test tests/traffic.cpp)
     target_link_libraries(ball_traffic_test PRIVATE Qt6::Test ball_daemon)
 
@@ -88,31 +105,33 @@ if(BUILD_TESTING)
     target_link_libraries(ball_processes_test PRIVATE Qt6::Test ball_daemon)
 
     qt_add_executable(ball_socktrail_test tests/socktrail.cpp)
-    target_link_libraries(ball_socktrail_test PRIVATE Qt6::Test ball_daemon)
+    target_link_libraries(ball_socktrail_test PRIVATE Qt6::Test ball_daemon ball_testkit)
 
     qt_add_executable(ball_service_test tests/service.cpp)
     target_link_libraries(ball_service_test PRIVATE Qt6::Test ball_daemon)
     # The fake collector is a separate process, exactly like the real external
     # socktrail binary; the test only needs its path.
     add_executable(ball_fake_collector tests/fake_collector.cpp)
-    target_link_libraries(ball_fake_collector PRIVATE Qt6::Core Qt6::Network)
+    # It writes the same frames a real collector does, so it reuses the test
+    # frame writer rather than hand-rolling MessagePack bytes.
+    target_link_libraries(ball_fake_collector PRIVATE Qt6::Core Qt6::Network ball_testkit)
     target_compile_options(ball_fake_collector PRIVATE -Wall -Wextra -Wpedantic)
     target_compile_definitions(ball_service_test PRIVATE
         BALL_FAKE_COLLECTOR_BINARY="$<TARGET_FILE:ball_fake_collector>")
     add_dependencies(ball_service_test ball_fake_collector)
 
     qt_add_executable(ball_ui_test tests/ui.cpp)
-    target_link_libraries(ball_ui_test PRIVATE Qt6::Test ball_ui)
+    target_link_libraries(ball_ui_test PRIVATE Qt6::Test ball_ui ball_testkit)
 
     qt_add_executable(ball_autostart_test tests/autostart.cpp)
     # GUI-free: the helper only touches files, so the test needs no display.
     target_link_libraries(ball_autostart_test PRIVATE Qt6::Test Qt6::Core ball_ui)
 
     qt_add_executable(ball_ui_preview tests/ui_preview.cpp)
-    target_link_libraries(ball_ui_preview PRIVATE ball_ui)
+    target_link_libraries(ball_ui_preview PRIVATE ball_ui ball_testkit)
 
     qt_add_executable(ball_cli_test tests/cli.cpp)
-    target_link_libraries(ball_cli_test PRIVATE Qt6::Test Qt6::Network)
+    target_link_libraries(ball_cli_test PRIVATE Qt6::Test Qt6::Network ball_protocol)
     target_compile_definitions(ball_cli_test PRIVATE
         BALL_EXECUTABLE="$<TARGET_FILE:ball>"
         BALL_FAKE_COLLECTOR_BINARY="$<TARGET_FILE:ball_fake_collector>")

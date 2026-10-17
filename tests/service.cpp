@@ -4,16 +4,15 @@
 // QLocalSocket client. No root, no network access.
 #include "daemon/service.h"
 
+#include "messagepack.h"
+#include "snapshot.h"
+
 #include <QByteArray>
 #include <QCoreApplication>
 #include <QDateTime>
 #include <QElapsedTimer>
 #include <QFile>
 #include <QFileInfo>
-#include <QJsonArray>
-#include <QJsonDocument>
-#include <QJsonObject>
-#include <QJsonValue>
 #include <QLocalServer>
 #include <QLocalSocket>
 #include <QProcess>
@@ -33,8 +32,12 @@
 #include <sys/un.h>
 #include <unistd.h>
 
+using ball::InterfaceSnapshot;
+using ball::ProcessSnapshot;
+using ball::ProcessStatus;
 using ball::Service;
 using ball::ServiceOptions;
+using ball::Snapshot;
 using namespace Qt::StringLiterals;
 
 #ifndef BALL_FAKE_COLLECTOR_BINARY
@@ -45,41 +48,67 @@ namespace {
 
 QString fakeCollectorBinary() { return QStringLiteral(BALL_FAKE_COLLECTOR_BINARY); }
 
-// The service lives in this same thread, so the event loop must run while
-// waiting; QTest::qWait does that, waitForReadyRead only pumps the client.
-bool waitForLine(QLocalSocket& socket, QByteArray& buffer, QByteArray& line, int timeoutMs) {
-    QElapsedTimer clock;
-    clock.start();
-    while (clock.elapsed() < timeoutMs) {
-        buffer += socket.readAll();
-        const qsizetype newline = buffer.indexOf('\n');
-        if (newline >= 0) {
-            line = buffer.left(newline);
-            buffer.remove(0, newline + 1);
-            return true;
-        }
-        QTest::qWait(10);
+// The interface names of one snapshot, for the "sampling still works" checks.
+QStringList interfaceNames(const Snapshot& snapshot) {
+    QStringList names;
+    for (const InterfaceSnapshot& row : snapshot.interfaces) {
+        names.append(row.name);
     }
-    return false;
+    return names;
 }
 
-// Counts complete lines received over `durationMs`, keeping the event loop
-// running so the daemon keeps sampling.
-int drainLines(QLocalSocket& socket, QByteArray& buffer, int durationMs) {
-    QElapsedTimer clock;
-    clock.start();
-    int lines = 0;
-    while (clock.elapsed() < durationMs) {
-        buffer += socket.readAll();
-        qsizetype newline = -1;
-        while ((newline = buffer.indexOf('\n')) >= 0) {
-            buffer.remove(0, newline + 1);
-            ++lines;
+// A client that reads whole MessagePack frames off the daemon socket. The
+// service lives in this same thread, so the event loop must run while waiting;
+// QTest::qWait does that, waitForReadyRead only pumps the client.
+class FrameReader {
+public:
+    explicit FrameReader(QLocalSocket& socket) : m_socket(socket) {}
+
+    // Reads until one complete frame is decoded, or `timeoutMs` elapses. The
+    // decoded frame is copied out, because the next read invalidates it.
+    bool waitForFrame(Snapshot& out, int timeoutMs) {
+        QElapsedTimer clock;
+        clock.start();
+        while (clock.elapsed() < timeoutMs) {
+            m_decoder.feed(m_socket.readAll());
+            ball::mp::Frame frame = m_decoder.next();
+            if (frame.valid()) {
+                const ball::SnapshotParseResult result = ball::decodeSnapshot(frame.value());
+                if (!result.snapshot.has_value()) {
+                    return false;
+                }
+                out = *result.snapshot;
+                return true;
+            }
+            QTest::qWait(10);
         }
-        QTest::qWait(20);
+        return false;
     }
-    return lines;
-}
+
+    // Counts complete frames received over `durationMs`, keeping the event loop
+    // running so the daemon keeps sampling.
+    int drain(int durationMs) {
+        QElapsedTimer clock;
+        clock.start();
+        int frames = 0;
+        while (clock.elapsed() < durationMs) {
+            m_decoder.feed(m_socket.readAll());
+            while (m_decoder.next().valid()) {
+                ++frames;
+            }
+            QTest::qWait(20);
+        }
+        return frames;
+    }
+
+    // Counts complete frames until the peer closes, reading from a raw
+    // descriptor. Returns false when it stayed connected.
+    static bool drainUntilClosed(int fd, int& frames, int timeoutMs);
+
+private:
+    QLocalSocket& m_socket;
+    ball::mp::Decoder m_decoder;
+};
 
 bool processAlive(qint64 pid) { return ::kill(static_cast<pid_t>(pid), 0) == 0 || errno == EPERM; }
 
@@ -116,8 +145,6 @@ bool createStaleSocket(const QString& path) {
     return true;
 }
 
-QJsonObject parseLine(const QByteArray& line) { return QJsonDocument::fromJson(line).object(); }
-
 // A raw client that never reads: unlike QLocalSocket it has no event-loop pump
 // draining the kernel buffer, so the daemon really sees a slow consumer.
 int connectRawClient(const QString& path) {
@@ -140,11 +167,13 @@ int connectRawClient(const QString& path) {
 }
 
 // Drains `fd` until the daemon closes it (read returns 0) or errors, counting
-// newline-terminated snapshots. Returns false when it stayed connected.
-bool drainUntilClosed(int fd, int& lines, int timeoutMs) {
+// the frames that were decoded on the way. Returns false when it stayed
+// connected.
+bool FrameReader::drainUntilClosed(int fd, int& frames, int timeoutMs) {
     QElapsedTimer clock;
     clock.start();
     QByteArray chunk(64LL * 1024, Qt::Uninitialized);
+    ball::mp::Decoder decoder;
     while (clock.elapsed() < timeoutMs) {
         pollfd descriptor{};
         descriptor.fd = fd;
@@ -163,17 +192,12 @@ bool drainUntilClosed(int fd, int& lines, int timeoutMs) {
         if (bytes < 0) {
             return errno == ECONNRESET || errno == EPIPE;
         }
-        for (ssize_t i = 0; i < bytes; ++i) {
-            if (chunk.at(i) == '\n') {
-                ++lines;
-            }
+        decoder.feed(chunk.first(bytes));
+        while (decoder.next().valid()) {
+            ++frames;
         }
     }
     return false;
-}
-
-QJsonArray interfaceArray(const QJsonObject& snapshot) {
-    return snapshot.value(u"interfaces"_s).toArray();
 }
 
 } // namespace
@@ -201,13 +225,13 @@ private Q_SLOTS:
 
 void TestService::snapshotBeforeStartIsWellFormed() {
     Service service;
-    const QJsonObject snapshot = service.snapshot();
-    QCOMPARE(snapshot.value(u"version"_s).toInt(), 1);
-    QCOMPARE(snapshot.value(u"kind"_s).toString(), u"snapshot"_s);
-    QVERIFY(snapshot.value(u"interfaces_available"_s).isBool());
-    QVERIFY(snapshot.value(u"interfaces"_s).isArray());
-    QVERIFY(snapshot.value(u"processes"_s).isArray());
-    QVERIFY(snapshot.value(u"process_status"_s).isObject());
+    const Snapshot snapshot = service.snapshot();
+    QCOMPARE(snapshot.version, 1);
+    QVERIFY(!snapshot.interfacesAvailable);
+    QVERIFY(snapshot.interfaces.isEmpty());
+    QVERIFY(snapshot.processes.isEmpty());
+    QVERIFY(!snapshot.processStatus.available);
+    QVERIFY(snapshot.processStatus.stale);
     QVERIFY(service.error().isEmpty());
 }
 
@@ -227,29 +251,28 @@ void TestService::initialAndPeriodicSnapshots() {
     QCOMPARE(static_cast<int>(static_cast<unsigned>(socketStat.st_mode) & 0777U), 0660);
 
     // Wait for the collector's first stats frame to reach the accumulator.
-    QTRY_VERIFY_WITH_TIMEOUT(service.snapshot().value(u"processes"_s).toArray().size() == 1, 10000);
-    QVERIFY(service.snapshot().value(u"interfaces_available"_s).toBool());
-    QVERIFY(!interfaceArray(service.snapshot()).isEmpty());
+    QTRY_VERIFY_WITH_TIMEOUT(service.snapshot().processes.size() == 1, 10000);
+    QVERIFY(service.snapshot().interfacesAvailable);
+    QVERIFY(!interfaceNames(service.snapshot()).isEmpty());
 
     QLocalSocket client;
     client.connectToServer(options.socketPath);
     QVERIFY(client.waitForConnected(2000));
 
-    QByteArray buffer;
-    QByteArray line;
-    QVERIFY2(waitForLine(client, buffer, line, 2000), "no initial snapshot");
-    const QJsonObject initial = parseLine(line);
-    QCOMPARE(initial.value(u"kind"_s).toString(), u"snapshot"_s);
-    QCOMPARE(initial.value(u"processes"_s).toArray().size(), 1);
-    // `at` and `started` carry a timezone offset / Z.
-    const QString at = initial.value(u"at"_s).toString();
-    const QString started = initial.value(u"started"_s).toString();
-    QVERIFY(at.contains(QLatin1Char('+')) || at.endsWith(QLatin1Char('Z')));
-    QVERIFY(started.contains(QLatin1Char('+')) || started.endsWith(QLatin1Char('Z')));
+    FrameReader reader(client);
+    Snapshot initial;
+    QVERIFY2(reader.waitForFrame(initial, 2000), "no initial snapshot");
+    QCOMPARE(initial.version, 1);
+    QCOMPARE(initial.processes.size(), 1);
+    // Both instants name a real moment, so they survive the wire.
+    QVERIFY(initial.at.isValid());
+    QVERIFY(initial.started.isValid());
 
     // The next snapshot follows within about one second, without reconnecting.
-    QVERIFY2(waitForLine(client, buffer, line, 3000), "no periodic snapshot");
-    QCOMPARE(parseLine(line).value(u"kind"_s).toString(), u"snapshot"_s);
+    Snapshot next;
+    QVERIFY2(reader.waitForFrame(next, 3000), "no periodic snapshot");
+    QCOMPARE(next.version, 1);
+    QVERIFY(next.at > initial.at);
 
     service.stop();
 }
@@ -267,31 +290,22 @@ void TestService::byteCountersKeepPrecision() {
     // The second stats frame produces the first nonzero delta.
     QTRY_VERIFY_WITH_TIMEOUT(
         [&] {
-            const QJsonArray rows = service.snapshot().value(u"processes"_s).toArray();
-            if (rows.size() != 1) {
-                return false;
-            }
-            const QJsonObject today = rows.first().toObject().value(u"today"_s).toObject();
-            return today.value(u"rx_bytes"_s).toString() != u"0"_s;
+            const Snapshot snapshot = service.snapshot();
+            return snapshot.processes.size() == 1 && snapshot.processes.first().today.rxBytes != 0;
         }(),
         10000);
 
-    const QJsonObject row = service.snapshot().value(u"processes"_s).toArray().first().toObject();
-    // start_ns is 2^53 + 1: only the exact decimal string can carry it.
-    QCOMPARE(row.value(u"start_ns"_s).toString(), u"9007199254740993"_s);
-    QCOMPARE(row.value(u"pid"_s).toInt(), 1);
-    QVERIFY(row.value(u"today"_s).toObject().value(u"rx_bytes"_s).isString());
-    QVERIFY(row.value(u"session"_s).toObject().value(u"tx_bytes"_s).isString());
-    const QJsonObject rate = row.value(u"rate"_s).toObject();
-    QVERIFY(rate.value(u"rx_bps"_s).isDouble());
-    QVERIFY(std::isfinite(rate.value(u"rx_bps"_s).toDouble()));
-    QVERIFY(rate.value(u"rx_bps"_s).toDouble() >= 0.0);
+    const ProcessSnapshot row = service.snapshot().processes.first();
+    // start_ns is 2^53 + 1: only an exact integer can carry it.
+    QCOMPARE(row.startNs, quint64(9007199254740993ULL));
+    QCOMPARE(row.pid, 1);
+    QVERIFY(std::isfinite(row.rxBps));
+    QVERIFY(row.rxBps >= 0.0);
 
-    // The interface counters are decimal strings too, and the index is an int.
-    const QJsonObject interface = interfaceArray(service.snapshot()).first().toObject();
-    QVERIFY(interface.value(u"today"_s).toObject().value(u"rx_bytes"_s).isString());
-    QVERIFY(interface.value(u"index"_s).isDouble());
-    QVERIFY(interface.value(u"index"_s).toInt() > 0);
+    // The interface counters keep every bit too, and the index is a positive int.
+    const InterfaceSnapshot interface = service.snapshot().interfaces.first();
+    QVERIFY(interface.index > 0);
+    QVERIFY(std::isfinite(interface.rxBps));
 
     service.stop();
 }
@@ -308,37 +322,30 @@ void TestService::collectorFailureStillServesInterfaces() {
 
     // The collector is gone but interface sampling keeps running. The failure
     // is delivered through the event loop, so spin until it is visible.
-    QTRY_VERIFY_WITH_TIMEOUT(service.snapshot().value(u"interfaces_available"_s).toBool(), 3000);
-    QVERIFY(!interfaceArray(service.snapshot()).isEmpty());
-    QTRY_VERIFY_WITH_TIMEOUT(service.snapshot()
-                                 .value(u"process_status"_s)
-                                 .toObject()
-                                 .value(u"notes"_s)
-                                 .toArray()
-                                 .contains(u"collector not running"_s),
-                             5000);
-    const QJsonObject status = service.snapshot().value(u"process_status"_s).toObject();
-    QVERIFY(!status.value(u"available"_s).toBool());
-    QVERIFY(status.value(u"stale"_s).toBool());
-    QVERIFY(status.value(u"incomplete"_s).toBool());
+    QTRY_VERIFY_WITH_TIMEOUT(service.snapshot().interfacesAvailable, 3000);
+    QVERIFY(!interfaceNames(service.snapshot()).isEmpty());
+    QTRY_VERIFY_WITH_TIMEOUT(
+        service.snapshot().processStatus.notes.contains(u"collector not running"_s), 5000);
+    const ProcessStatus status = service.snapshot().processStatus;
+    QVERIFY(!status.available);
+    QVERIFY(status.stale);
+    QVERIFY(status.incomplete);
     QVERIFY(!service.error().isEmpty()); // the failure stays visible
 
     // A client still gets a well-formed snapshot.
     QLocalSocket client;
     client.connectToServer(options.socketPath);
     QVERIFY(client.waitForConnected(2000));
-    QByteArray buffer;
-    QByteArray line;
-    QVERIFY(waitForLine(client, buffer, line, 2000));
-    const QJsonObject snapshot = parseLine(line);
-    QVERIFY(snapshot.value(u"interfaces_available"_s).toBool());
-    QVERIFY(snapshot.value(u"processes"_s).toArray().isEmpty());
+    FrameReader reader(client);
+    Snapshot snapshot;
+    QVERIFY(reader.waitForFrame(snapshot, 2000));
+    QVERIFY(snapshot.interfacesAvailable);
+    QVERIFY(snapshot.processes.isEmpty());
 
     service.stop();
     // No restart storm after stop.
     QTest::qWait(1500);
-    QVERIFY(
-        !service.snapshot().value(u"process_status"_s).toObject().value(u"available"_s).toBool());
+    QVERIFY(!service.snapshot().processStatus.available);
 }
 
 void TestService::collectorRestartsArePaced() {
@@ -386,9 +393,7 @@ void TestService::collectorRecoversWhenBinaryAppears() {
     QVERIFY(service.start(options));
     QTRY_VERIFY_WITH_TIMEOUT(!service.error().isEmpty(), 5000);
     QVERIFY(QFile::link(fakeCollectorBinary(), options.collectorBinary));
-    QTRY_VERIFY_WITH_TIMEOUT(
-        service.snapshot().value(u"process_status"_s).toObject().value(u"available"_s).toBool(),
-        10000);
+    QTRY_VERIFY_WITH_TIMEOUT(service.snapshot().processStatus.available, 10000);
     QVERIFY2(service.error().isEmpty(), qPrintable(service.error()));
     service.stop();
 }
@@ -401,23 +406,17 @@ void TestService::restartStartsNewMonitoringSession() {
     QVERIFY(service.start(options));
     QTRY_VERIFY_WITH_TIMEOUT(
         [&] {
-            const auto rows = service.snapshot().value(u"processes"_s).toArray();
-            return !rows.isEmpty() && rows.first()
-                                              .toObject()
-                                              .value(u"session"_s)
-                                              .toObject()
-                                              .value(u"rx_bytes"_s)
-                                              .toString() != u"0"_s;
+            const Snapshot snapshot = service.snapshot();
+            return !snapshot.processes.isEmpty() && snapshot.processes.first().session.rxBytes != 0;
         }(),
         10000);
-    const QString started = service.snapshot().value(u"started"_s).toString();
+    const QDateTime started = service.snapshot().started;
     service.stop();
     QVERIFY(service.start(options));
-    QVERIFY(service.snapshot().value(u"started"_s).toString() != started);
-    QVERIFY(service.snapshot().value(u"processes"_s).toArray().isEmpty());
-    for (const auto value : service.snapshot().value(u"interfaces"_s).toArray()) {
-        QCOMPARE(value.toObject().value(u"session"_s).toObject().value(u"rx_bytes"_s).toString(),
-                 u"0"_s);
+    QVERIFY(service.snapshot().started != started);
+    QVERIFY(service.snapshot().processes.isEmpty());
+    for (const InterfaceSnapshot& row : service.snapshot().interfaces) {
+        QCOMPARE(row.session.rxBytes, quint64(0));
     }
     service.stop();
 }
@@ -462,22 +461,22 @@ void TestService::slowClientIsDroppedWithoutBlockingSampling() {
     QLocalSocket active;
     active.connectToServer(options.socketPath);
     QVERIFY(active.waitForConnected(3000));
-    QByteArray buffer;
-    QByteArray line;
-    QVERIFY(waitForLine(active, buffer, line, 5000));
+    FrameReader reader(active);
+    Snapshot first;
+    QVERIFY(reader.waitForFrame(first, 5000));
 
     // The healthy client keeps receiving snapshots while the raw one is dropped
     // once its write backlog exceeds the bound.
-    const int lines = drainLines(active, buffer, 6000);
-    QVERIFY2(lines >= 2, qPrintable(u"healthy client got %1 snapshots"_s.arg(lines)));
+    const int frames = reader.drain(6000);
+    QVERIFY2(frames >= 2, qPrintable(u"healthy client got %1 snapshots"_s.arg(frames)));
     QVERIFY(active.state() == QLocalSocket::ConnectedState);
 
-    int slowLines = 0;
-    const bool closed = drainUntilClosed(slow, slowLines, 8000);
+    int slowFrames = 0;
+    const bool closed = FrameReader::drainUntilClosed(slow, slowFrames, 8000);
     ::close(slow);
     QVERIFY2(closed,
-             qPrintable(u"slow client got %1 snapshots without being dropped"_s.arg(slowLines)));
-    QVERIFY2(slowLines < 60, qPrintable(u"slow client buffered %1 snapshots"_s.arg(slowLines)));
+             qPrintable(u"slow client got %1 snapshots without being dropped"_s.arg(slowFrames)));
+    QVERIFY2(slowFrames < 60, qPrintable(u"slow client buffered %1 snapshots"_s.arg(slowFrames)));
 
     service.stop();
     qunsetenv("BALL_FAKE_PROCESS_COUNT");

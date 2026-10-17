@@ -1,10 +1,10 @@
 // ball: a network traffic HUD for KDE Wayland sessions.
-// Asynchronous subscriber for the socktrail Unix-socket NDJSON stream.
+// Asynchronous subscriber for the socktrail Unix-socket MessagePack stream.
 #pragma once
 
 #include "daemon/processes.h"
+#include "messagepack.h"
 
-#include <QByteArray>
 #include <QDateTime>
 #include <QElapsedTimer>
 #include <QList>
@@ -16,7 +16,7 @@
 
 namespace ball {
 
-// Result of decoding one complete NDJSON frame. A frame is fully parsed and
+// Result of decoding one complete MessagePack frame. A frame is fully parsed and
 // validated before any of it reaches the accumulator, so a rejected frame
 // leaves no partial state behind.
 enum class SocktrailFrameStatus : quint8 {
@@ -27,7 +27,7 @@ enum class SocktrailFrameStatus : quint8 {
     Unsupported,   // kind "hello" with a version this client cannot read
 };
 
-// One --output ndjson frame, kept out of the client so it can be tested alone.
+// One --output msgpack frame, kept out of the client so it can be tested alone.
 struct SocktrailFrame {
     SocktrailFrameStatus status = SocktrailFrameStatus::ProtocolError;
     QDateTime at;                   // stats: "at"
@@ -37,12 +37,13 @@ struct SocktrailFrame {
     QString error;                  // short ASCII reason for a rejected frame
 };
 
-// Parses one line of the stream. Callers must pass exactly one frame, without
-// its newline. Flow frames carry per-connection increments and are ignored
-// entirely: process totals may only come from the stats table.
-SocktrailFrame decodeSocktrailFrame(const QByteArray& line);
+// Parses one complete frame. `frame` is the decoded object and the caller keeps
+// the storage alive, because the validated fields are copied out before it goes
+// away. Flow frames carry per-connection increments and are ignored entirely:
+// process totals may only come from the stats table.
+SocktrailFrame decodeSocktrailFrame(const msgpack::object& frame);
 
-// Subscribes to a socktrail `--socket` NDJSON stream and keeps a Processes
+// Subscribes to a socktrail `--socket` MessagePack stream and keeps a Processes
 // accumulator fed from the periodic stats frames. Everything is asynchronous:
 // no call blocks the event loop. Lifetime is plain parent/child ownership.
 class Socktrail : public QObject {
@@ -83,8 +84,6 @@ public:
     // window starts when the socket connects, so a peer that only sends flow
     // frames still turns stale and reports a reason.
     static constexpr int kStatsTimeoutMs = 5000;
-    // Upper bound for one buffered frame, to bound memory on a broken peer.
-    static constexpr qint64 kMaxLineBytes = 16LL * 1024 * 1024;
 
 Q_SIGNALS:
     // Any change of data, availability, staleness or error.
@@ -97,9 +96,9 @@ private:
     void onDisconnected();
     void onSocketError();
     void onStatsTimeout();
-    // Returns false when the frame broke the connection and the rest of the
-    // read buffer must be discarded.
-    bool handleLine(const QByteArray& line);
+    // Returns false when the frame broke the connection and the read buffer
+    // must be discarded.
+    bool handleFrame(const msgpack::object& frame);
     // Applies one validated stats sample. Returns false when it was rejected.
     bool applyStats(const QList<ProcessCounter>& counters, const QDateTime& at, qint64 monotonicMs,
                     const QStringList& qualityNotes);
@@ -118,7 +117,7 @@ private:
     // so resetting would send it backwards in time.
     QElapsedTimer m_clock;
     QString m_path;
-    QByteArray m_buffer;
+    mp::Decoder m_decoder;
     QByteArray m_error;
     QStringList m_qualityNotes;
     QDateTime m_backendStarted;

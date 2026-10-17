@@ -1,11 +1,12 @@
 // ball: a network traffic HUD for KDE Wayland sessions.
 // Daemon-side service: samples interfaces, supervises the external collector
-// and serves the read-only NDJSON snapshot stream to local GUI clients.
+// and serves the read-only MessagePack snapshot stream to local GUI clients.
 #pragma once
+
+#include "snapshot.h"
 
 #include <QDateTime>
 #include <QElapsedTimer>
-#include <QJsonObject>
 #include <QList>
 #include <QObject>
 #include <QString>
@@ -25,16 +26,24 @@ class Interfaces;
 class Socktrail;
 class Traffic;
 
-// Where the daemon listens and which socktrail binary to supervise. The socket
+// Where the daemon listens and where its process data comes from. The socket
 // directory is created by the deployment layer (systemd), never here.
+//
+// Either `collectorBinary` names a socktrail to spawn and supervise, or
+// `collectorSocketPath` names one that another unit (socktrail.service) already
+// runs. Setting both is a configuration error and is refused.
 struct ServiceOptions {
     QString socketPath;
     QString collectorBinary;
+    // External collector socket: the daemon only subscribes and never spawns or
+    // kills a collector. Empty means "supervise `collectorBinary`".
+    QString collectorSocketPath;
 };
 
 // Owns the whole daemon side of the protocol: a 1 s interface sampler, one
-// supervised socktrail child plus its subscriber, and a QLocalServer that
-// broadcasts a full snapshot after every connection and once per second.
+// socktrail source (a supervised child, or an external socket it subscribes to)
+// and a QLocalServer that broadcasts a full snapshot after every connection and
+// once per second.
 class Service : public QObject {
     Q_OBJECT
 
@@ -51,7 +60,7 @@ public:
     void stop();
 
     // Current protocol snapshot; safe to call at any time, even before start().
-    QJsonObject snapshot() const;
+    Snapshot snapshot() const;
     // A socket-level failure from start() while empty; afterwards the current
     // collector/socktrail problem, so a running daemon can still report why
     // process data is missing. Empty when everything the service needs is in
@@ -68,13 +77,18 @@ private:
     void onTick();
     void pollInterfaces();
     void broadcastSnapshot();
-    QByteArray snapshotLine() const;
-    // Writes one snapshot line; false asks the caller to drop the socket (gone
-    // or too far behind).
-    bool sendSnapshot(QLocalSocket* socket, const QByteArray& line);
+    // Encodes the current snapshot once; `ok` is false when a value could not
+    // be represented, so the frame is never sent.
+    QByteArray snapshotFrame(bool& ok) const;
+    // Writes one already encoded frame; false asks the caller to drop the socket
+    // (gone or too far behind).
+    bool sendSnapshot(QLocalSocket* socket, const QByteArray& frame);
     void removeClient(QLocalSocket* socket);
     void startCollector();
     void stopCollector();
+    // True when the process data comes from `collectorSocketPath`, so no child
+    // is spawned and collectorRunning() reports the external unit instead.
+    bool usesExternalCollector() const { return !m_options.collectorSocketPath.isEmpty(); }
     void onCollectorFinished();
     void drainCollectorStderr();
     bool collectorRunning() const;

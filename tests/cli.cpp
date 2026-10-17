@@ -2,13 +2,14 @@
 // End-to-end tests for the real executable: argument handling, daemon shutdown
 // on signals and the promise that quitting the GUI never stops the backend.
 // No display, no Wayland session and no root are needed.
+#include "messagepack.h"
+#include "snapshot.h"
+
 #include <QByteArray>
 #include <QCoreApplication>
 #include <QElapsedTimer>
 #include <QFile>
 #include <QFileInfo>
-#include <QJsonDocument>
-#include <QJsonObject>
 #include <QLocalSocket>
 #include <QProcess>
 #include <QProcessEnvironment>
@@ -85,9 +86,9 @@ bool readPidFile(const QString& path, qint64& pid) {
     return ok && pid > 0;
 }
 
-// A daemon that is running and serving: waits for the socket then reads the
-// first complete snapshot line.
-bool firstSnapshot(const QString& socketPath, QString* line, int timeoutMs) {
+// A daemon that is running and serving: waits for the socket, then reads the
+// first complete snapshot frame and decodes it.
+bool firstSnapshot(const QString& socketPath, ball::Snapshot* snapshot, int timeoutMs) {
     QElapsedTimer clock;
     clock.start();
     while (clock.elapsed() < timeoutMs && !QFileInfo::exists(socketPath)) {
@@ -98,12 +99,16 @@ bool firstSnapshot(const QString& socketPath, QString* line, int timeoutMs) {
     if (!client.waitForConnected(2000)) {
         return false;
     }
-    QByteArray buffer;
+    ball::mp::Decoder decoder;
     while (clock.elapsed() < timeoutMs) {
-        buffer += client.readAll();
-        const qsizetype newline = buffer.indexOf('\n');
-        if (newline >= 0) {
-            *line = QString::fromUtf8(buffer.left(newline));
+        decoder.feed(client.readAll());
+        ball::mp::Frame frame = decoder.next();
+        if (frame.valid()) {
+            const ball::SnapshotParseResult result = ball::decodeSnapshot(frame.value());
+            if (!result.snapshot.has_value()) {
+                return false;
+            }
+            *snapshot = *result.snapshot;
             return true;
         }
         QTest::qWait(20);
@@ -123,12 +128,11 @@ bool startDaemon(QProcess& process, QTemporaryDir& dir, const QString& pidFile) 
     if (!process.waitForStarted(5000)) {
         return false;
     }
-    QString line;
-    if (!firstSnapshot(socketPath, &line, 15000)) {
+    ball::Snapshot snapshot;
+    if (!firstSnapshot(socketPath, &snapshot, 15000)) {
         return false;
     }
-    return QJsonDocument::fromJson(line.toUtf8()).object().value(u"kind"_s).toString() ==
-           u"snapshot"_s;
+    return snapshot.version == 1;
 }
 
 void stopDaemon(QProcess& process) {
@@ -154,6 +158,7 @@ private Q_SLOTS:
     void rejectsBadArguments();
     void rejectsMissingDaemonSocket();
     void rejectsSocktrailBinWithoutDaemon();
+    void rejectsCollectorSocketMisuse();
     void daemonServesFirstSnapshot();
     void daemonUsesDefaultCollectorPath();
     void daemonExitsCleanlyOnSigterm();
@@ -229,6 +234,29 @@ void TestCli::rejectsSocktrailBinWithoutDaemon() {
     QVERIFY(result.standardError.contains("--daemon"));
 }
 
+void TestCli::rejectsCollectorSocketMisuse() {
+    const QProcessEnvironment environment = headlessEnvironment();
+
+    // Subscribe-only mode is a daemon option.
+    RunResult result = runBall({u"--collector-socket"_s, u"/run/x.sock"_s}, environment);
+    QVERIFY(result.exitCode != 0);
+    QVERIFY(result.standardError.contains("--daemon"));
+
+    // A relative collector socket is refused, exactly like --socket.
+    result = runBall({u"--daemon"_s, u"--socket"_s, u"/tmp/ball-test.sock"_s,
+                      u"--collector-socket"_s, u"relative.sock"_s},
+                     environment);
+    QVERIFY(result.exitCode != 0);
+    QVERIFY(result.standardError.contains("absolute"));
+
+    // Spawning a collector and subscribing to another one cannot both be meant.
+    result = runBall({u"--daemon"_s, u"--socket"_s, u"/tmp/ball-test.sock"_s, u"--socktrail-bin"_s,
+                      u"/absolute/collector"_s, u"--collector-socket"_s, u"/run/x.sock"_s},
+                     environment);
+    QVERIFY(result.exitCode != 0);
+    QVERIFY(result.standardError.contains("mutually exclusive"));
+}
+
 void TestCli::daemonServesFirstSnapshot() {
     QTemporaryDir dir;
     QVERIFY(dir.isValid());
@@ -255,11 +283,10 @@ void TestCli::daemonUsesDefaultCollectorPath() {
     // this machine, but interface sampling must still serve snapshots.
     daemon.start(ballBinary(), {u"--daemon"_s, u"--socket"_s, socketPath});
     QVERIFY(daemon.waitForStarted(5000));
-    QString line;
-    QVERIFY2(firstSnapshot(socketPath, &line, 10000), "no snapshot from the default daemon");
-    const QJsonObject snapshot = QJsonDocument::fromJson(line.toUtf8()).object();
-    QCOMPARE(snapshot.value(u"version"_s).toInt(), 1);
-    QCOMPARE(snapshot.value(u"kind"_s).toString(), u"snapshot"_s);
+    ball::Snapshot snapshot;
+    QVERIFY2(firstSnapshot(socketPath, &snapshot, 10000), "no snapshot from the default daemon");
+    QCOMPARE(snapshot.version, 1);
+    QVERIFY(snapshot.at.isValid());
     stopDaemon(daemon);
 }
 
@@ -323,8 +350,8 @@ void TestCli::guiExitDoesNotStopDaemon() {
 
     QVERIFY(daemon.state() == QProcess::Running);
     QVERIFY(processAlive(collectorPid));
-    QString line;
-    QVERIFY2(firstSnapshot(socketPath, &line, 5000),
+    ball::Snapshot snapshot;
+    QVERIFY2(firstSnapshot(socketPath, &snapshot, 5000),
              "the daemon stopped serving after the GUI exited");
     QVERIFY(QFileInfo::exists(socketPath));
 

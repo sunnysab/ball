@@ -11,7 +11,9 @@ constexpr int kMaxErrorLength = 120;
 
 SnapshotClient::SnapshotClient(QObject* parent) : QObject(parent) {
     m_socket = new QLocalSocket(this);
-    m_socket->setReadBufferSize(kMaxLineBytes);
+    // One frame above the cap, so a peer that never finishes a frame cannot make
+    // the kernel buffer, the decoder or this process grow without bound.
+    m_socket->setReadBufferSize(mp::kMaxFrameBytes);
     m_reconnectTimer = new QTimer(this);
     m_reconnectTimer->setInterval(kReconnectIntervalMs);
     m_staleTimer = new QTimer(this);
@@ -31,7 +33,7 @@ void SnapshotClient::start(const QString& socketPath) {
     m_running = true;
     m_reconnectTimer->stop();
     m_socket->abort();
-    m_buffer.clear();
+    m_decoder.reset();
     m_stale = true;
     m_incomplete = true;
     if (m_path.isEmpty()) {
@@ -48,7 +50,7 @@ void SnapshotClient::stop() {
     m_reconnectTimer->stop();
     m_staleTimer->stop();
     m_socket->abort();
-    m_buffer.clear();
+    m_decoder.reset();
     m_stale = true;
     Q_EMIT updated();
 }
@@ -57,34 +59,33 @@ void SnapshotClient::connectSocket() {
     if (!m_running || m_path.isEmpty()) {
         return;
     }
+    if (m_socket->state() != QLocalSocket::UnconnectedState) {
+        return;
+    }
     m_reconnectTimer->stop();
     m_socket->connectToServer(QString::fromUtf8(m_path));
 }
 
 void SnapshotClient::onConnected() {
-    m_buffer.clear();
+    m_reconnectTimer->stop();
+    m_decoder.reset();
     m_staleTimer->start();
     Q_EMIT updated();
 }
 
 void SnapshotClient::onReadyRead() {
-    m_buffer += m_socket->readAll();
+    m_decoder.feed(m_socket->readAll());
+    if (m_decoder.failed()) {
+        dropConnection(QString::fromLatin1(m_decoder.error()));
+        return;
+    }
 
-    qsizetype newline = -1;
-    while ((newline = m_buffer.indexOf('\n')) >= 0) {
-        if (newline > kMaxLineBytes) {
-            dropConnection(QStringLiteral("frame too large"));
-            return;
+    while (true) {
+        mp::Frame frame = m_decoder.next();
+        if (!frame.valid()) {
+            break; // nothing complete left, or a transport-level failure
         }
-        QByteArray line = m_buffer.left(newline);
-        m_buffer.remove(0, newline + 1);
-        if (line.endsWith('\r')) {
-            line.chop(1);
-        }
-        if (line.trimmed().isEmpty()) {
-            continue; // NDJSON allows blank keep-alive lines
-        }
-        const SnapshotParseResult result = parseSnapshot(line);
+        const SnapshotParseResult result = decodeSnapshot(frame.value());
         if (!result.snapshot.has_value()) {
             // Rejecting the whole frame keeps the previous snapshot intact; the
             // connection is dropped so the reason is visible and a clean
@@ -99,16 +100,16 @@ void SnapshotClient::onReadyRead() {
         m_staleTimer->start();
         Q_EMIT updated();
     }
-
-    if (m_buffer.size() >= kMaxLineBytes) {
-        dropConnection(QStringLiteral("frame too large"));
+    if (m_decoder.failed()) {
+        dropConnection(QString::fromLatin1(m_decoder.error()));
     }
 }
 
 void SnapshotClient::onDisconnected() {
+    m_staleTimer->stop();
     m_stale = true;
     m_incomplete = true;
-    m_buffer.clear();
+    m_decoder.reset();
     if (m_error.isEmpty()) {
         m_error = QStringLiteral("disconnected");
     }
@@ -118,23 +119,27 @@ void SnapshotClient::onDisconnected() {
     Q_EMIT updated();
 }
 
-void SnapshotClient::onError() { dropConnection(m_socket->errorString()); }
+void SnapshotClient::onError() {
+    dropConnection(m_socket->error() == QLocalSocket::PeerClosedError
+                       ? QStringLiteral("backend connection closed")
+                       : m_socket->errorString());
+}
 
 void SnapshotClient::onSnapshotTimeout() {
     m_stale = true;
     m_incomplete = true;
     if (m_error.isEmpty()) {
-        m_error = QStringLiteral("no fresh snapshot");
+        m_error = QStringLiteral("no snapshot");
     }
     Q_EMIT updated();
 }
 
 void SnapshotClient::dropConnection(const QString& reason) {
     m_error = reason.left(kMaxErrorLength);
-    m_buffer.clear();
+    m_staleTimer->stop();
+    m_socket->abort();
     m_stale = true;
     m_incomplete = true;
-    m_socket->abort();
     if (m_running) {
         startReconnect();
     }

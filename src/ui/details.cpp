@@ -7,6 +7,7 @@
 
 #include <QAbstractTableModel>
 #include <QCheckBox>
+#include <QFontMetrics>
 #include <QFrame>
 #include <QHBoxLayout>
 #include <QHeaderView>
@@ -183,19 +184,6 @@ Details::Details() : QWidget(nullptr, Qt::Window) {
     title->setFont(titleFont);
     heading->addWidget(title);
     heading->addStretch();
-    auto* onTop = new QToolButton(this);
-    onTop->setObjectName(QStringLiteral("details.onTop"));
-    onTop->setText(QStringLiteral("置顶"));
-    onTop->setCheckable(true);
-    onTop->setToolTip(QStringLiteral("使详情窗口保持在其他普通窗口之上"));
-    connect(onTop, &QToolButton::toggled, this, [this](bool checked) {
-        const bool visible = isVisible();
-        setWindowFlag(Qt::WindowStaysOnTopHint, checked);
-        if (visible) {
-            show();
-        }
-    });
-    heading->addWidget(onTop);
     layout->addLayout(heading);
 
     m_selectionLabel = new QLabel(this);
@@ -304,9 +292,17 @@ Details::Details() : QWidget(nullptr, Qt::Window) {
         table->setAlternatingRowColors(true);
         table->verticalHeader()->hide();
         table->verticalHeader()->setDefaultSectionSize(36);
-        table->horizontalHeader()->setSectionResizeMode(QHeaderView::ResizeToContents);
-        table->horizontalHeader()->setMinimumSectionSize(80);
-        table->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Stretch);
+        auto* header = table->horizontalHeader();
+        header->setSectionResizeMode(QHeaderView::Interactive);
+        header->setMinimumSectionSize(40);
+        table->setColumnWidth(0, 220);
+        table->setColumnWidth(1, 80);
+        table->setColumnWidth(2, 80);
+        const int metricWidth =
+            QFontMetrics(numericFont()).horizontalAdvance(QStringLiteral("1023.99 MiB/s")) + 24;
+        for (int column = 3; column < 9; ++column) {
+            table->setColumnWidth(column, metricWidth);
+        }
         table->sortByColumn(3, Qt::DescendingOrder);
     }
     connect(m_search, &QLineEdit::textChanged, this, &Details::filterTables);

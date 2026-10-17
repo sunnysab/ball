@@ -2,7 +2,8 @@
 // Asynchronous, read-only subscriber to the local snapshot socket.
 #pragma once
 
-#include "ui/snapshot.h"
+#include "messagepack.h"
+#include "snapshot.h"
 
 #include <QByteArray>
 #include <QElapsedTimer>
@@ -33,7 +34,7 @@ public:
     // snapshot is not enough.
     bool fresh() const { return m_snapshot.has_value() && !m_stale; }
     // True after a disconnect, a rejected frame or a timeout made the shown
-    // data untrustworthy. Sticky for the rest of the monitoring session.
+    // data untrustworthy. A valid replacement snapshot clears this flag.
     bool incomplete() const { return m_incomplete; }
     // Empty while healthy, otherwise a short ASCII reason for the UI.
     QString error() const { return m_error; }
@@ -41,8 +42,6 @@ public:
     // A snapshot older than this is stale; the UI must not show its rates as
     // live zeros.
     static constexpr int kSnapshotTimeoutMs = 5000;
-    // Upper bound for one buffered frame, to bound memory on a broken peer.
-    static constexpr qint64 kMaxLineBytes = 16LL * 1024 * 1024;
 
 Q_SIGNALS:
     // Any change of snapshot, freshness, completeness or error.
@@ -61,13 +60,13 @@ private:
     QLocalSocket* m_socket = nullptr;
     QTimer* m_reconnectTimer = nullptr;
     QTimer* m_staleTimer = nullptr;
-    QByteArray m_buffer;
+    mp::Decoder m_decoder;
     QByteArray m_path;
     QString m_error;
     std::optional<Snapshot> m_snapshot;
     bool m_running = false;
     bool m_stale = true;
-    // Sticky: once the shown history has a gap it cannot be repaired in-process.
+    // The current snapshot is untrusted until a valid replacement arrives.
     bool m_incomplete = true;
 };
 

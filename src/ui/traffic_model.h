@@ -2,7 +2,7 @@
 // Aggregation of a snapshot into the values the HUD displays.
 #pragma once
 
-#include "ui/snapshot.h"
+#include "snapshot.h"
 
 #include <QList>
 #include <QString>
