@@ -72,6 +72,15 @@ SocktrailFrame parseStats(const msgpack::object& stats) {
         return reject("bad at");
     }
 
+    const msgpack::object* const ipPackets = mp::member(stats, QLatin1StringView("ip_packets"));
+    const msgpack::object* const ipBytes = mp::member(stats, QLatin1StringView("ip_bytes"));
+    if (ipPackets != nullptr && !mp::readCount(*ipPackets, frame.ipPackets)) {
+        return reject("bad ip_packets");
+    }
+    if (ipBytes != nullptr && !mp::readCount(*ipBytes, frame.ipBytes)) {
+        return reject("bad ip_bytes");
+    }
+
     const msgpack::object* processes = nullptr;
     quint32 processCount = 0;
     const msgpack::object* const processValue = mp::member(stats, QLatin1StringView("process_io"));
@@ -274,8 +283,7 @@ void Socktrail::start(const QString& path) {
     m_path = path;
     m_running = true;
     m_decoder.reset();
-    m_pendingCounters.clear();
-    m_pendingQualityNotes.clear();
+    m_pendingStats = {};
     m_hasPendingStats = false;
     // Only the accumulator keeps its history; the observable state starts over
     // as unavailable and incomplete until a hello and a stats frame arrive.
@@ -284,6 +292,8 @@ void Socktrail::start(const QString& path) {
     }
     m_helloReceived = false;
     m_qualityNotes.clear();
+    m_ipPackets = 0;
+    m_ipBytes = 0;
     m_error.clear();
     m_available = false;
     m_incomplete = true;
@@ -304,8 +314,7 @@ void Socktrail::stop() {
     m_staleTimer->stop();
     m_flushTimer->stop();
     m_decoder.reset();
-    m_pendingCounters.clear();
-    m_pendingQualityNotes.clear();
+    m_pendingStats = {};
     m_hasPendingStats = false;
     if (m_socket->state() != QLocalSocket::UnconnectedState) {
         m_socket->abort();
@@ -384,8 +393,7 @@ bool Socktrail::handleFrame(const msgpack::object& frame) {
             m_restartPending = true;
             m_gapSeen = true;
             m_hasPendingStats = false;
-            m_pendingCounters.clear();
-            m_pendingQualityNotes.clear();
+            m_pendingStats = {};
             m_flushTimer->stop();
         }
         m_backendStarted = decoded.backendStarted;
@@ -408,31 +416,29 @@ bool Socktrail::handleFrame(const msgpack::object& frame) {
         // monotonic clock, and Processes would skip the earlier one (elapsed 0)
         // and lose its bytes. Keep the newest sample and apply it once a real
         // interval exists instead of inventing a timestamp.
-        m_pendingCounters = decoded.counters;
-        m_pendingAt = decoded.at;
-        m_pendingQualityNotes = decoded.qualityNotes;
+        m_pendingStats = decoded;
         m_hasPendingStats = true;
         m_flushTimer->start();
         return true;
     }
     m_hasPendingStats = false;
-    m_pendingCounters.clear();
-    m_pendingQualityNotes.clear();
+    m_pendingStats = {};
     m_flushTimer->stop();
-    return applyStats(decoded.counters, decoded.at, monotonicMs, decoded.qualityNotes);
+    return applyStats(decoded, monotonicMs);
 }
 
-bool Socktrail::applyStats(const QList<ProcessCounter>& counters, const QDateTime& at,
-                           qint64 monotonicMs, const QStringList& qualityNotes) {
+bool Socktrail::applyStats(const SocktrailFrame& stats, qint64 monotonicMs) {
     // Processes keeps its own monotonic history, so this call must never see a
     // timestamp older than a previous one.
-    if (!m_processes.update(counters, at, monotonicMs, m_restartPending)) {
+    if (!m_processes.update(stats.counters, stats.at, monotonicMs, m_restartPending)) {
         dropConnection(QStringLiteral("rejected clock sample"));
         return false;
     }
     m_restartPending = false;
     m_lastAppliedMonoMs = monotonicMs;
-    m_qualityNotes = qualityNotes;
+    m_qualityNotes = stats.qualityNotes;
+    m_ipPackets = stats.ipPackets;
+    m_ipBytes = stats.ipBytes;
 
     // Stats arrives: the data is live again and the freshness timer restarts.
     // No flow frame ever touches this timer.
@@ -444,7 +450,7 @@ bool Socktrail::applyStats(const QList<ProcessCounter>& counters, const QDateTim
     // table, so it cannot claim complete observation while the notes persist.
     // The loss is already history, so the marker is sticky for the rest of the
     // subscription.
-    if (!qualityNotes.isEmpty()) {
+    if (!stats.qualityNotes.isEmpty()) {
         m_gapSeen = true;
     }
     m_incomplete = m_gapSeen;
@@ -463,14 +469,9 @@ void Socktrail::flushPendingStats() {
         m_flushTimer->start();
         return;
     }
-    QList<ProcessCounter> counters;
-    QStringList qualityNotes;
-    QDateTime at;
-    std::swap(counters, m_pendingCounters);
-    std::swap(qualityNotes, m_pendingQualityNotes);
-    std::swap(at, m_pendingAt);
+    const SocktrailFrame stats = std::exchange(m_pendingStats, {});
     m_hasPendingStats = false;
-    applyStats(counters, at, monotonicMs, qualityNotes);
+    applyStats(stats, monotonicMs);
 }
 
 void Socktrail::onStatsTimeout() {
@@ -495,8 +496,7 @@ void Socktrail::onDisconnected() {
     m_gapSeen = m_gapSeen || m_lastAppliedMonoMs >= 0;
     m_helloReceived = false;
     m_decoder.reset();
-    m_pendingCounters.clear();
-    m_pendingQualityNotes.clear();
+    m_pendingStats = {};
     m_hasPendingStats = false;
     if (m_error.isEmpty()) {
         m_error = QByteArrayLiteral("disconnected");
@@ -518,8 +518,7 @@ void Socktrail::dropConnection(const QString& reason) {
     m_staleTimer->stop();
     m_flushTimer->stop();
     m_decoder.reset();
-    m_pendingCounters.clear();
-    m_pendingQualityNotes.clear();
+    m_pendingStats = {};
     m_hasPendingStats = false;
     m_available = false;
     m_incomplete = true;

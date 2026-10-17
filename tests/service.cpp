@@ -46,6 +46,15 @@ using namespace Qt::StringLiterals;
 
 namespace {
 
+// The collector-run IP totals the fake collector fixture reports. The values are
+// mirrored from tests/fake_collector.cpp rather than included from
+// tests/mp_frames.h, because this suite does not link the ball_testkit target
+// that provides that header. They have no relation to any socket I/O on this
+// machine, and 2^53 + 1 is not exactly representable as a double, so a frame
+// that rounded the byte count fails instead of coincidentally matching.
+constexpr quint64 kFakeIpPackets = 2'450'000;
+constexpr quint64 kFakeIpBytes = 9'007'199'254'740'993ULL;
+
 QString fakeCollectorBinary() { return QStringLiteral(BALL_FAKE_COLLECTOR_BINARY); }
 
 // The interface names of one snapshot, for the "sampling still works" checks.
@@ -232,6 +241,10 @@ void TestService::snapshotBeforeStartIsWellFormed() {
     QVERIFY(snapshot.processes.isEmpty());
     QVERIFY(!snapshot.processStatus.available);
     QVERIFY(snapshot.processStatus.stale);
+    // Nothing has been collected yet, so the collector-run IP totals are zero
+    // rather than guessed from the interface counters.
+    QCOMPARE(snapshot.ipPackets, quint64(0));
+    QCOMPARE(snapshot.ipBytes, quint64(0));
     QVERIFY(service.error().isEmpty());
 }
 
@@ -267,6 +280,11 @@ void TestService::initialAndPeriodicSnapshots() {
     // Both instants name a real moment, so they survive the wire.
     QVERIFY(initial.at.isValid());
     QVERIFY(initial.started.isValid());
+    // The collector-run IP totals reach the GUI frame unchanged and are not
+    // derived from the process table: the fixture writes values of that order
+    // only for this calibre.
+    QCOMPARE(initial.ipPackets, kFakeIpPackets);
+    QCOMPARE(initial.ipBytes, kFakeIpBytes);
 
     // The next snapshot follows within about one second, without reconnecting.
     Snapshot next;
@@ -301,6 +319,11 @@ void TestService::byteCountersKeepPrecision() {
     QCOMPARE(row.pid, 1);
     QVERIFY(std::isfinite(row.rxBps));
     QVERIFY(row.rxBps >= 0.0);
+
+    // The collector-run IP totals keep every bit too, and are unrelated to the
+    // process counters above.
+    QCOMPARE(service.snapshot().ipPackets, kFakeIpPackets);
+    QCOMPARE(service.snapshot().ipBytes, kFakeIpBytes);
 
     // The interface counters keep every bit too, and the index is a positive int.
     const InterfaceSnapshot interface = service.snapshot().interfaces.first();
@@ -418,6 +441,12 @@ void TestService::restartStartsNewMonitoringSession() {
     for (const InterfaceSnapshot& row : service.snapshot().interfaces) {
         QCOMPARE(row.session.rxBytes, quint64(0));
     }
+    // The collector-run IP totals are the new collector's own numbers, not the
+    // previous run's with a new sample added: the fixture reports the same value
+    // every frame, so an accumulation bug would show as a multiple.
+    QTRY_VERIFY_WITH_TIMEOUT(service.snapshot().processes.size() == 1, 10000);
+    QCOMPARE(service.snapshot().ipPackets, kFakeIpPackets);
+    QCOMPARE(service.snapshot().ipBytes, kFakeIpBytes);
     service.stop();
 }
 

@@ -28,6 +28,8 @@
   "at": "2026-10-14T14:30:02+08:00",
   "interfaces_available": true,
   "interface_error": "",
+  "ip_packets": 2450000,
+  "ip_bytes": 3892314112,
   "process_status": {
     "available": true,
     "stale": false,
@@ -63,16 +65,26 @@
 - `started` 是本次后台监测起点，后台重启后改变，GUI 重启不改变。
 - `at` 是生成快照的时刻。两者都是 MessagePack timestamp 扩展（ext type `-1`），
   按规范表示一个精确时刻；解码后转成本地时间显示。字符串时间不是合法取值。
+- `ip_packets` / `ip_bytes` 是**采集器本次运行**观测到的 IP 报文个数与字节总数，
+  与进程 socket I/O、网卡计数是三种互不相等的口径，任何两个都不得相加。两者是可选
+  字段：缺失时解码端按 0 处理（后台尚未收到 `stats`、或采集器不提供该计数），但字段
+  存在而取值非法时整帧被拒绝，不会退化成 0。合法取值与非负整数计数的规则相同
+  （见下面关于整数与浮点的条目）。
 - `rate` 的 `bps` 指 **bytes per second**，不是 bits per second；为有限、非负数字。
 - 所有字节计数及 `start_ns` 使用整数。MessagePack 的整数本身就保证 64 位精度，
   所以不需要字符串编码；`start_ns` 为 0 时省略该字段，解码端按 0 处理。
+  浮点形式只在能被精确表示时接受（非负、无小数部分、不超过 2^53），否则拒绝整帧，
+  以免计数被静默取整。
 - PID 与网卡索引为正整数且不超过 `INT_MAX`。
 - `kind` 只取 `physical`、`virtual`、`loopback`。网卡和进程的数组顺序不是身份；
   同一快照内网卡索引、`(pid, start_ns)` 都不得重复。
 - `interface_error` 与 `process_status` 的各字段、`notes` 数组必须存在，缺失即坏帧；
   所有字符串不得包含控制字符（口碑的解析器会拒绝，避免把终端转义带进界面）。
 - `today` 是本地日期内已观测累计；`session` 是本次监测已观测累计。首次监测前视为零，
-  不从系统已有计数补算历史。
+  不从系统已有计数补算历史。后端重启时两者都清零。
+- `ip_packets` / `ip_bytes` 与 `today` / `session` 的分段规则不同：它们是采集器进程
+  自己的 64 位累计，**采集器重启后从零重新开始**。因此它们与界面上的网卡、进程累计
+  没有共同的起点，不能相互校验或相减。
 - 缺席进程及已移除接口可以保留累计行，`present` / `up` 为 false、速率为零。
 - 未知字段必须被忽略：新增可选字段不改变现有消费方。
 
@@ -80,6 +92,10 @@
 
 - 流量条只合计用户选定网卡。首次使用默认选择当前启用的物理网卡，不自动把 VPN、回环和虚拟接口加入。
 - 进程统计是应用 socket I/O，网卡统计是内核接口计数，不要求两者相等，不互相相加。
+  详情窗口另有一行单独的「IP 报文字节 / 报文数」：它是采集点的 IP 口径，工具提示里
+  说明三者互不相等、不互相相加，且该行不随所选网卡变化。
+- 只有 `process_status.available=true`、`!stale` 且快照新鲜时该行才显示数值；否则显示
+  占位符 `—`（也包括还没有任何快照时）。已经收到的旧数值不得当作当前值展示。
 - `interfaces_available=false` 或 GUI 没有新鲜快照时，不能把过期速率显示成真实的零；应显示不可用状态。
 - 进程页是否实时可用须同时检查 `available` 和 `!stale`；不完整标记及原因可见。
 - 快照只在 GUI 内保留最新一份，流量历史不落盘；显示位置、透明度及网卡选择可保存为偏好设置。
@@ -89,9 +105,11 @@
 后台以 `--output msgpack --socket <路径>` 启动 socktrail，订阅同一个编码，但帧结构不同：
 每帧是一个带 `kind` 的信封，`kind` 取 `hello`、`flow` 或 `stats`，负载在同名 key 下。
 后台只使用 `hello`（`version=1`、`started` 时间戳）与 `stats`（`at` 时间戳、
-`process_io` 全量进程表、`probes.pid` 与 `io_unindexed` / `expired_pid_io` /
-`expired_pid_count` 质量计数）；`flow` 帧按协议接受但完全忽略，因为进程累计只能来自
-`stats` 表。后台只关心进程流量，所以采集器以 `--socket-kinds stats` 启动（spawn 模式
+`process_io` 全量进程表、`ip_packets` / `ip_bytes` 采集器运行累计、`probes.pid` 与
+`io_unindexed` / `expired_pid_io` / `expired_pid_count` 质量计数）；`flow` 帧按协议接受
+但完全忽略，因为进程累计只能来自 `stats` 表。`ip_packets` / `ip_bytes` 的可选规则与
+拒绝策略同 `process_io`：缺失为 0，存在但非法则拒绝整帧并断开订阅。
+后台只关心进程流量，所以采集器以 `--socket-kinds stats` 启动（spawn 模式
 由后台传参；外部采集器模式需在采集器侧自行配置）：`hello` 与 `stats` 之外的 `flow` 帧
 一律不发布。本机约 2000 条连接时，这会把订阅流量从约 4.8 MB/s 降到每秒约一帧。
 采集器自身的字段说明见其仓库的 `docs/internals/stream-output.md`。
@@ -99,5 +117,6 @@
 ## 验证要求
 
 后台与界面分别用真实本地 socket 测试半帧、多帧、初始快照、断线重连、无新鲜数据、
-坏帧与缓冲上限。部署验收须确认普通用户 GUI 能读取允许访问的 socket，关闭 GUI 不终止后台，
-关闭后台不留下采集子进程。
+坏帧与缓冲上限。IP 两字段另需覆盖：读入与缺失为 0、超过 2^53 与 `UINT64_MAX` 不失真、
+非法取值拒绝整帧、坏帧不部分更新、采集器重启后覆盖而非累加。部署验收须确认普通用户
+GUI 能读取允许访问的 socket，关闭 GUI 不终止后台，关闭后台不留下采集子进程。

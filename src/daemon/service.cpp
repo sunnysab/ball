@@ -343,6 +343,8 @@ Snapshot Service::snapshot() const {
     snapshot.processStatus.incomplete = m_socktrail->incomplete();
     snapshot.processStatus.error = processError();
     snapshot.processStatus.notes = notes;
+    snapshot.ipPackets = m_socktrail->ipPackets();
+    snapshot.ipBytes = m_socktrail->ipBytes();
 
     for (const InterfaceTraffic& row : m_traffic->rows()) {
         InterfaceSnapshot interface;

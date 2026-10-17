@@ -50,6 +50,8 @@ ball::Snapshot mockSnapshot() {
     snapshot.at = at(u"2026-10-15T09:41:07+08:00"_s);
     snapshot.interfacesAvailable = true;
     snapshot.interfaceError.clear();
+    snapshot.ipPackets = 2'450'000;
+    snapshot.ipBytes = 3'892'314'112ULL;
     snapshot.processStatus = {true, false, true, QString(), {u"PID events: dropped 3"_s}};
     snapshot.interfaces = {
         interface(2, u"eno1"_s, ball::InterfaceKind::Physical, 3221225472ULL, 536870912ULL,

@@ -1,6 +1,6 @@
 # ball 交接文档：安装脚本、开机自启与后续计划
 
-**状态**：安装脚本已完成并验证；后续计划未开始
+**状态**：安装脚本已完成并验证；3.1（IP 计数展示）已完成，构建与自动化测试通过，真实采集器未测；其余后续计划未开始
 **涉及仓库**：`ball`（本仓库）、`socktrail`（`~/Code/0-Cloned/0-Internet/socktrail`）
 **相关文档**：`docs/collector-service-handoff.md`（采集器常驻服务化，已完成）
 
@@ -78,23 +78,38 @@
 
 按优先级排列。每项都写明**动机、方案、验证方式、风险**。
 
-### 3.1 ball 消费 `ip_packets` / `ip_bytes`（低风险，建议先做）
+### 3.1 ball 消费 `ip_packets` / `ip_bytes`（已完成）
 
-**动机**：`stats` 帧里有这两个字段，ball 完全没读。它们是与进程 socket I/O **并列的另一种
-口径**（采集点的 IP 报文字节），`docs/protocol.md` 已声明两者不相等、不互相相加，但界面
-没有呈现，用户看不出这个差异。
+**状态**：代码、测试与文档已完成；开发构建与 9 组自动化测试通过。
+真实采集器下的端到端未测。
 
-**方案**：
+**动机**：此前 ball 未读取 `stats` 帧里的这两个字段。它们是与进程 socket I/O
+**并列的另一种口径**（采集点的 IP 报文），需要独立展示并解释差异。
 
-- `src/daemon/socktrail.cpp` 的 `parseStats` 增加两个可选字段的读取（沿用现有
-  `mp::readCount` 与拒绝策略；注意这两个字段在采集器侧是无 `omitempty` 的必填项）。
-- 通过 `Snapshot` 传到 GUI，在详情窗口的网卡区域或状态行显示「IP 报文字节」，
-  与「进程 socket I/O」分开呈现，并在 tooltip 里说明口径差异。
-- 需要给 `Snapshot`/`InterfaceSnapshot`/`ProcessSnapshot` 之外的顶层加字段，注意
-  同步更新 `tests/ui_preview.cpp` 的样例数据与 `tests/mp_frames.h` 的写帧器。
+**实现情况**：
 
-**验证**：单元测试覆盖「读到该字段」「字段缺失时按 0」「与进程口径并列显示不被相加」；
-真实采集器下 `ctest --preset dev` 全绿。
+- `src/daemon/socktrail.{h,cpp}`：`parseStats` 用 `mp::readCount` 读两个可选字段，缺失为 0，
+  存在但非法则拒绝整帧；`Socktrail` 在 `applyStats` 里以新值**覆盖**累计（不累加），
+  `start()` 清零。
+- `src/snapshot.{h,cpp}`、`src/daemon/service.cpp`：顶层 `ip_packets` / `ip_bytes` 进快照，
+  保持 64 位精度，与网卡、进程字段分开放置。
+- `src/ui/details.cpp`：`details.ipTotals` 单独一行，tooltip 说明三种口径不等价；
+  `fresh=false` 或 `process_status` 不可用/过期时显示 `—`，不受所选网卡影响。
+- 测试：`tests/mp_frames.h`（`Writer::ipCounters`、`removeMember`）、`tests/socktrail.cpp`、
+  `tests/service.cpp`、`tests/fake_collector.cpp`、`tests/ui.cpp`、`tests/ui_preview.cpp` 已同步。
+- 文档：`docs/protocol.md` 补充字段、可选规则与「采集器运行累计 / 重启清零」语义；
+  README「数据口径」把首次采样 0 与重启清零限定为网卡与进程累计。
+
+**已验证**：
+
+- `cmake --build --preset dev` 与 `ctest --preset dev` 通过（9/9 组测试）。
+- 变更文件的 clang-format 与 clang-tidy（`clang-analyzer-*`）检查通过；离屏 UI 预览生成成功。
+- 解析测试覆盖两字段分别缺失、同时缺失、64 位整数精度、非法值拒绝整帧。
+- 本地 socket 测试覆盖最新帧覆盖、同毫秒延迟应用、坏帧不部分更新、采集器重启。
+- UI 测试覆盖 IP 与网卡/进程口径不相加、网卡选择不影响 IP 值、不可用时显示占位符。
+
+**尚未验证**：真实采集器（socktrail）下的端到端；自动化测试使用假采集器与本地 socket，
+不需要 root，也不修改正在运行的系统服务。
 
 **风险**：低。属于纯展示扩展，不影响累积逻辑。
 

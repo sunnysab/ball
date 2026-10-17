@@ -265,6 +265,15 @@ SnapshotParseResult decodeSnapshot(const msgpack::object& frame) {
         return reject("bad interface_error");
     }
 
+    const msgpack::object* const ipPackets = mp::member(frame, field::kIpPackets);
+    const msgpack::object* const ipBytes = mp::member(frame, field::kIpBytes);
+    if (ipPackets != nullptr && !mp::readCount(*ipPackets, snapshot.ipPackets)) {
+        return reject("bad ip_packets");
+    }
+    if (ipBytes != nullptr && !mp::readCount(*ipBytes, snapshot.ipBytes)) {
+        return reject("bad ip_bytes");
+    }
+
     if (!readProcessStatus(frame, snapshot.processStatus)) {
         return reject("bad process_status");
     }
@@ -345,7 +354,7 @@ void writeCounters(SnapshotWriter& writer, const ByteCounters& counters) {
 } // namespace
 
 QByteArray encodeSnapshot(const Snapshot& snapshot, bool& ok) {
-    SnapshotWriter writer(9);
+    SnapshotWriter writer(11);
     writer.key(field::kVersion);
     writer.count(uint64_t(snapshot.version));
     writer.key(field::kKind);
@@ -358,6 +367,11 @@ QByteArray encodeSnapshot(const Snapshot& snapshot, bool& ok) {
     writer.boolean(snapshot.interfacesAvailable);
     writer.key(field::kInterfaceError);
     writer.string(snapshot.interfaceError);
+
+    writer.key(field::kIpPackets);
+    writer.count(snapshot.ipPackets);
+    writer.key(field::kIpBytes);
+    writer.count(snapshot.ipBytes);
 
     writer.key(field::kProcessStatus);
     writer.beginMap(5);

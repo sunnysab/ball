@@ -37,6 +37,13 @@ QByteArray helloFrame() {
                                 });
 }
 
+// The collector-run IP totals the fake collector reports, mirrored in
+// tests/service.cpp because that suite does not link ball_testkit. They have no
+// relation to any socket I/O on this machine, and 2^53 + 1 is not exactly
+// representable as a double, so a frame that rounded the byte count fails here.
+constexpr quint64 kIpPackets = 2'450'000;
+constexpr quint64 kIpBytes = 9'007'199'254'740'993ULL;
+
 // One stats frame with `count` process rows. The counters grow on every call,
 // so the second frame produces the first nonzero delta.
 QByteArray statsFrame(quint64& rx, quint64& tx) {
@@ -47,7 +54,7 @@ QByteArray statsFrame(quint64& rx, quint64& tx) {
     return ball::test::envelope(u"stats"_s, QLatin1StringView("stats"),
                                 [&](ball::test::Writer& writer) {
                                     msgpack::packer<msgpack::sbuffer>& packer = writer.packer();
-                                    packer.pack_map(7);
+                                    packer.pack_map(9);
                                     writer.key(QLatin1StringView("at"));
                                     writer.timestamp(QDateTime::currentDateTimeUtc());
                                     writer.key(QLatin1StringView("process_io"));
@@ -69,6 +76,7 @@ QByteArray statsFrame(quint64& rx, quint64& tx) {
                                         writer.key(QLatin1StringView("tx_bytes"));
                                         packer.pack(tx);
                                     }
+                                    writer.ipCounters(kIpPackets, kIpBytes);
                                     writer.key(QLatin1StringView("io_unindexed"));
                                     packer.pack_map(2);
                                     writer.key(QLatin1StringView("rx_bytes"));

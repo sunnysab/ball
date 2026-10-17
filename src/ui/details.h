@@ -36,6 +36,7 @@ private:
     QLabel* m_selectionLabel = nullptr;
     QLabel* m_downLabels[3]{};
     QLabel* m_upLabels[3]{};
+    QLabel* m_ipLabel = nullptr;
     QLabel* m_startedLabel = nullptr;
     QWidget* m_quality = nullptr;
     QLabel* m_qualitySummary = nullptr;

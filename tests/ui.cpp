@@ -79,6 +79,11 @@ Snapshot makeSnapshot(const QDateTime& at = isoAt(u"2026-10-14T14:30:02+08:00"_s
     snapshot.interfaceError =
         interfacesAvailable ? QString() : QStringLiteral("rtnetlink dump failed");
     snapshot.processStatus = ProcessStatus{processAvailable, processStale, false, QString(), {}};
+    // The collector-run IP totals: a byte count no process here can produce,
+    // plus a value whose low bits only survive as an integer. Both are shown as
+    // their own calibre, never added to the interface or process totals.
+    snapshot.ipPackets = 2'450'000;
+    snapshot.ipBytes = 9007199254740993ULL;
 
     const auto interface = [](quint32 index, const QString& name, InterfaceKind kind, bool up,
                               quint64 todayRx, quint64 todayTx, double rxBps, double txBps) {
@@ -219,6 +224,7 @@ private Q_SLOTS:
     void commandLineFormattingPreservesArguments();
     void processTooltipReadsVerifiedCommandLineAndEscapesMarkup();
     void processQualityDoesNotInvalidateInterfaceRates();
+    void detailsIpTotalsAreIndependentOfSelectionAndStatus();
     void partialInterfaceSelectionIsVisible();
     void staleRatesAreUnavailableInBothWindows();
     void detailsGeometrySurvivesRestart();
@@ -314,6 +320,8 @@ void TestUi::parsesFullSnapshot() {
     QVERIFY(snapshot.processStatus.available);
     QCOMPARE(snapshot.interfaces.size(), 4);
     QCOMPARE(snapshot.processes.size(), 3);
+    QCOMPARE(snapshot.ipPackets, quint64(2'450'000));
+    QCOMPARE(snapshot.ipBytes, quint64(9007199254740993ULL));
     QCOMPARE(snapshot.interfaces.at(0).name, u"eno1"_s);
     QCOMPARE(snapshot.interfaces.at(0).kind, InterfaceKind::Physical);
     QCOMPARE(snapshot.interfaces.at(0).today.rxBytes, quint64(2048));
@@ -342,6 +350,9 @@ void TestUi::roundTripsEveryEncodedValue() {
     original.at = isoAt(u"2026-10-15T09:41:07.123+08:00"_s);
     original.interfacesAvailable = false; // false must survive as false
     original.interfaceError = u"rtnetlink dump failed"_s;
+    // Both optional IP fields, with values that only survive as integers.
+    original.ipPackets = 1;
+    original.ipBytes = std::numeric_limits<quint64>::max();
     original.processStatus = ProcessStatus{
         false,
         true,
@@ -390,6 +401,8 @@ void TestUi::roundTripsEveryEncodedValue() {
     QCOMPARE(decoded.at, original.at);
     QCOMPARE(decoded.interfacesAvailable, original.interfacesAvailable);
     QCOMPARE(decoded.interfaceError, original.interfaceError);
+    QCOMPARE(decoded.ipPackets, original.ipPackets);
+    QCOMPARE(decoded.ipBytes, original.ipBytes);
     QCOMPARE(decoded.processStatus.available, original.processStatus.available);
     QCOMPARE(decoded.processStatus.stale, original.processStatus.stale);
     QCOMPARE(decoded.processStatus.incomplete, original.processStatus.incomplete);
@@ -485,6 +498,73 @@ void TestUi::rejectsBadFrames() {
         QVERIFY(up != nullptr);
         *up = msgpack::object(std::string("yes"), zone);
     })));
+
+    // The two optional IP totals may be absent (read as zero) but never wrong:
+    // a present field of the wrong shape is refused, since a rounded or
+    // saturated total would be worse than no total at all.
+    const auto withIp = [](QLatin1StringView name,
+                           const std::function<void(msgpack::object&, msgpack::zone&)>& value) {
+        return patchFrame(snapshotFrame(), [&](msgpack::object& root, msgpack::zone& zone) {
+            msgpack::object* ip = ball::test::member(root, name);
+            QVERIFY(ip != nullptr);
+            value(*ip, zone);
+        });
+    };
+    for (const QLatin1StringView name :
+         {QLatin1StringView("ip_packets"), QLatin1StringView("ip_bytes")}) {
+        QVERIFY(rejected(withIp(name, [](msgpack::object& ip, msgpack::zone& zone) {
+            ip = msgpack::object(1.5, zone);
+        })));
+        QVERIFY(rejected(withIp(name, [](msgpack::object& ip, msgpack::zone& zone) {
+            ip = msgpack::object(int64_t(-1), zone);
+        })));
+        QVERIFY(rejected(withIp(name, [](msgpack::object& ip, msgpack::zone& zone) {
+            ip = msgpack::object(std::string("2450000"), zone);
+        })));
+        QVERIFY(rejected(withIp(name, [](msgpack::object& ip, msgpack::zone& zone) {
+            ip = msgpack::object(true, zone);
+        })));
+        QVERIFY(rejected(withIp(name, [](msgpack::object& ip, msgpack::zone&) {
+            ip = msgpack::object(); // present, and nil is not a number
+        })));
+        QVERIFY(rejected(withIp(name, [](msgpack::object& ip, msgpack::zone& zone) {
+            ip = msgpack::object(std::nan(""), zone);
+        })));
+        QVERIFY(rejected(withIp(name, [](msgpack::object& ip, msgpack::zone& zone) {
+            ip = msgpack::object(std::numeric_limits<double>::infinity(), zone);
+        })));
+    }
+
+    // One field absent is legal and means zero, with the other one kept.
+    const QByteArray noPackets =
+        patchFrame(snapshotFrame(), [](msgpack::object& root, msgpack::zone&) {
+            QVERIFY(ball::test::removeMember(root, QLatin1StringView("ip_packets")));
+        });
+    const ball::SnapshotParseResult parsedNoPackets = decodeFrame(noPackets);
+    QVERIFY2(parsedNoPackets.snapshot.has_value(), qPrintable(parsedNoPackets.error));
+    QCOMPARE(parsedNoPackets.snapshot->ipPackets, quint64(0));
+    QCOMPARE(parsedNoPackets.snapshot->ipBytes, quint64(9007199254740993ULL));
+
+    const QByteArray noBytes =
+        patchFrame(snapshotFrame(), [](msgpack::object& root, msgpack::zone&) {
+            QVERIFY(ball::test::removeMember(root, QLatin1StringView("ip_bytes")));
+        });
+    const ball::SnapshotParseResult parsedNoBytes = decodeFrame(noBytes);
+    QVERIFY2(parsedNoBytes.snapshot.has_value(), qPrintable(parsedNoBytes.error));
+    QCOMPARE(parsedNoBytes.snapshot->ipPackets, quint64(2'450'000));
+    QCOMPARE(parsedNoBytes.snapshot->ipBytes, quint64(0));
+
+    // A frame that carries neither optional field is still a snapshot whose two
+    // IP totals read as zero.
+    const QByteArray neither =
+        patchFrame(snapshotFrame(), [](msgpack::object& root, msgpack::zone&) {
+            QVERIFY(ball::test::removeMember(root, QLatin1StringView("ip_packets")));
+            QVERIFY(ball::test::removeMember(root, QLatin1StringView("ip_bytes")));
+        });
+    const ball::SnapshotParseResult parsedNeither = decodeFrame(neither);
+    QVERIFY2(parsedNeither.snapshot.has_value(), qPrintable(parsedNeither.error));
+    QCOMPARE(parsedNeither.snapshot->ipPackets, quint64(0));
+    QCOMPARE(parsedNeither.snapshot->ipBytes, quint64(0));
 
     // The unpatched frame is accepted, so every rejection above is caused by the
     // edit and not by the fixture.
@@ -1305,6 +1385,81 @@ void TestUi::processTooltipReadsVerifiedCommandLineAndEscapesMarkup() {
     QVERIFY(unavailable.contains(u"命令行不可用"_s));
     QVERIFY(unavailable.contains(u"&lt;img"_s));
     QVERIFY(!unavailable.contains(u"<img"_s));
+}
+
+void TestUi::detailsIpTotalsAreIndependentOfSelectionAndStatus() {
+    QSettings settings(m_settingsPath, QSettings::IniFormat);
+    Hud hud(startServer(), settings);
+    QVERIFY(acceptConnection() != nullptr);
+    send(snapshotFrame());
+    auto* ip = hud.detailsWindow()->findChild<QLabel*>(u"details.ipTotals"_s);
+    QVERIFY(ip != nullptr);
+    QVERIFY(waitFor([ip] { return ip->text().contains(u"8.00 PiB"_s); }));
+    // The label names the calibre in the text itself, and the tooltip explains
+    // why it is neither the interface nor the process total.
+    QVERIFY(ip->text().contains(u"采集器本次运行累计"_s));
+    QVERIFY(ip->text().contains(u"2450000"_s));
+    QVERIFY(ip->toolTip().contains(u"不是进程 socket I/O"_s));
+    QVERIFY(ip->toolTip().contains(u"不随所选网卡变化"_s));
+    const QString reported = ip->text();
+
+    // Selection is about interfaces only: switching it, or dropping every
+    // interface, must leave the collector-run number alone.
+    hud.setSelectedInterfaces({u"lo"_s});
+    QCOMPARE(ip->text(), reported);
+    hud.setSelectedInterfaces({});
+    QCOMPARE(ip->text(), reported);
+    hud.setSelectedInterfaces({u"eno1"_s});
+    QCOMPARE(ip->text(), reported);
+
+    // The interface and process calibres keep their own numbers: eno1 alone is
+    // 1.00 KiB/s down and 2.00 KiB today, and firefox's today RX is 1.00 KiB.
+    // The IP total must not leak into any of them.
+    auto* currentDown = hud.detailsWindow()->findChild<QLabel*>(u"details.currentDown"_s);
+    auto* todayDown = hud.detailsWindow()->findChild<QLabel*>(u"details.todayDown"_s);
+    auto* table = hud.detailsWindow()->findChild<QTableView*>(u"details.processTable"_s);
+    QVERIFY(currentDown != nullptr);
+    QVERIFY(todayDown != nullptr);
+    QVERIFY(table != nullptr);
+    QVERIFY(waitFor([currentDown] { return currentDown->text().contains(u"1.00 KiB/s"_s); }));
+    QVERIFY(waitFor([todayDown] { return todayDown->text().contains(u"2.00 KiB"_s); }));
+    QAbstractItemModel* model = table->model();
+    QVERIFY(waitFor([model] { return model->rowCount() == 2; }));
+    // Names may come from /proc; identify the process by its PID column.
+    int firefoxRow = -1;
+    for (int row = 0; row < model->rowCount(); ++row) {
+        if (findText(model, row, 1) == u"1234"_s) {
+            firefoxRow = row;
+            break;
+        }
+    }
+    QVERIFY(firefoxRow >= 0);
+    QCOMPARE(findText(model, firefoxRow, 5).trimmed(), u"1.00 KiB"_s);
+
+    // Interface collection failing is not the IP calibre failing: the label keeps
+    // the collector-run number while the interface rates go unavailable.
+    send(snapshotFrame(isoAt(u"2026-10-14T14:30:03+08:00"_s), false));
+    QVERIFY(waitFor([currentDown] { return currentDown->text().contains(u"—"_s); }));
+    QCOMPARE(ip->text(), reported);
+
+    // A stale backend shows the placeholder instead of the last known total, and
+    // it never falls back to a zero that looks like a real measurement.
+    const QString unavailableText = u"IP 报文字节：— · 报文数：—（采集器本次运行累计）"_s;
+    m_client->disconnectFromServer();
+    QVERIFY(waitFor([ip, unavailableText] { return ip->text() == unavailableText; }));
+
+    // An unavailable or stale process side, and no snapshot at all, do the same.
+    hud.detailsWindow()->setSnapshot(
+        makeSnapshot(isoAt(u"2026-10-14T14:30:04+08:00"_s), true, false), true, {u"eno1"_s});
+    QCOMPARE(ip->text(), unavailableText);
+    hud.detailsWindow()->setSnapshot(
+        makeSnapshot(isoAt(u"2026-10-14T14:30:04+08:00"_s), true, true, true), true, {u"eno1"_s});
+    QCOMPARE(ip->text(), unavailableText);
+    hud.detailsWindow()->setSnapshot(makeSnapshot(isoAt(u"2026-10-14T14:30:04+08:00"_s)), false,
+                                     {u"eno1"_s});
+    QCOMPARE(ip->text(), unavailableText);
+    hud.detailsWindow()->setSnapshot(std::nullopt, false, {});
+    QCOMPARE(ip->text(), unavailableText);
 }
 
 void TestUi::processQualityDoesNotInvalidateInterfaceRates() {

@@ -69,6 +69,9 @@ struct Snapshot {
     bool interfacesAvailable = false;
     QString interfaceError;
     ProcessStatus processStatus;
+    // Collector-run totals, independent of interface and process accumulation.
+    quint64 ipPackets = 0;
+    quint64 ipBytes = 0;
     QList<InterfaceSnapshot> interfaces;
     QList<ProcessSnapshot> processes;
 };
@@ -82,6 +85,8 @@ inline constexpr QLatin1StringView kStarted("started");
 inline constexpr QLatin1StringView kAt("at");
 inline constexpr QLatin1StringView kInterfacesAvailable("interfaces_available");
 inline constexpr QLatin1StringView kInterfaceError("interface_error");
+inline constexpr QLatin1StringView kIpPackets("ip_packets");
+inline constexpr QLatin1StringView kIpBytes("ip_bytes");
 inline constexpr QLatin1StringView kProcessStatus("process_status");
 inline constexpr QLatin1StringView kAvailable("available");
 inline constexpr QLatin1StringView kStale("stale");

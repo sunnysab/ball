@@ -46,6 +46,15 @@ public:
         m_packer.pack_ext_body(body, size);
     }
 
+    // The two collector-run IP totals a stats frame carries, as the two map
+    // entries the decoder reads. The caller counts both in its map size.
+    void ipCounters(quint64 packets, quint64 bytes) {
+        key(QLatin1StringView("ip_packets"));
+        m_packer.pack(packets);
+        key(QLatin1StringView("ip_bytes"));
+        m_packer.pack(bytes);
+    }
+
 private:
     msgpack::sbuffer m_buffer;
     Packer m_packer{m_buffer};
@@ -58,21 +67,44 @@ inline QByteArray frame(const std::function<void(Writer&)>& fill) {
     return writer.take();
 }
 
-// The map entry named `key`, or nullptr when `value` is not a map or has no
-// such key. Used to break exactly one field of a real frame.
-inline msgpack::object* member(msgpack::object& value, QLatin1StringView key) {
+// Position of the map entry named `key`, or -1 when `value` is not a map or has
+// no such key.
+inline int memberIndex(const msgpack::object& value, QLatin1StringView key) {
     if (value.type != msgpack::type::MAP) {
-        return nullptr;
+        return -1;
     }
     for (uint32_t i = 0; i < value.via.map.size; ++i) {
-        msgpack::object_kv& entry = value.via.map.ptr[i];
+        const msgpack::object_kv& entry = value.via.map.ptr[i];
         if (entry.key.type == msgpack::type::STR &&
             entry.key.via.str.size == uint32_t(key.size()) &&
             std::memcmp(entry.key.via.str.ptr, key.data(), key.size()) == 0) {
-            return &entry.val;
+            return int(i);
         }
     }
-    return nullptr;
+    return -1;
+}
+
+// The map entry named `key`, or nullptr when `value` is not a map or has no
+// such key. Used to break exactly one field of a real frame.
+inline msgpack::object* member(msgpack::object& value, QLatin1StringView key) {
+    const int index = memberIndex(value, key);
+    return index < 0 ? nullptr : &value.via.map.ptr[index].val;
+}
+
+// Erases the map entry named `key`, so a test can make an optional field
+// genuinely absent: a nil value is a different (and separately refused) case,
+// not a missing key. False when there is no such entry.
+inline bool removeMember(msgpack::object& value, QLatin1StringView key) {
+    const int index = memberIndex(value, key);
+    if (index < 0) {
+        return false;
+    }
+    msgpack::object_kv* entries = value.via.map.ptr;
+    for (uint32_t i = uint32_t(index) + 1; i < value.via.map.size; ++i) {
+        entries[i - 1] = entries[i];
+    }
+    --value.via.map.size;
+    return true;
 }
 
 // Re-encodes `frame` after `edit` changed its decoded tree, so a test can make

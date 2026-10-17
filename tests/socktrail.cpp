@@ -13,6 +13,8 @@
 #include <QTest>
 #include <QUuid>
 
+#include <cmath>
+#include <initializer_list>
 #include <limits>
 
 using ball::ProcessTraffic;
@@ -87,14 +89,21 @@ void writeQuality(ball::test::Writer& writer, quint64 kernelLost = 0, quint64 dr
     packer.pack(invalid);
 }
 
-// A healthy stats frame. The real publisher writes more fields than the client
-// reads (ip_packets, ip_bytes); a decoder must ignore what it does not know, so
-// the fixture writes only the fields in use.
-QByteArray statsLine(const QDateTime& at, const QList<Process>& processes) {
+// The collector-run IP totals a healthy fixture reports. The real publisher
+// writes both fields unconditionally and they are unrelated to any process
+// socket I/O, so the numbers are deliberately not derivable from the table.
+constexpr quint64 kFixtureIpPackets = 2'450'000;
+constexpr quint64 kFixtureIpBytes = 3'892'314'112ULL;
+
+// A healthy stats frame, including the two optional IP totals. Both are
+// optional on the wire: the decoder reads a missing key as zero, which the
+// tests exercise by erasing it from this otherwise real frame.
+QByteArray statsLine(const QDateTime& at, const QList<Process>& processes,
+                     quint64 ipPackets = kFixtureIpPackets, quint64 ipBytes = kFixtureIpBytes) {
     return ball::test::envelope(u"stats"_s, QLatin1StringView("stats"),
                                 [&](ball::test::Writer& writer) {
                                     msgpack::packer<msgpack::sbuffer>& packer = writer.packer();
-                                    packer.pack_map(7);
+                                    packer.pack_map(9);
                                     writer.key(QLatin1StringView("at"));
                                     writer.timestamp(at);
                                     writer.key(QLatin1StringView("process_io"));
@@ -103,13 +112,58 @@ QByteArray statsLine(const QDateTime& at, const QList<Process>& processes) {
                                         writeProcess(writer, process.pid, process.startNs,
                                                      process.name, process.rx, process.tx);
                                     }
+                                    writer.ipCounters(ipPackets, ipBytes);
                                     writeQuality(writer);
                                 });
+}
+
+// The real fixture with the named IP fields erased. A nil value is a different
+// case (a present but wrong type, which must be refused), so the tests need a
+// way to remove a key rather than blank it.
+QByteArray withoutIp(const QDateTime& at, std::initializer_list<QLatin1StringView> names) {
+    return ball::test::patchFrame(
+        statsLine(at, {}), [names](msgpack::object& root, msgpack::zone&) {
+            msgpack::object* stats = ball::test::member(root, QLatin1StringView("stats"));
+            QVERIFY(stats != nullptr);
+            for (const QLatin1StringView name : names) {
+                QVERIFY(ball::test::removeMember(*stats, name));
+            }
+        });
 }
 
 // A stats frame whose payload is built by the test, for the malformed cases.
 QByteArray statsFrame(const std::function<void(ball::test::Writer&)>& fill) {
     return ball::test::envelope(u"stats"_s, QLatin1StringView("stats"), fill);
+}
+
+// A stats frame whose named IP field is written by the test, so every accepted
+// and refused encoding is exercised without touching the other field or the
+// rest of the frame. The other field keeps a legal count: writing the same
+// illegal value into both would only ever exercise the first rejection.
+QByteArray statsWithIp(const QDateTime& at, QLatin1StringView name,
+                       const std::function<void(ball::test::Writer&)>& ipValue) {
+    const bool packets = name == QLatin1StringView("ip_packets");
+    return statsFrame([&](ball::test::Writer& writer) {
+        msgpack::packer<msgpack::sbuffer>& packer = writer.packer();
+        packer.pack_map(9);
+        writer.key(QLatin1StringView("at"));
+        writer.timestamp(at);
+        writer.key(QLatin1StringView("process_io"));
+        packer.pack_array(0);
+        writer.key(QLatin1StringView("ip_packets"));
+        if (packets) {
+            ipValue(writer);
+        } else {
+            packer.pack(uint64_t(1));
+        }
+        writer.key(QLatin1StringView("ip_bytes"));
+        if (packets) {
+            packer.pack(uint64_t(1));
+        } else {
+            ipValue(writer);
+        }
+        writeQuality(writer);
+    });
 }
 
 QByteArray helloLine(const QDateTime& started = kStarted, int version = 1) {
@@ -167,10 +221,14 @@ private Q_SLOTS:
     void frameValidation();
     void frameNumbersAreExact();
     void timestampMustBeATimestamp();
+    void ipCountersAreOptionalAndExact();
     void helloThenFirstStats();
     void statsBeforeHelloIsRejected();
     void accumulatedStatsAcrossSplitFrames();
     void flowFramesAreIgnored();
+    void ipCountersFollowTheLatestStatsFrame();
+    void badFrameDoesNotPartiallyUpdateIpCounters();
+    void collectorRestartOverwritesIpCounters();
     void sameMillisecondStatsAreNotLost();
     void newerStatsSupersedePendingStats();
     void firstConnectionFailureIsNotHistoricalGap();
@@ -405,6 +463,78 @@ void TestSocktrail::frameNumbersAreExact() {
              SocktrailFrameStatus::ProtocolError);
 }
 
+void TestSocktrail::ipCountersAreOptionalAndExact() {
+    const QDateTime at = QDateTime::fromString(u"2026-10-13T14:00:01Z"_s, Qt::ISODate);
+
+    // Both fields are read as written, unrelated to any process row: socket I/O
+    // and the collector's IP packet count are different things and are never
+    // added together.
+    const SocktrailFrame present = decode(statsLine(at, {Process{7, 500, u"curl"_s, 1, 2}}));
+    QCOMPARE(present.status, SocktrailFrameStatus::Ok);
+    QCOMPARE(present.ipPackets, kFixtureIpPackets);
+    QCOMPARE(present.ipBytes, kFixtureIpBytes);
+
+    // 2^53 + 1 and UINT64_MAX survive the trip: both counters are integers on
+    // the wire, so nothing may round them through a double.
+    const quint64 maximum = std::numeric_limits<quint64>::max();
+    const SocktrailFrame large = decode(statsLine(at, {}, 9'007'199'254'740'993ULL, maximum));
+    QCOMPARE(large.status, SocktrailFrameStatus::Ok);
+    QCOMPARE(large.ipPackets, quint64(9'007'199'254'740'993ULL));
+    QCOMPARE(large.ipBytes, maximum);
+
+    // A missing field is zero rather than a rejected frame: both fields are
+    // optional on the wire, so an absent one simply means no total.
+    const SocktrailFrame noPackets = decode(withoutIp(at, {QLatin1StringView("ip_packets")}));
+    QCOMPARE(noPackets.status, SocktrailFrameStatus::Ok);
+    QCOMPARE(noPackets.ipPackets, quint64(0));
+    QCOMPARE(noPackets.ipBytes, kFixtureIpBytes);
+    const SocktrailFrame noBytes = decode(withoutIp(at, {QLatin1StringView("ip_bytes")}));
+    QCOMPARE(noBytes.status, SocktrailFrameStatus::Ok);
+    QCOMPARE(noBytes.ipPackets, kFixtureIpPackets);
+    QCOMPARE(noBytes.ipBytes, quint64(0));
+    const SocktrailFrame neither =
+        decode(withoutIp(at, {QLatin1StringView("ip_packets"), QLatin1StringView("ip_bytes")}));
+    QCOMPARE(neither.status, SocktrailFrameStatus::Ok);
+    QCOMPARE(neither.ipPackets, quint64(0));
+    QCOMPARE(neither.ipBytes, quint64(0));
+
+    // Every other encoding is refused as a whole frame, so a counter can never
+    // be silently rounded, saturated or read out of the wrong type. Each field
+    // is exercised on its own, with the other one left legal.
+    const auto rejected = [&at](QLatin1StringView name,
+                                const std::function<void(ball::test::Writer&)>& value) {
+        return decode(statsWithIp(at, name, value)).status == SocktrailFrameStatus::ProtocolError;
+    };
+    for (const QLatin1StringView name :
+         {QLatin1StringView("ip_packets"), QLatin1StringView("ip_bytes")}) {
+        QVERIFY(rejected(name, [](ball::test::Writer& writer) { writer.packer().pack(-1); }));
+        QVERIFY(rejected(name, [](ball::test::Writer& writer) { writer.packer().pack(1.5); }));
+        QVERIFY(
+            rejected(name, [](ball::test::Writer& writer) { writer.packer().pack(std::nan("")); }));
+        QVERIFY(rejected(name, [](ball::test::Writer& writer) {
+            writer.packer().pack(std::numeric_limits<double>::infinity());
+        }));
+        QVERIFY(rejected(name, [](ball::test::Writer& writer) {
+            writer.packer().pack(18'446'744'073'709'551'616.0);
+        }));
+        QVERIFY(rejected(name, [](ball::test::Writer& writer) { writer.text(u"1234"_s); }));
+        QVERIFY(rejected(name, [](ball::test::Writer& writer) { writer.packer().pack(true); }));
+        QVERIFY(rejected(name, [](ball::test::Writer& writer) { writer.packer().pack_nil(); }));
+    }
+    // An integral float is exactly representable, so it is a legal count for
+    // either field while the other one keeps its own legal value.
+    const auto asFloat = [&at](QLatin1StringView name, quint64 expectedPackets,
+                               quint64 expectedBytes) {
+        const SocktrailFrame frame = decode(
+            statsWithIp(at, name, [](ball::test::Writer& writer) { writer.packer().pack(2.0); }));
+        QCOMPARE(frame.status, SocktrailFrameStatus::Ok);
+        QCOMPARE(frame.ipPackets, expectedPackets);
+        QCOMPARE(frame.ipBytes, expectedBytes);
+    };
+    asFloat(QLatin1StringView("ip_packets"), quint64(2), quint64(1));
+    asFloat(QLatin1StringView("ip_bytes"), quint64(1), quint64(2));
+}
+
 void TestSocktrail::timestampMustBeATimestamp() {
     // An instant has exactly one representation on the wire: the MessagePack
     // timestamp extension. Anything else is refused, however plausible.
@@ -545,6 +675,129 @@ void TestSocktrail::flowFramesAreIgnored() {
     QCOMPARE(client.processes().row(99, 1).present, false);
 }
 
+void TestSocktrail::ipCountersFollowTheLatestStatsFrame() {
+    Socktrail client;
+    client.start(startServer());
+    QVERIFY(acceptConnection());
+    send(helloLine());
+    send(statsLine(QDateTime::fromString(u"2026-10-13T14:00:01Z"_s, Qt::ISODate),
+                   {Process{7, 500, u"curl"_s, 1'000, 0}}, 2'500, 300));
+    QTRY_VERIFY(client.available());
+    QCOMPARE(client.ipPackets(), quint64(2'500));
+    QCOMPARE(client.ipBytes(), quint64(300));
+
+    // The collector reports its own running totals, so a later frame is the new
+    // value, never an increment added on top: the smaller numbers below replace
+    // the larger ones instead of adding to them. A collector restart between
+    // the two frames is exactly when that happens. The per-process totals are a
+    // separate accumulator and keep growing.
+    QTest::qWait(30);
+    send(statsLine(QDateTime::fromString(u"2026-10-13T14:00:02Z"_s, Qt::ISODate),
+                   {Process{7, 500, u"curl"_s, 1'400, 0}}, 10, 100));
+    QTRY_COMPARE(client.ipPackets(), quint64(10));
+    QCOMPARE(client.ipBytes(), quint64(100));
+    QCOMPARE(client.processes().row(7, 500).session.rxBytes, quint64(400));
+
+    // A frame that omits both fields overwrites them with zero; an absent field
+    // is not "keep the previous value".
+    QTest::qWait(30);
+    send(withoutIp(QDateTime::fromString(u"2026-10-13T14:00:03Z"_s, Qt::ISODate),
+                   {QLatin1StringView("ip_packets"), QLatin1StringView("ip_bytes")}));
+    QTRY_COMPARE(client.ipPackets(), quint64(0));
+    QCOMPARE(client.ipBytes(), quint64(0));
+    QVERIFY(client.available());
+}
+
+void TestSocktrail::badFrameDoesNotPartiallyUpdateIpCounters() {
+    Socktrail client;
+    client.start(startServer());
+    QVERIFY(acceptConnection());
+    send(helloLine());
+    send(statsLine(QDateTime::fromString(u"2026-10-13T14:00:01Z"_s, Qt::ISODate),
+                   {Process{7, 500, u"curl"_s, 1'000, 0}}, 10, 100));
+    QTRY_VERIFY(client.available());
+
+    // The IP fields are valid but a process row is not. A rejected frame leaves
+    // no partial state, so the decoded IP totals must not reach the client.
+    send(statsFrame([](ball::test::Writer& writer) {
+        msgpack::packer<msgpack::sbuffer>& packer = writer.packer();
+        packer.pack_map(9);
+        writer.key(QLatin1StringView("at"));
+        writer.timestamp(QDateTime::fromString(u"2026-10-13T14:00:02Z"_s, Qt::ISODate));
+        writer.key(QLatin1StringView("process_io"));
+        packer.pack_array(1);
+        writeProcess(writer, 0, 1, u"nobody"_s, 1, 1); // PID 0 names no process
+        writer.ipCounters(9'999'999, 9'999'999'999ULL);
+        writeQuality(writer);
+    }));
+    QTRY_VERIFY(!client.available());
+    QVERIFY(!client.error().isEmpty());
+    QCOMPARE(client.ipPackets(), quint64(10));
+    QCOMPARE(client.ipBytes(), quint64(100));
+    QCOMPARE(client.processes().row(7, 500).session.rxBytes, quint64(0));
+
+    // The same holds when only one of the two IP fields is the wrong type: the
+    // good field is refused with it, and the process table is not applied.
+    QVERIFY(acceptConnection(4000));
+    send(helloLine());
+    send(statsLine(QDateTime::fromString(u"2026-10-13T14:00:03Z"_s, Qt::ISODate),
+                   {Process{7, 500, u"curl"_s, 1'000, 0}}, 20, 200));
+    QTRY_COMPARE(client.ipPackets(), quint64(20));
+    QTest::qWait(30);
+    send(statsFrame([](ball::test::Writer& writer) {
+        msgpack::packer<msgpack::sbuffer>& packer = writer.packer();
+        packer.pack_map(9);
+        writer.key(QLatin1StringView("at"));
+        writer.timestamp(QDateTime::fromString(u"2026-10-13T14:00:04Z"_s, Qt::ISODate));
+        writer.key(QLatin1StringView("process_io"));
+        packer.pack_array(0);
+        writer.key(QLatin1StringView("ip_packets"));
+        packer.pack(uint64_t(99));
+        writer.key(QLatin1StringView("ip_bytes"));
+        packer.pack(1.5); // fractional, so the frame is refused whole
+        writeQuality(writer);
+    }));
+    QTRY_VERIFY(!client.available());
+    QCOMPARE(client.ipPackets(), quint64(20));
+    QCOMPARE(client.ipBytes(), quint64(200));
+}
+
+void TestSocktrail::collectorRestartOverwritesIpCounters() {
+    Socktrail client;
+    client.start(startServer());
+    QVERIFY(acceptConnection());
+    send(helloLine());
+    send(statsLine(QDateTime::fromString(u"2026-10-13T14:00:01Z"_s, Qt::ISODate),
+                   {Process{7, 500, u"curl"_s, 1'000, 0}}, 10, 100));
+    QTRY_VERIFY(client.available());
+    QTest::qWait(30);
+    send(statsLine(QDateTime::fromString(u"2026-10-13T14:00:02Z"_s, Qt::ISODate),
+                   {Process{7, 500, u"curl"_s, 1'500, 0}}, 60, 600));
+    QTRY_COMPARE(client.ipPackets(), quint64(60));
+    QCOMPARE(client.processes().row(7, 500).session.rxBytes, quint64(500));
+
+    m_client->close();
+    QTRY_VERIFY(!client.available());
+    QVERIFY(acceptConnection(4000));
+
+    // A different `started` means the collector restarted: its counters start
+    // from zero again, so the smaller number is the new total and not a delta
+    // to be added. The process observation keeps what it already accumulated.
+    send(helloLine(QDateTime::fromString(u"2026-10-13T15:00:00Z"_s, Qt::ISODate)));
+    send(statsLine(QDateTime::fromString(u"2026-10-13T15:00:01Z"_s, Qt::ISODate),
+                   {Process{7, 500, u"curl"_s, 800, 0}}, 3, 30));
+    QTRY_COMPARE(client.ipPackets(), quint64(3));
+    QCOMPARE(client.ipBytes(), quint64(30));
+    QCOMPARE(client.processes().row(7, 500).session.rxBytes, quint64(500));
+
+    // A new subscription drops the collector-run totals: they were the previous
+    // collector's numbers, and the next frame is an absolute value rather than
+    // an increment either way.
+    client.start(startServer());
+    QCOMPARE(client.ipPackets(), quint64(0));
+    QCOMPARE(client.ipBytes(), quint64(0));
+}
+
 void TestSocktrail::sameMillisecondStatsAreNotLost() {
     Socktrail client;
     client.start(startServer());
@@ -556,13 +809,16 @@ void TestSocktrail::sameMillisecondStatsAreNotLost() {
 
     // Two stats frames in one write usually land in one readyRead within one
     // millisecond. The newest sample must not be dropped just because it shares
-    // its millisecond with the previous one.
+    // its millisecond with the previous one, and the IP totals follow it: the
+    // deferred frame carries both.
     m_client->write(statsLine(QDateTime::fromString(u"2026-10-13T14:00:02Z"_s, Qt::ISODate),
-                              {Process{7, 500, u"curl"_s, 1'400, 0}}) +
+                              {Process{7, 500, u"curl"_s, 1'400, 0}}, 40, 400) +
                     statsLine(QDateTime::fromString(u"2026-10-13T14:00:03Z"_s, Qt::ISODate),
-                              {Process{7, 500, u"curl"_s, 1'700, 0}}));
+                              {Process{7, 500, u"curl"_s, 1'700, 0}}, 70, 700));
     m_client->flush();
     QTRY_COMPARE(client.processes().row(7, 500).session.rxBytes, quint64(700));
+    QCOMPARE(client.ipPackets(), quint64(70));
+    QCOMPARE(client.ipBytes(), quint64(700));
     QVERIFY(!client.incomplete());
 }
 
@@ -576,18 +832,22 @@ void TestSocktrail::newerStatsSupersedePendingStats() {
     QTRY_VERIFY(client.available());
 
     // A large flow frame sits between the stats frames, so the batch spans
-    // several reads; the newest pending sample must still be the one applied.
+    // several reads; the newest pending sample must still be the one applied,
+    // together with its IP totals.
     QByteArray batch = statsLine(QDateTime::fromString(u"2026-10-13T14:00:02Z"_s, Qt::ISODate),
-                                 {Process{7, 500, u"app"_s, 1'400, 0}});
+                                 {Process{7, 500, u"app"_s, 1'400, 0}}, 40, 400);
     batch += statsLine(QDateTime::fromString(u"2026-10-13T14:00:03Z"_s, Qt::ISODate),
-                       {Process{7, 500, u"app"_s, 2'100, 0}});
+                       {Process{7, 500, u"app"_s, 2'100, 0}}, 70, 700);
     batch += flowLine(QString(3LL * 1024 * 1024, u'x'));
     batch += statsLine(QDateTime::fromString(u"2026-10-13T14:00:04Z"_s, Qt::ISODate),
-                       {Process{7, 500, u"app"_s, 2'600, 0}});
+                       {Process{7, 500, u"app"_s, 2'600, 0}}, 90, 900);
     send(batch);
     QTRY_COMPARE(client.processes().row(7, 500).session.rxBytes, quint64(1'600));
+    QCOMPARE(client.ipPackets(), quint64(90));
+    QCOMPARE(client.ipBytes(), quint64(900));
     QTest::qWait(20);
     QCOMPARE(client.processes().row(7, 500).session.rxBytes, quint64(1'600));
+    QCOMPARE(client.ipPackets(), quint64(90));
 }
 
 void TestSocktrail::firstConnectionFailureIsNotHistoricalGap() {

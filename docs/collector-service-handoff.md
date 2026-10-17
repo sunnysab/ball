@@ -160,15 +160,15 @@ sudo ./build/dev/ball --daemon --socket /run/ball-$USER/gui.sock \
 
 ## 7. 后续规划
 
-按优先级排列，均已明确未做：
+按优先级排列；IP 计数展示已完成，其余状态见各项说明。
 
 ### 7.1 ball 消费已有的缺口统计（低风险，建议先做）
 
-`stats` 帧里还有几个 ball **完全没读**的字段：
+`stats` 帧里的缺口统计及展示状态（后续进展见 `docs/next-steps-handoff.md` §3.1）：
 
 | 字段 | 含义 | 建议用途 |
 | --- | --- | --- |
-| `ip_packets` / `ip_bytes` | 采集点的 IP 报文字节 | 与进程 socket I/O 并列展示，明确两种口径不相等 |
+| `ip_packets` / `ip_bytes` | 采集点的 IP 报文数 / 字节 | 已做：详情窗口独立展示采集器运行累计，明确不与进程或网卡口径相加 |
 | `io_unmatched_bytes` | 没能关联到所选流的 socket I/O | 已做（报为质量说明）；可进一步在详情里显示数值 |
 
 ### 7.2 连接级视图（大改动，独立立项）

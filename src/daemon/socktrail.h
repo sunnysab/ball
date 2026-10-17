@@ -33,6 +33,8 @@ struct SocktrailFrame {
     QDateTime at;                   // stats: "at"
     QDateTime backendStarted;       // hello: "started"
     QList<ProcessCounter> counters; // stats: the full process_io table
+    quint64 ipPackets = 0;          // stats: collector-run IP packet count
+    quint64 ipBytes = 0;            // stats: collector-run IP bytes, not socket I/O
     QStringList qualityNotes;       // stats: dropped / expired / unindexed bytes
     QString error;                  // short ASCII reason for a rejected frame
 };
@@ -80,6 +82,9 @@ public:
     // They are never added to any per-process total.
     QStringList qualityNotes() const { return m_qualityNotes; }
 
+    quint64 ipPackets() const { return m_ipPackets; }
+    quint64 ipBytes() const { return m_ipBytes; }
+
     // How long a stats frame may be missing before stale() turns true. The
     // window starts when the socket connects, so a peer that only sends flow
     // frames still turns stale and reports a reason.
@@ -100,8 +105,7 @@ private:
     // must be discarded.
     bool handleFrame(const msgpack::object& frame);
     // Applies one validated stats sample. Returns false when it was rejected.
-    bool applyStats(const QList<ProcessCounter>& counters, const QDateTime& at, qint64 monotonicMs,
-                    const QStringList& qualityNotes);
+    bool applyStats(const SocktrailFrame& stats, qint64 monotonicMs);
     // Applies a sample that was deferred because its millisecond had not moved.
     void flushPendingStats();
     void dropConnection(const QString& reason);
@@ -121,9 +125,9 @@ private:
     QByteArray m_error;
     QStringList m_qualityNotes;
     QDateTime m_backendStarted;
-    QList<ProcessCounter> m_pendingCounters;
-    QDateTime m_pendingAt;
-    QStringList m_pendingQualityNotes;
+    SocktrailFrame m_pendingStats;
+    quint64 m_ipPackets = 0;
+    quint64 m_ipBytes = 0;
     qint64 m_lastAppliedMonoMs = -1;
     bool m_running = false;
     bool m_helloReceived = false;

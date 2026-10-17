@@ -224,6 +224,18 @@ Details::Details() : QWidget(nullptr, Qt::Window) {
     m_upLabels[2]->setObjectName(QStringLiteral("details.sessionUp"));
     layout->addLayout(totals);
 
+    m_ipLabel = new QLabel(this);
+    m_ipLabel->setObjectName(QStringLiteral("details.ipTotals"));
+    m_ipLabel->setProperty("role", "muted");
+    m_ipLabel->setTextFormat(Qt::PlainText);
+    m_ipLabel->setWordWrap(true);
+    m_ipLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    m_ipLabel->setToolTip(
+        QStringLiteral("IP 报文字节是采集点观测到的 IP 报文大小，不是进程 socket I/O。"
+                       "两者与网卡计数均不相等，也不互相相加；此处不随所选网卡变化。"
+                       "累计从采集器启动开始，采集器重启后清零，不按今日或本次监测分段。"));
+    layout->addWidget(m_ipLabel);
+
     m_quality = new QWidget(this);
     auto* qualityLayout = new QVBoxLayout(m_quality);
     qualityLayout->setContentsMargins(0, 0, 0, 0);
@@ -352,6 +364,11 @@ void Details::setSnapshot(const std::optional<Snapshot>& snapshot, bool fresh,
         m_upLabels[i + 1]->setText(QStringLiteral("↑ %1").arg(
             usable ? formatBytes(counters[i].txBytes).trimmed() : placeholder()));
     }
+    const bool ipUsable = fresh && snapshot.has_value() && snapshot->processStatus.available &&
+                          !snapshot->processStatus.stale;
+    m_ipLabel->setText(QStringLiteral("IP 报文字节：%1 · 报文数：%2（采集器本次运行累计）")
+                           .arg(ipUsable ? formatBytes(snapshot->ipBytes).trimmed() : placeholder(),
+                                ipUsable ? QString::number(snapshot->ipPackets) : placeholder()));
     const QString started =
         snapshot.has_value() && snapshot->started.isValid()
             ? snapshot->started.toLocalTime().toString(QStringLiteral("yyyy-MM-dd HH:mm:ss"))
