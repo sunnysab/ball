@@ -1,0 +1,93 @@
+# 连接查询设计
+
+## 范围与交互
+
+悬浮条保持轻量。详情窗口保留「进程」「网卡」，增加「连接」页。
+
+- 双击进程行或使用「查看连接」操作，切换到连接页，并按 PID 和启动时间筛选；显示可清除的进程筛选标签。
+- 全局连接页支持文本搜索（端点、域名、进程名和 PID）、协议、活动或已结束状态、排名指标和前 N 条。
+- 查询顺序为：全部缓存记录 → 组合筛选 → 按指标排序 → 前 N 条；前 N 支持 10、20、50、100 和全部。
+- 排名指标包括总速率、累计 IP 字节、RX 速率、TX 速率、重传。相同值按 ID 排序，避免刷新抖动。
+- 表格列为域名或应用、协议、来源、目标、参与进程、状态、采集 RX/TX 速率、累计 IP 字节、RTT、重传。
+- 选中一条连接显示可复制的详情：ID、端点、域名证据说明、接口、客户端与服务端身份、实际 I/O 进程及其 socket 字节、开始/最近时间、结束原因。
+- 支持暂停连接表刷新（明确标记为暂停）、恢复及复制所选连接；刷新保持选中 ID 和手动列宽。
+- 无连接、筛选无结果、未收到 flow、过期和截断必须可区分；筛选只作用于连接，不改变原有网卡/进程合计。
+
+## 数据口径
+
+连接 RX/TX 是采集点 IP 报文字节方向，不承诺等于应用下载/上传；总速率为 RX+TX。
+连接字节累计从采集器对该连接的首次观测开始，不命名为「今日」或「本次监测」。
+进程总量继续只取 stats.process_io。client/server 表示建立/接受连接的进程，io[] 表示实际执行 I/O 的进程；进程查询三种来源都匹配。
+点击进程产生的筛选匹配 (pid, start_ns)，绝不退化为只看 PID。未关联进程的连接仍在全局列表中显示为未知。
+不做自动反向 DNS、网络请求或 TLS 解密；明文 Host/SNI 等证据仅使用采集器已经提供的字段。
+
+## 实现边界与共享契约
+
+第一版沿用现有只读全量快照协议，GUI 在有界连接缓存上本地查询，不新增服务端查询命令或依赖。
+后台只保留展示所需的精简字段，不透传原始 flow 或负载。传输仍由 16 MiB 帧限制和慢客户端断开保护。
+
+### 数据类型（src/snapshot.h）
+
+新增以下结构，成员名为后续组件的固定契约：
+
+- `ConnectionProcess`：`int pid=0; quint64 startNs=0; QString name; quint64 rxBytes=0, txBytes=0;`
+- `ConnectionSnapshot`：`quint64 id=0; QString protocol, app, state, direction, source, target, name, detail, end; QStringList interfaces; QDateTime firstSeen, lastSeen; quint64 rxBytes=0, txBytes=0, packets=0, retransmits=0; double rxBps=0, txBps=0; qint64 rttUs=0; QString rttSource; ConnectionProcess client, server; QList<ConnectionProcess> io;`
+- `ConnectionStatus`：`bool available=false, stale=true, truncated=false; QStringList notes;`
+- `Snapshot` 增加 `QList<ConnectionSnapshot> connections; ConnectionStatus connectionStatus;`
+- `ProcessStatus` 增加 `QStringList info;`，仅作说明，不驱动 incomplete 或 HUD 感叹号。
+
+进程身份 0 表示缺失，-1 只用于上游明确的歧义进程；io[] 只接受正 PID。startNs 和所有计数保持 uint64 精度。
+新增快照字段使用 snake_case，完整验证后再更新。缺少整个 connections/connection_status 视为不支持连接，不伪装成可用空表。
+为现有测试 fixture 允许缺少新增字段，但字段一旦出现必须严格校验；不是新增第二套旧协议实现。
+
+### 连接缓存（src/daemon/connections.h/.cpp）
+
+类 `ball::Connections`，公开接口固定为：
+
+- `void reset()`：清空所有连接、基线和截断状态。
+- `void update(const ConnectionSnapshot& row)`：按 ID 替换累计值；更新不会累加原始计数。
+- `void sample(qint64 monotonicMs)`：按真实单调时钟采样速率；首次出现为基线，重复采样时间不重置基线；计数回退重建基线，不产生巨幅速率；已结束连接速率为 0。
+- `QList<ConnectionSnapshot> rows() const`：返回最新记录。
+- `bool truncated() const`：本次缓存是否发生过容量淘汰。
+- `static constexpr int kMaxConnections = 8192;`
+
+容量满时优先回收最早结束的连接，否则最久未更新者；不增长到无界，不改变进程总量。结束记录保留在同一有界缓存，不承诺无限历史。
+每次 hello（含同一采集器重连）重建连接缓存，避免遗漏 end 和 ID 复用。断线立即让连接状态过期。
+
+### 采集器接线（src/daemon/socktrail.*、service.*）
+
+- `SocktrailFrameStatus` 增加 `Flow`，`SocktrailFrame` 增加 `ConnectionSnapshot connection; QStringList infoNotes; bool connectionsAdvertised=false;`。
+- hello 可选 `kinds` 字符串数组，包含 flow 则声明连接可用；缺失时直到实际收到合法 flow 才确认支持。
+- flow 帧 envelope 下 `flow` 完整验证。ID 非零；protocol/source/target/first_seen/last_seen/rx_bytes/tx_bytes/packets 必需；其余字段按上游省略规则读取。
+- `Socktrail` 增加 `const Connections& connections() const; bool connectionsAvailable() const; QStringList infoNotes() const;`。
+- flow 更新不让 stats 变新鲜；连接缓存速率在成功应用 stats 时统一 sample，避免握手刷新产生虚假峰值。
+- malformed flow 严格拒绝整帧并进入已有重连流程；测试的原始空 flow fixture 改为合法连接，不继续忽略坏帧。
+- service 将缓存与独立 connectionStatus 放进快照；缓存不可用/过期与接口可用性分开。
+- spawn 改用 `--socket-kinds stats,flow`，继续关闭 openssl/socket-sniff；现成抓包证据足够支持第一版连接页。
+- 外部采集器文档明确需 stats,flow；不自动修改正在运行的服务或重启它。
+
+### 质量说明
+
+PID ring 丢失、无效事件、unindexed 和断线保留真实 incomplete 语义。
+unmatched 与 expired PID 进入 info，不触发历史丢失标记；说明 unmatched 不是 process_io 漏采量，当前上游多接口口径还有顺序依赖。
+kTLS 能力从可选 probes.ktls.status 读取，加入说明；不承诺无 kTLS 采集缺口，也不自动增加 CAP_SYS_ADMIN。
+
+## 所有权与提交顺序
+
+| 阶段 | 独占变更范围 | 验收 |
+| --- | --- | --- |
+| 数据契约 | snapshot.*、daemon/connections.*、tests/connections.cpp、CMakeLists.txt | 64 位 round-trip、坏帧拒绝、缓存覆盖/速率/重置/容量 |
+| 后台接线 | daemon/socktrail.*、daemon/service.*、fake_collector、socktrail/service/cli 测试、protocol.md | 真实本地 socket 的 flow/stats/reconnect、非丢失说明 |
+| 查询界面 | ui/connections.*、ui/details.*、ui/hud.cpp、tests/ui.cpp、tests/ui_preview.cpp、CMakeLists.txt、README.md | 先过滤再 top N、三类进程关联、PID 复用、过期/暂停/复制、选择稳定 |
+| 上游能力状态 | socktrail 的 probe 状态与 hello kinds、对应测试/文档 | 不更改 BPF 字节码、不增加权限、Go 离线构建和测试 |
+| 集成 | 父代理，仅接缝修复和验收 | 全量构建/测试、format、clang-tidy、独立只读审查 |
+
+每个阶段通过对应构建、测试和静态检查后使用英文 Conventional Commit；源码注释英文、文档中文。
+不提交临时 agent 文件，不 push，不安装或重启系统服务。上游 unmatched 的 netns 级重新记账另作独立修复，不能把各接口的 unmatched 简单求和。
+
+## 验证与后续
+
+离线构建使用 cmake --preset dev、cmake --build --preset dev 和 ctest --preset dev。
+连接页面使用合成数据做离屏测试/预览，不把真实域名、命令行写入截图或日志。
+性能验证至少覆盖 2000 条连接；筛选和排名针对当前缓存，达到容量上限时明确提示不是全量历史。
+本轮不加入日历史存储、主动探测、录包、反向解析或自动服务提权。
