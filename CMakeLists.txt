@@ -47,6 +47,7 @@ add_library(ball_ui STATIC
     src/ui/snapshot_client.cpp
     src/ui/format.cpp
     src/ui/traffic_model.cpp
+    src/ui/connections.cpp
     src/ui/placement.cpp
     src/ui/preferences.cpp
     src/ui/autostart.cpp
@@ -135,6 +136,11 @@ if(BUILD_TESTING)
     qt_add_executable(ball_ui_test tests/ui.cpp)
     target_link_libraries(ball_ui_test PRIVATE Qt6::Test ball_ui ball_testkit)
 
+    # The connection view is exercised with synthetic snapshots only, so no
+    # collector or desktop session is involved.
+    qt_add_executable(ball_connection_ui_test tests/connection_ui.cpp)
+    target_link_libraries(ball_connection_ui_test PRIVATE Qt6::Test ball_ui ball_testkit)
+
     qt_add_executable(ball_autostart_test tests/autostart.cpp)
     # GUI-free: the helper only touches files, so the test needs no display.
     target_link_libraries(ball_autostart_test PRIVATE Qt6::Test Qt6::Core ball_ui)
@@ -177,6 +183,10 @@ if(BUILD_TESTING)
 
     add_test(NAME ball_connections COMMAND ball_connections_test)
     set_tests_properties(ball_connections PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
+    add_test(NAME ball_connection_ui COMMAND ball_connection_ui_test)
+    set_tests_properties(ball_connection_ui PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
+        TIMEOUT 90)
 
     add_test(NAME ball_service COMMAND ball_service_test)
     set_tests_properties(ball_service PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
