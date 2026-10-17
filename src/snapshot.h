@@ -138,6 +138,8 @@ struct ConnectionStatus {
     bool stale = true;
     bool truncated = false;
     QStringList notes;
+    // Namespaces connection IDs across every collector subscription.
+    quint64 generation = 0;
 };
 
 struct Snapshot {
@@ -191,6 +193,7 @@ inline constexpr QLatin1StringView kPresent("present");
 inline constexpr QLatin1StringView kSnapshotKind("snapshot");
 inline constexpr QLatin1StringView kConnections("connections");
 inline constexpr QLatin1StringView kConnectionStatus("connection_status");
+inline constexpr QLatin1StringView kGeneration("generation");
 inline constexpr QLatin1StringView kInfo("info");
 inline constexpr QLatin1StringView kTruncated("truncated");
 inline constexpr QLatin1StringView kId("id");

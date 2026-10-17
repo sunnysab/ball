@@ -379,6 +379,7 @@ Snapshot Service::snapshot() const {
     // status: a collector that publishes no flow frames leaves it unavailable
     // without affecting anything else, and says so explicitly.
     snapshot.connectionStatus.available = m_socktrail->connectionsAvailable();
+    snapshot.connectionStatus.generation = m_socktrail->connectionGeneration();
     snapshot.connectionStatus.stale = !collectorUp || m_socktrail->stale();
     snapshot.connectionStatus.truncated = m_socktrail->connections().truncated();
     if (!collectorUp) {

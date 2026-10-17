@@ -88,6 +88,7 @@ private slots:
     void connectionStatusControlsFreshness();
     void removingSelectionClearsDetails();
     void absentProtocolKeepsFilter();
+    void subscriptionChangesClearSelection();
 };
 
 void ConnectionUiTest::filtersThenRanksThenLimits() {
@@ -403,6 +404,40 @@ void ConnectionUiTest::absentProtocolKeepsFilter() {
     view.setProcessFilter(7, 8, QStringLiteral("<b>literal</b>"));
     QCOMPARE(view.findChild<QLabel*>(QStringLiteral("connections.processFilter"))->textFormat(),
              Qt::PlainText);
+}
+
+void ConnectionUiTest::subscriptionChangesClearSelection() {
+    ConnectionsView view;
+    view.show();
+    Snapshot first =
+        snapshotOf({row(7, QStringLiteral("tcp"), QStringLiteral("old"), QStringLiteral("b"))});
+    first.started = QDateTime::fromMSecsSinceEpoch(1000);
+    first.connectionStatus.generation = 1;
+    view.setSnapshot(first, true);
+    auto* table = view.findChild<QTableWidget*>(QStringLiteral("connections.table"));
+    auto* details = view.findChild<QPlainTextEdit*>(QStringLiteral("connections.details"));
+    table->selectRow(0);
+    QVERIFY(!details->toPlainText().isEmpty());
+    Snapshot next = first;
+    next.connections.first().source = QStringLiteral("unrelated");
+    next.connectionStatus.generation = 2;
+    view.setSnapshot(next, true);
+    QVERIFY(table->selectionModel()->selectedRows().isEmpty());
+    QVERIFY(details->toPlainText().isEmpty());
+
+    table->selectRow(0);
+    auto* pause = view.findChild<QToolButton*>(QStringLiteral("connections.pause"));
+    pause->setChecked(true);
+    next.connectionStatus.generation = 3;
+    view.setSnapshot(next, true);
+    QVERIFY(!details->toPlainText().isEmpty());
+    pause->setChecked(false);
+    QVERIFY(details->toPlainText().isEmpty());
+
+    table->selectRow(0);
+    next.started = next.started.addSecs(1);
+    view.setSnapshot(next, true);
+    QVERIFY(details->toPlainText().isEmpty());
 }
 
 QTEST_MAIN(ConnectionUiTest)

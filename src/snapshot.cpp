@@ -402,7 +402,9 @@ bool readConnectionStatus(const msgpack::object& parent, ConnectionStatus& statu
         !mp::readBool(*truncated, status.truncated)) {
         return false;
     }
-    return readTextList(*value, field::kNotes, status.notes, quint32(connection::kMaxNotes), true);
+    return readTextList(*value, field::kNotes, status.notes, quint32(connection::kMaxNotes),
+                        true) &&
+           readOptionalCount(*value, field::kGeneration, status.generation);
 }
 
 bool readProcessStatus(const msgpack::object& parent, ProcessStatus& status) {
@@ -802,7 +804,9 @@ QByteArray encodeSnapshot(const Snapshot& snapshot, bool& ok) {
         writeConnection(writer, row);
     }
     writer.key(field::kConnectionStatus);
-    writer.beginMap(4);
+    writer.beginMap(5);
+    writer.key(field::kGeneration);
+    writer.count(snapshot.connectionStatus.generation);
     writer.key(field::kAvailable);
     writer.boolean(snapshot.connectionStatus.available);
     writer.key(field::kStale);

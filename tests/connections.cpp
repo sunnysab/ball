@@ -132,6 +132,7 @@ private Q_SLOTS:
     void acceptsLongTextAndManyParticipants();
     void rejectsMalformedStatusAndInfo();
     void rejectsOversizedFrame();
+    void generationIsExactAndValidated();
 };
 
 void TestConnections::roundTripsEveryConnectionField() {
@@ -635,6 +636,24 @@ void TestConnections::rejectsOversizedFrame() {
     const QByteArray bytes = ball::encodeSnapshot(snapshot, ok);
     QVERIFY(!ok);
     QVERIFY(bytes.isEmpty());
+}
+
+void TestConnections::generationIsExactAndValidated() {
+    Snapshot snapshot = makeSnapshot();
+    snapshot.connectionStatus.generation = 9'007'199'254'740'993ULL;
+    const QByteArray frame = encode(snapshot);
+    QCOMPARE(requireSnapshot(frame).connectionStatus.generation,
+             snapshot.connectionStatus.generation);
+    const auto absent = patchFrame(frame, [](msgpack::object& root, msgpack::zone&) {
+        QVERIFY(removeMember(*member(root, QLatin1StringView("connection_status")),
+                             QLatin1StringView("generation")));
+    });
+    QCOMPARE(requireSnapshot(absent).connectionStatus.generation, quint64(0));
+    const auto invalid = patchFrame(frame, [](msgpack::object& root, msgpack::zone&) {
+        *member(*member(root, QLatin1StringView("connection_status")),
+                QLatin1StringView("generation")) = msgpack::object(int64_t(-1));
+    });
+    QVERIFY(rejects(invalid));
 }
 
 QTEST_GUILESS_MAIN(TestConnections)

@@ -540,6 +540,7 @@ bool Socktrail::handleFrame(const msgpack::object& frame) {
         // Every hello, including a reconnect to the same collector, rebuilds
         // the connection cache: a reconnect may have missed `end` transitions
         // and ID reuse in between, which an incremental update cannot repair.
+        ++m_connectionGeneration;
         m_connections.reset();
         m_connectionsAvailable = decoded.connectionsAdvertised;
         return true;

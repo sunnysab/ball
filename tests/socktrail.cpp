@@ -866,6 +866,7 @@ void TestSocktrail::helloResetRebuildsConnectionCache() {
     QVERIFY(acceptConnection(4000));
     send(helloLine(kStarted, 1, {QStringLiteral("flow")}));
     QTRY_VERIFY(client.connectionsAvailable());
+    QVERIFY(client.connectionGeneration() >= 2);
     QVERIFY(client.connections().rows().isEmpty());
     send(statsLine(QDateTime::fromString(u"2026-10-13T14:00:03Z"_s, Qt::ISODate),
                    {Process{7, 500, u"curl"_s, 1'500, 0}}));

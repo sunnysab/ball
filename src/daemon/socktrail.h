@@ -96,6 +96,7 @@ public:
     // True once a hello advertised flow, or a real flow frame was seen from a
     // collector that did not advertise. Every reconnect requires a new proof.
     bool connectionsAvailable() const { return m_connectionsAvailable; }
+    quint64 connectionGeneration() const { return m_connectionGeneration; }
     quint64 ipPackets() const { return m_ipPackets; }
     quint64 ipBytes() const { return m_ipBytes; }
 
@@ -128,6 +129,7 @@ private:
 
     Processes m_processes;
     Connections m_connections;
+    quint64 m_connectionGeneration = 0;
     QLocalSocket* m_socket = nullptr;
     QTimer* m_reconnectTimer = nullptr;
     QTimer* m_staleTimer = nullptr;

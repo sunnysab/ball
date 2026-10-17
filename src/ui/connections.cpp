@@ -292,6 +292,15 @@ void ConnectionsView::setSnapshot(const std::optional<Snapshot>& snapshot, bool 
 }
 
 void ConnectionsView::applySnapshot() {
+    if (m_applied && m_latest &&
+        (m_applied->started != m_latest->started ||
+         m_applied->connectionStatus.generation != m_latest->connectionStatus.generation)) {
+        // An ID in another subscription can name an unrelated connection.
+        m_table->clearSelection();
+        m_table->setCurrentItem(nullptr);
+        m_details->clear();
+        m_copy->setEnabled(false);
+    }
     m_applied = m_latest;
     m_dirty = true;
     if (isVisible()) {
