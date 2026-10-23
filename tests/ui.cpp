@@ -260,6 +260,7 @@ private Q_SLOTS:
     void remembersPositionAndOpacity();
     void appearanceRoundTripAndInvalidPreferences();
     void barLayoutsStayCompactAndDoNotClip();
+    void emptyStatusDoesNotReserveBarSpace();
     void themeChangesAreLocalAndKeepTextLegible();
     void fontChangesResizeTheBarWithoutClipping();
     void allMetricsAreVisibleAndSortNumerically();
@@ -913,10 +914,11 @@ void TestUi::switchesTabsAndSortsProcesses() {
     auto* table = hud.detailsWindow()->findChild<QTableView*>(u"details.processTable"_s);
     QVERIFY(tabs != nullptr);
     QVERIFY(table != nullptr);
-    QCOMPARE(tabs->tabText(0), u"进程"_s);
-    QCOMPARE(tabs->tabText(1), u"网卡"_s);
-    QCOMPARE(tabs->tabText(2), u"连接"_s);
-    QCOMPARE(tabs->count(), 3);
+    QCOMPARE(tabs->tabText(0), u"概览"_s);
+    QCOMPARE(tabs->tabText(1), u"进程"_s);
+    QCOMPARE(tabs->tabText(2), u"网卡"_s);
+    QCOMPARE(tabs->tabText(3), u"连接"_s);
+    QCOMPARE(tabs->count(), 4);
 
     // firefox (512 B/s) sorts above code (9 B/s) with the real rate column.
     QAbstractItemModel* model = table->model();
@@ -987,7 +989,7 @@ void TestUi::drillsProcessRowIntoConnectionsTab() {
     QVERIFY(viewConnections->isEnabled());
     viewConnections->click();
     QCoreApplication::processEvents();
-    QCOMPARE(tabs->currentIndex(), 2);
+    QCOMPARE(tabs->currentIndex(), 3);
     // Only code's own connection matches (pid 42, start_ns 1).
     QCOMPARE(connTable->rowCount(), 1);
     QCOMPARE(connTable->item(0, 3)->text(), u"203.0.113.7:53"_s);
@@ -998,14 +1000,14 @@ void TestUi::drillsProcessRowIntoConnectionsTab() {
     QVERIFY(clearProcess->isHidden());
 
     // The double-click path picks the selected row without pressing the button.
-    tabs->setCurrentIndex(0);
+    tabs->setCurrentIndex(1);
     search->setText(u"firefox"_s);
     QCOMPARE(table->model()->rowCount(), 1);
     table->selectRow(0);
     // Emitting the view's own signal drives the real double-click handler.
     table->doubleClicked(table->model()->index(0, 0));
     QCoreApplication::processEvents();
-    QCOMPARE(tabs->currentIndex(), 2);
+    QCOMPARE(tabs->currentIndex(), 3);
     QCOMPARE(connTable->rowCount(), 1);
     QCOMPARE(connTable->item(0, 3)->text(), u"93.184.216.34:443"_s);
     // The active process filter names the drilled process, not a stale one.
@@ -1016,8 +1018,8 @@ void TestUi::drillsProcessRowIntoConnectionsTab() {
     auto* connSearch = details->findChild<QLineEdit*>(u"connections.search"_s);
     QVERIFY(connSearch != nullptr);
     connSearch->setText(u"example.org"_s);
-    tabs->setCurrentIndex(0);
-    tabs->setCurrentIndex(2);
+    tabs->setCurrentIndex(1);
+    tabs->setCurrentIndex(3);
     QCOMPARE(connSearch->text(), u"example.org"_s);
     clearProcess->click();
 }
@@ -1079,15 +1081,18 @@ void TestUi::connectionPagePrioritizesQuerySpace() {
     auto* current = details.findChild<QLabel*>(u"details.currentDown"_s);
     auto* ip = details.findChild<QLabel*>(u"details.ipTotals"_s);
     QVERIFY(current->isVisible());
+    tabs->setCurrentIndex(3);
+    QVERIFY(!current->isVisible());
+    QVERIFY(!ip->isVisible());
     tabs->setCurrentIndex(2);
     QVERIFY(!current->isVisible());
     QVERIFY(!ip->isVisible());
+    QVERIFY(!details.findChild<QToolButton*>(u"details.viewConnections"_s)->isVisible());
     tabs->setCurrentIndex(1);
+    QVERIFY(details.findChild<QToolButton*>(u"details.viewConnections"_s)->isVisible());
+    tabs->setCurrentIndex(0);
     QVERIFY(current->isVisible());
     QVERIFY(ip->isVisible());
-    QVERIFY(!details.findChild<QToolButton*>(u"details.viewConnections"_s)->isVisible());
-    tabs->setCurrentIndex(0);
-    QVERIFY(details.findChild<QToolButton*>(u"details.viewConnections"_s)->isVisible());
 }
 
 void TestUi::processInfoIsNeutralPlainTextWithoutWarning() {
@@ -1474,6 +1479,49 @@ void TestUi::barLayoutsStayCompactAndDoNotClip() {
     }
 }
 
+void TestUi::emptyStatusDoesNotReserveBarSpace() {
+    QSettings settings(m_settingsPath, QSettings::IniFormat);
+    Hud hud(startServer(), settings);
+    hud.show();
+    QVERIFY(acceptConnection() != nullptr);
+    send(snapshotFrame());
+    auto* status = hud.findChild<QLabel*>(u"hud.status"_s);
+    QVERIFY(waitFor([status] { return status->text().isEmpty(); }));
+    for (const auto layout : {ball::ui::BarLayout::TwoLine, ball::ui::BarLayout::SingleLine,
+                              ball::ui::BarLayout::TwoLine}) {
+        hud.setBarLayout(layout);
+        QCoreApplication::processEvents();
+        QVERIFY(status->isHidden());
+        const QSize healthy = hud.size();
+        auto* tx = hud.findChild<QLabel*>(u"hud.tx"_s);
+        QLabel* unit = nullptr;
+        for (auto* label : tx->parentWidget()->findChildren<QLabel*>()) {
+            if (label->property("role").toString() == u"muted"_s) {
+                unit = label;
+            }
+        }
+        QVERIFY(unit != nullptr);
+        const int right = unit->mapTo(&hud, QPoint(unit->width(), 0)).x();
+        QVERIFY(hud.width() - right <= 14); // Only the 12 px outer padding remains.
+
+        hud.setSelectedInterfaces({u"eno1"_s});
+        QCOMPARE(hud.size(), healthy); // Rate changes do not resize the bar.
+        hud.setSelectedInterfaces({u"eno1"_s, u"missing"_s});
+        QCOMPARE(status->text(), u"!"_s);
+        QVERIFY(!status->isHidden());
+        QVERIFY(hud.width() > healthy.width());
+        QCOMPARE(status->width(), QFontMetrics(hud.font()).horizontalAdvance(u"!"_s) + 4);
+        const int warningWidth = hud.width();
+        hud.setSelectedInterfaces({});
+        QCOMPARE(status->text(), u"未选"_s);
+        QVERIFY(hud.width() > warningWidth);
+        QVERIFY(hud.rect().contains(QRect(status->mapTo(&hud, QPoint()), status->size())));
+        hud.setSelectedInterfaces({u"eno1"_s, u"wlan0"_s});
+        QVERIFY(status->isHidden());
+        QCOMPARE(hud.size(), healthy);
+    }
+}
+
 void TestUi::fontChangesResizeTheBarWithoutClipping() {
     QSettings settings(m_settingsPath, QSettings::IniFormat);
     Hud hud(startServer(), settings);
@@ -1530,7 +1578,7 @@ void TestUi::allMetricsAreVisibleAndSortNumerically() {
     QVERIFY(details->findChild<QObject*>(u"details.period"_s) == nullptr);
     QCOMPARE(table->model()->columnCount(), 9);
     for (int column = 3; column < 9; ++column) {
-        QVERIFY(!table->isColumnHidden(column));
+        QCOMPARE(table->isColumnHidden(column), column >= 7);
         table->sortByColumn(column, Qt::AscendingOrder);
         QCOMPARE(findText(table->model(), 0, 0), u"code"_s);
         table->sortByColumn(column, Qt::DescendingOrder);

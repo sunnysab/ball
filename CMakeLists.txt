@@ -47,6 +47,7 @@ add_library(ball_ui STATIC
     src/ui/snapshot_client.cpp
     src/ui/format.cpp
     src/ui/traffic_model.cpp
+    src/ui/traffic_chart.cpp
     src/ui/connections.cpp
     src/ui/placement.cpp
     src/ui/preferences.cpp
@@ -133,6 +134,9 @@ if(BUILD_TESTING)
         BALL_FAKE_COLLECTOR_BINARY="$<TARGET_FILE:ball_fake_collector>")
     add_dependencies(ball_service_test ball_fake_collector)
 
+    qt_add_executable(ball_chart_test tests/traffic_chart.cpp)
+    target_link_libraries(ball_chart_test PRIVATE Qt6::Test ball_ui)
+
     qt_add_executable(ball_ui_test tests/ui.cpp)
     target_link_libraries(ball_ui_test PRIVATE Qt6::Test ball_ui ball_testkit)
 
@@ -154,6 +158,9 @@ if(BUILD_TESTING)
         BALL_EXECUTABLE="$<TARGET_FILE:ball>"
         BALL_FAKE_COLLECTOR_BINARY="$<TARGET_FILE:ball_fake_collector>")
     add_dependencies(ball_cli_test ball ball_fake_collector)
+
+    add_test(NAME ball_chart COMMAND ball_chart_test)
+    set_tests_properties(ball_chart PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 60)
 
     add_test(NAME ball_ui COMMAND ball_ui_test)
     set_tests_properties(ball_ui PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 90)

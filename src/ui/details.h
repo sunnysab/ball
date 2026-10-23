@@ -16,6 +16,7 @@ class QToolButton;
 namespace ball::ui {
 
 class ConnectionsView;
+class TrafficChart;
 
 class Details : public QWidget {
     Q_OBJECT
@@ -38,7 +39,7 @@ private:
     void filterTables();
     // Drills into the connection tab using the selected row's real identity,
     // never its position in the original (unsorted) list.
-    void openConnectionsForCurrentRow();
+    void openConnectionsForCurrentRow(QTableView* table);
 
     std::optional<Snapshot> m_snapshot;
     bool m_fresh = false;
@@ -58,6 +59,9 @@ private:
     QCheckBox* m_showIdle = nullptr;
     QToolButton* m_viewConnections = nullptr;
     QTabWidget* m_tabs = nullptr;
+    QTableView* m_overviewProcesses = nullptr;
+    QLabel* m_activityLabel = nullptr;
+    TrafficChart* m_chart = nullptr;
     QTableView* m_processTable = nullptr;
     QTableView* m_interfaceTable = nullptr;
     ConnectionsView* m_connections = nullptr;

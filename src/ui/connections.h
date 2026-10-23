@@ -68,6 +68,7 @@ private:
     QLabel* m_processFilter = nullptr;
     QToolButton* m_clearProcess = nullptr;
     QPlainTextEdit* m_details = nullptr;
+    quint64 m_detailsId = 0;
 
     std::optional<Snapshot> m_applied;
     std::optional<Snapshot> m_latest;

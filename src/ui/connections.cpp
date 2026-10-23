@@ -1,22 +1,29 @@
 // ball: a network traffic HUD for KDE Wayland sessions.
 #include "ui/connections.h"
 
+#include "ui/appearance.h"
 #include "ui/format.h"
 
 #include <QApplication>
 #include <QClipboard>
 #include <QComboBox>
 #include <QDateTime>
+#include <QFontMetrics>
 #include <QHBoxLayout>
 #include <QHeaderView>
 #include <QLabel>
 #include <QLineEdit>
 #include <QLocale>
 #include <QPlainTextEdit>
+#include <QScrollBar>
 #include <QShortcut>
 #include <QShowEvent>
 #include <QSpinBox>
+#include <QSplitter>
 #include <QTableWidget>
+#include <QTextBlock>
+#include <QTextCursor>
+#include <QTextDocument>
 #include <QToolButton>
 #include <QVBoxLayout>
 #include <QVariant>
@@ -188,10 +195,18 @@ void ConnectionsView::buildUi() {
          QStringLiteral("目标"), QStringLiteral("进程"), QStringLiteral("状态"),
          QStringLiteral("采集 RX 速率"), QStringLiteral("采集 TX 速率"),
          QStringLiteral("累计 IP 字节"), QStringLiteral("RTT"), QStringLiteral("重传")});
+    m_table->horizontalHeader()->setDefaultAlignment(Qt::AlignLeft | Qt::AlignVCenter);
+    for (int column = ColRxRate; column < ColumnCount; ++column) {
+        m_table->horizontalHeaderItem(column)->setTextAlignment(Qt::AlignRight | Qt::AlignVCenter);
+    }
     m_table->setSelectionBehavior(QAbstractItemView::SelectRows);
     m_table->setSelectionMode(QAbstractItemView::SingleSelection);
     m_table->setEditTriggers(QAbstractItemView::NoEditTriggers);
     m_table->setSortingEnabled(false);
+    m_table->setShowGrid(false);
+    m_table->setWordWrap(false);
+    m_table->setAlternatingRowColors(true);
+    m_table->verticalHeader()->setDefaultSectionSize(36);
     m_table->verticalHeader()->setVisible(false);
     m_table->horizontalHeader()->setSectionResizeMode(QHeaderView::Interactive);
     m_table->horizontalHeader()->setSectionsClickable(true);
@@ -207,6 +222,9 @@ void ConnectionsView::buildUi() {
     m_table->setColumnWidth(ColIpBytes, 110);
     m_table->setColumnWidth(ColRtt, 80);
     m_table->setColumnWidth(ColRetransmits, 70);
+    m_table->setColumnHidden(ColSource, true);
+    m_table->setColumnHidden(ColState, true);
+    enableColumnMenu(*m_table);
 
     m_details = new QPlainTextEdit(this);
     m_details->setObjectName(QStringLiteral("connections.details"));
@@ -222,6 +240,13 @@ void ConnectionsView::buildUi() {
     filters->addWidget(m_limit);
     filters->addWidget(m_pause);
     filters->addWidget(m_copy);
+    auto* columns = new QToolButton(this);
+    columns->setText(QStringLiteral("显示列"));
+    filters->addWidget(columns);
+    connect(columns, &QToolButton::clicked, this, [this] {
+        auto* header = m_table->horizontalHeader();
+        Q_EMIT header->customContextMenuRequested(QPoint(0, header->height()));
+    });
 
     auto* processRow = new QHBoxLayout;
     processRow->addWidget(m_processFilter);
@@ -229,11 +254,21 @@ void ConnectionsView::buildUi() {
     processRow->addStretch(1);
 
     auto* layout = new QVBoxLayout(this);
+    layout->setContentsMargins(0, 12, 0, 0);
     layout->addLayout(filters);
     layout->addLayout(processRow);
+    m_summary->setProperty("role", "muted");
     layout->addWidget(m_summary);
-    layout->addWidget(m_table, 2);
-    layout->addWidget(m_details, 1);
+    auto* splitter = new QSplitter(Qt::Vertical, this);
+    splitter->setObjectName(QStringLiteral("connections.splitter"));
+    splitter->setChildrenCollapsible(false);
+    m_table->setMinimumHeight(120);
+    m_details->setMinimumHeight(100);
+    splitter->addWidget(m_table);
+    splitter->addWidget(m_details);
+    splitter->setStretchFactor(0, 3);
+    splitter->setStretchFactor(1, 1);
+    layout->addWidget(splitter, 1);
 
     connect(m_search, &QLineEdit::textChanged, this, [this] { scheduleRebuild(); });
     connect(m_protocol, &QComboBox::currentIndexChanged, this, [this] { scheduleRebuild(); });
@@ -301,6 +336,7 @@ void ConnectionsView::applySnapshot() {
         m_table->clearSelection();
         m_table->setCurrentItem(nullptr);
         m_details->clear();
+        m_detailsId = 0;
         m_copy->setEnabled(false);
     }
     m_applied = m_latest;
@@ -421,6 +457,7 @@ void ConnectionsView::rebuild() {
         m_table->setRowCount(0);
         m_table->blockSignals(false);
         m_details->clear();
+        m_detailsId = 0;
         m_copy->setEnabled(false);
         m_summary->setText(QStringLiteral("未收到连接数据"));
         return;
@@ -611,6 +648,7 @@ void ConnectionsView::updateDetails() {
     if (id == 0 || !m_applied) {
         m_copy->setEnabled(false);
         m_details->clear();
+        m_detailsId = 0;
         return;
     }
     const ConnectionSnapshot* found = nullptr;
@@ -623,16 +661,16 @@ void ConnectionsView::updateDetails() {
     if (!found) {
         m_copy->setEnabled(false);
         m_details->clear();
+        m_detailsId = 0;
         return;
     }
     const ConnectionSnapshot& row = *found;
     m_copy->setEnabled(true);
     QStringList lines;
-    lines << QStringLiteral("ID: %1").arg(row.id);
+    lines << QStringLiteral("连接概况");
+    lines << QStringLiteral("域名/名称: %1")
+                 .arg(row.name.isEmpty() ? QStringLiteral("未知") : row.name);
     lines << QStringLiteral("应用: %1").arg(row.app.isEmpty() ? QStringLiteral("未知") : row.app);
-    if (!row.name.isEmpty()) {
-        lines << QStringLiteral("域名/名称: %1").arg(row.name);
-    }
     lines << QStringLiteral("协议: %1").arg(row.protocol);
     lines << QStringLiteral("状态: %1")
                  .arg(row.end.isEmpty() ? (row.state.isEmpty() ? QStringLiteral("活动") : row.state)
@@ -640,6 +678,7 @@ void ConnectionsView::updateDetails() {
     lines << QStringLiteral("方向: %1").arg(row.direction);
     lines << QStringLiteral("RTT: %1 (%2)").arg(formatRtt(row.rttUs), row.rttSource);
     lines << QStringLiteral("报文: %1 · 重传: %2").arg(row.packets).arg(row.retransmits);
+    lines << QStringLiteral("\n端点与流量");
     lines << QStringLiteral("来源: %1").arg(row.source);
     lines << QStringLiteral("目标: %1").arg(row.target);
     lines << QStringLiteral("接口: %1")
@@ -652,6 +691,7 @@ void ConnectionsView::updateDetails() {
     if (!row.detail.isEmpty()) {
         lines << QStringLiteral("说明: %1").arg(row.detail);
     }
+    lines << QStringLiteral("\n进程归属（socket I/O）");
     lines << QStringLiteral("客户端进程:") << describeProcess(row.client);
     lines << QStringLiteral("服务端进程:") << describeProcess(row.server);
     lines << QStringLiteral("I/O 进程:");
@@ -662,9 +702,35 @@ void ConnectionsView::updateDetails() {
             lines << describeProcess(process);
         }
     }
+    lines << QStringLiteral("\n技术标识 · ID: %1").arg(row.id);
     lines
         << QStringLiteral("结束原因: %1").arg(row.end.isEmpty() ? QStringLiteral("活动") : row.end);
-    m_details->setPlainText(lines.join(QLatin1Char('\n')));
+    const QString text = lines.join(QLatin1Char('\n'));
+    const bool sameConnection = m_detailsId == id;
+    if (sameConnection && m_details->toPlainText() == text) {
+        return;
+    }
+    const auto visible = m_details->cursorForPosition(QPoint(0, 0));
+    const int block = visible.blockNumber();
+    const int column = visible.positionInBlock();
+    const int top = m_details->cursorRect(visible).top();
+    const int horizontal = m_details->horizontalScrollBar()->value();
+    m_details->setPlainText(text);
+    m_detailsId = id;
+    if (sameConnection) {
+        auto* document = m_details->document();
+        QTextCursor anchor(
+            document->findBlockByNumber(std::min(block, document->blockCount() - 1)));
+        anchor.setPosition(anchor.position() + std::min(column, anchor.block().length() - 1));
+        m_details->setTextCursor(anchor);
+        m_details->ensureCursorVisible();
+        // Qt lazily counts wrapped lines, so a raw scrollbar value is not a stable anchor.
+        auto* scroll = m_details->verticalScrollBar();
+        scroll->setValue(scroll->value() +
+                         qRound(double(m_details->cursorRect(anchor).top() - top) /
+                                m_details->fontMetrics().lineSpacing()));
+        m_details->horizontalScrollBar()->setValue(horizontal);
+    }
 }
 
 void ConnectionsView::copySelection() {

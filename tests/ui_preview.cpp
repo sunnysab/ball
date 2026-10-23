@@ -21,6 +21,7 @@
 #include <QTemporaryDir>
 #include <QTimer>
 
+#include <cmath>
 #include <cstdio>
 
 using namespace Qt::StringLiterals;
@@ -202,22 +203,53 @@ int main(int argc, char* argv[]) {
             app.exit(1);
             return;
         }
+        auto* details = hud.detailsWindow();
+        auto history = mockSnapshot();
+        history.processStatus.incomplete = false;
+        history.processStatus.notes.clear();
+        const auto until = history.at;
+        for (int second = 0; second <= 300; ++second) {
+            history.at = until.addSecs(second - 300);
+            const double burst = 0.65 + 0.2 * std::sin(second / 20.0) +
+                                 2.2 * std::exp(-std::pow(second - 80.0, 2) / 240) +
+                                 1.4 * std::exp(-std::pow(second - 210.0, 2) / 800);
+            history.interfaces[0].rxBps = 1625292.8 * burst;
+            history.interfaces[0].txBps = 231424.0 * (1 + 0.4 * std::sin(second / 14.0));
+            details->setSnapshot(history, second < 140 || second > 155, {u"eno1"_s, u"wlan0"_s});
+        }
+        details->setStatus({}, {});
         hud.setTheme(ball::ui::Theme::Porcelain);
         QCoreApplication::processEvents();
-        const QPixmap shot = hud.detailsWindow()->grab();
+        const QPixmap shot = details->grab();
         if (!shot.save(output)) {
             std::fprintf(stderr, "preview: cannot write %s\n", qPrintable(output));
             app.exit(1);
             return;
         }
-        // The connection tab needs its own screenshot. It is switched to and a
-        // row is selected so the details pane is visible; the process and
-        // interface screenshots above are untouched.
-        auto* details = hud.detailsWindow();
         auto* tabs = details->findChild<QTabWidget*>(u"details.tabs"_s);
+        const auto saveVariant = [&](const QString& suffix) {
+            QCoreApplication::processEvents();
+            const QString path = file.absolutePath() + QLatin1Char('/') + file.completeBaseName() +
+                                 suffix + QStringLiteral(".png");
+            return details->grab().save(path);
+        };
+        hud.setTheme(ball::ui::Theme::Graphite);
+        if (!saveVariant(u"-dark"_s)) {
+            app.exit(1);
+            return;
+        }
+        hud.setTheme(ball::ui::Theme::Porcelain);
+        if (tabs != nullptr) {
+            tabs->setCurrentIndex(1);
+        }
+        if (!saveVariant(u"-processes"_s)) {
+            app.exit(1);
+            return;
+        }
+        // Select one synthetic connection so the resizable detail panel is populated.
         auto* table = details->findChild<QTableWidget*>(u"connections.table"_s);
         if (tabs != nullptr) {
-            tabs->setCurrentIndex(2);
+            tabs->setCurrentIndex(3);
             QCoreApplication::processEvents();
             if (table != nullptr && table->rowCount() > 0) {
                 table->selectRow(0);

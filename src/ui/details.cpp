@@ -4,6 +4,7 @@
 #include "process.h"
 #include "ui/connections.h"
 #include "ui/format.h"
+#include "ui/traffic_chart.h"
 #include "ui/traffic_model.h"
 
 #include <QAbstractTableModel>
@@ -119,10 +120,14 @@ public:
         }
     }
     QVariant headerData(int section, Qt::Orientation orientation, int role) const override {
-        if (role != Qt::DisplayRole || orientation != Qt::Horizontal) {
+        if (orientation != Qt::Horizontal) {
             return {};
         }
-        return m_headers.value(section);
+        if (role == Qt::TextAlignmentRole) {
+            return int((m_numericColumns.contains(section) ? Qt::AlignRight : Qt::AlignLeft) |
+                       Qt::AlignVCenter);
+        }
+        return role == Qt::DisplayRole ? QVariant(m_headers.value(section)) : QVariant();
     }
     // Only the value columns are sortable; the name and status columns keep
     // insertion order so a stable ranking is always available.
@@ -187,7 +192,7 @@ private:
 Details::Details() : QWidget(nullptr, Qt::Window) {
     setObjectName(QStringLiteral("details"));
     setWindowTitle(QStringLiteral("ball · 流量详情"));
-    resize(1180, 620);
+    resize(1180, 780);
     auto* layout = new QVBoxLayout(this);
     layout->setContentsMargins(20, 16, 20, 16);
     layout->setSpacing(14);
@@ -200,14 +205,22 @@ Details::Details() : QWidget(nullptr, Qt::Window) {
     title->setFont(titleFont);
     heading->addWidget(title);
     heading->addStretch();
-    layout->addLayout(heading);
-
     m_selectionLabel = new QLabel(this);
     m_selectionLabel->setObjectName(QStringLiteral("details.selection"));
     m_selectionLabel->setProperty("role", "muted");
     m_selectionLabel->setWordWrap(true);
     m_selectionLabel->setTextFormat(Qt::PlainText);
-    layout->addWidget(m_selectionLabel);
+    heading->addWidget(m_selectionLabel);
+    layout->addLayout(heading);
+
+    m_tabs = new QTabWidget(this);
+    m_tabs->setObjectName(QStringLiteral("details.tabs"));
+    auto* overview = new QWidget(m_tabs);
+    overview->setObjectName(QStringLiteral("details.overview"));
+    auto* overviewLayout = new QVBoxLayout(overview);
+    overviewLayout->setContentsMargins(0, 14, 0, 0);
+    overviewLayout->setSpacing(16);
+    m_tabs->addTab(overview, QStringLiteral("概览"));
 
     m_totals = new QWidget(this);
     auto* totals = new QHBoxLayout(m_totals);
@@ -227,12 +240,25 @@ Details::Details() : QWidget(nullptr, Qt::Window) {
         m_upLabels[column] = new QLabel(card);
         m_downLabels[column]->setProperty("role", "download");
         m_upLabels[column]->setProperty("role", "upload");
+        auto* values = column == 0 ? new QHBoxLayout : nullptr;
         for (QLabel* value : {m_downLabels[column], m_upLabels[column]}) {
-            value->setFont(numericFont());
+            QFont valueFont = numericFont();
+            if (column == 0) {
+                valueFont.setPointSizeF(valueFont.pointSizeF() + 9);
+                valueFont.setBold(true);
+            }
+            value->setFont(valueFont);
             value->setTextInteractionFlags(Qt::TextSelectableByMouse);
-            cardLayout->addWidget(value);
+            if (column == 0) {
+                values->addWidget(value, 1);
+            } else {
+                cardLayout->addWidget(value);
+            }
         }
-        totals->addWidget(card, 1);
+        if (values) {
+            cardLayout->addLayout(values);
+        }
+        totals->addWidget(card, column == 0 ? 2 : 1);
     }
     m_downLabels[0]->setObjectName(QStringLiteral("details.currentDown"));
     m_upLabels[0]->setObjectName(QStringLiteral("details.currentUp"));
@@ -240,7 +266,44 @@ Details::Details() : QWidget(nullptr, Qt::Window) {
     m_upLabels[1]->setObjectName(QStringLiteral("details.todayUp"));
     m_downLabels[2]->setObjectName(QStringLiteral("details.sessionDown"));
     m_upLabels[2]->setObjectName(QStringLiteral("details.sessionUp"));
-    layout->addWidget(m_totals);
+    overviewLayout->addWidget(m_totals);
+
+    auto* chartCard = new QFrame(overview);
+    chartCard->setProperty("role", "card");
+    auto* chartLayout = new QVBoxLayout(chartCard);
+    chartLayout->setContentsMargins(18, 14, 18, 12);
+    auto* chartHeading = new QHBoxLayout;
+    auto* chartTitle = new QLabel(QStringLiteral("网络活动"), chartCard);
+    QFont sectionFont = font();
+    sectionFont.setBold(true);
+    chartTitle->setFont(sectionFont);
+    chartHeading->addWidget(chartTitle);
+    chartHeading->addStretch();
+    auto* historyNote = new QLabel(QStringLiteral("最近 5 分钟 · 仅界面运行期间"), chartCard);
+    historyNote->setProperty("role", "muted");
+    chartHeading->addWidget(historyNote);
+    chartLayout->addLayout(chartHeading);
+    m_chart = new TrafficChart(chartCard);
+    chartLayout->addWidget(m_chart, 1);
+    overviewLayout->addWidget(chartCard, 3);
+
+    auto* activityHeading = new QHBoxLayout;
+    m_activityLabel = new QLabel(overview);
+    m_activityLabel->setTextFormat(Qt::PlainText);
+    m_activityLabel->setFont(sectionFont);
+    activityHeading->addWidget(m_activityLabel);
+    activityHeading->addStretch();
+    auto* allProcesses = new QToolButton(overview);
+    allProcesses->setText(QStringLiteral("查看全部进程 →"));
+    allProcesses->setObjectName(QStringLiteral("details.allProcesses"));
+    activityHeading->addWidget(allProcesses);
+    overviewLayout->addLayout(activityHeading);
+    m_overviewProcesses = new QTableView(overview);
+    m_overviewProcesses->setObjectName(QStringLiteral("details.overviewProcesses"));
+    m_overviewProcesses->setToolTip(QStringLiteral("按 socket 总速率排列，双击查看进程连接。"
+                                                   "进程统计不随所选网卡变化，不与图表数值相加。"));
+    overviewLayout->addWidget(m_overviewProcesses, 2);
+    connect(allProcesses, &QToolButton::clicked, this, [this] { m_tabs->setCurrentIndex(1); });
 
     m_ipLabel = new QLabel(this);
     m_ipLabel->setObjectName(QStringLiteral("details.ipTotals"));
@@ -252,7 +315,7 @@ Details::Details() : QWidget(nullptr, Qt::Window) {
         QStringLiteral("IP 报文字节是采集点观测到的 IP 报文大小，不是进程 socket I/O。"
                        "两者与网卡计数均不相等，也不互相相加；此处不随所选网卡变化。"
                        "累计从采集器启动开始，采集器重启后清零，不按今日或本次监测分段。"));
-    layout->addWidget(m_ipLabel);
+    overviewLayout->addWidget(m_ipLabel);
 
     m_quality = new QWidget(this);
     auto* qualityLayout = new QVBoxLayout(m_quality);
@@ -309,18 +372,23 @@ Details::Details() : QWidget(nullptr, Qt::Window) {
     m_viewConnections->setToolTip(QStringLiteral("用当前选中的进程筛选连接页"));
     m_viewConnections->setEnabled(false);
     tools->addWidget(m_viewConnections);
-    layout->addWidget(m_tools);
-
-    m_tabs = new QTabWidget(this);
-    m_tabs->setObjectName(QStringLiteral("details.tabs"));
     m_processTable = new QTableView(m_tabs);
     m_processTable->setObjectName(QStringLiteral("details.processTable"));
     m_interfaceTable = new QTableView(m_tabs);
     m_interfaceTable->setObjectName(QStringLiteral("details.interfaceTable"));
     m_connections = new ConnectionsView(m_tabs);
     m_connections->setObjectName(QStringLiteral("details.connections"));
-    m_tabs->addTab(m_processTable, QStringLiteral("进程"));
-    m_tabs->addTab(m_interfaceTable, QStringLiteral("网卡"));
+    for (auto* table : {m_processTable, m_interfaceTable}) {
+        auto* page = new QWidget(m_tabs);
+        auto* pageLayout = new QVBoxLayout(page);
+        pageLayout->setContentsMargins(0, 12, 0, 0);
+        if (table == m_processTable) {
+            pageLayout->addWidget(m_tools);
+        }
+        pageLayout->addWidget(table, 1);
+        m_tabs->addTab(page,
+                       table == m_processTable ? QStringLiteral("进程") : QStringLiteral("网卡"));
+    }
     m_tabs->addTab(m_connections, QStringLiteral("连接"));
     layout->addWidget(m_tabs, 1);
 
@@ -334,8 +402,14 @@ Details::Details() : QWidget(nullptr, Qt::Window) {
          QStringLiteral("当前↓"), QStringLiteral("当前↑"), QStringLiteral("今日↓"),
          QStringLiteral("今日↑"), QStringLiteral("本次↓"), QStringLiteral("本次↑")},
         {3, 4, 5, 6, 7, 8}, this));
-    for (QTableView* table : {m_processTable, m_interfaceTable}) {
-        table->setSortingEnabled(true);
+    m_overviewProcesses->setModel(new TrafficTableModel(
+        {QStringLiteral("活跃进程"), QStringLiteral("PID"), QStringLiteral("状态"),
+         QStringLiteral("下载 · socket I/O"), QStringLiteral("上传 · socket I/O"),
+         QStringLiteral("今日↓"), QStringLiteral("今日↑"), QStringLiteral("本次↓"),
+         QStringLiteral("本次↑")},
+        {3, 4, 5, 6, 7, 8}, this));
+    for (QTableView* table : {m_processTable, m_interfaceTable, m_overviewProcesses}) {
+        table->setSortingEnabled(table != m_overviewProcesses);
         table->setSelectionBehavior(QAbstractItemView::SelectRows);
         table->setSelectionMode(QAbstractItemView::SingleSelection);
         table->setEditTriggers(QAbstractItemView::NoEditTriggers);
@@ -350,41 +424,67 @@ Details::Details() : QWidget(nullptr, Qt::Window) {
         table->setColumnWidth(0, 220);
         table->setColumnWidth(1, 80);
         table->setColumnWidth(2, 80);
+        table->setColumnHidden(2, true);
+        table->setColumnHidden(7, true);
+        table->setColumnHidden(8, true);
         const int metricWidth =
             QFontMetrics(numericFont()).horizontalAdvance(QStringLiteral("1023.99 MiB/s")) + 24;
         for (int column = 3; column < 9; ++column) {
             table->setColumnWidth(column, metricWidth);
         }
-        table->sortByColumn(3, Qt::DescendingOrder);
+        if (table != m_overviewProcesses) {
+            table->sortByColumn(3, Qt::DescendingOrder);
+            enableColumnMenu(*table);
+        } else {
+            table->setColumnHidden(1, true);
+            table->setColumnHidden(5, true);
+            table->setColumnHidden(6, true);
+            header->setSectionResizeMode(0, QHeaderView::Stretch);
+        }
     }
-    auto* processModel = static_cast<TrafficTableModel*>(m_processTable->model());
-    connect(processModel, &QAbstractItemModel::modelAboutToBeReset, this, [this, processModel] {
-        m_resetPid = 0;
-        m_resetStartNs = 0;
-        const auto selected = m_processTable->selectionModel()->selectedRows();
-        if (!selected.isEmpty() && selected.first().row() < processModel->rowCount()) {
-            const TableRow& row = processModel->visibleRow(selected.first().row());
-            m_resetPid = row.pid;
-            m_resetStartNs = row.startNs;
-        }
+    auto* columnsButton = new QToolButton(m_tools);
+    columnsButton->setText(QStringLiteral("显示列"));
+    columnsButton->setObjectName(QStringLiteral("details.columns"));
+    tools->addWidget(columnsButton);
+    connect(columnsButton, &QToolButton::clicked, this, [this] {
+        auto* header =
+            (m_tabs->currentIndex() == 1 ? m_processTable : m_interfaceTable)->horizontalHeader();
+        Q_EMIT header->customContextMenuRequested(QPoint(0, header->height()));
     });
-    connect(processModel, &QAbstractItemModel::modelReset, this, [this, processModel] {
-        if (m_resetPid <= 0) {
-            return;
-        }
-        for (int i = 0; i < processModel->rowCount(); ++i) {
-            const TableRow& row = processModel->visibleRow(i);
-            if (row.pid == m_resetPid && row.startNs == m_resetStartNs) {
-                m_processTable->selectRow(i);
-                break;
+    for (auto* table : {m_processTable, m_overviewProcesses}) {
+        auto* processModel = static_cast<TrafficTableModel*>(table->model());
+        connect(processModel, &QAbstractItemModel::modelAboutToBeReset, this,
+                [this, processModel, table] {
+                    m_resetPid = 0;
+                    m_resetStartNs = 0;
+                    const auto selected = table->selectionModel()->selectedRows();
+                    if (!selected.isEmpty() && selected.first().row() < processModel->rowCount()) {
+                        const TableRow& row = processModel->visibleRow(selected.first().row());
+                        m_resetPid = row.pid;
+                        m_resetStartNs = row.startNs;
+                    }
+                });
+        connect(processModel, &QAbstractItemModel::modelReset, this, [this, processModel, table] {
+            if (m_resetPid <= 0) {
+                return;
             }
-        }
-    });
+            for (int i = 0; i < processModel->rowCount(); ++i) {
+                const TableRow& row = processModel->visibleRow(i);
+                if (row.pid == m_resetPid && row.startNs == m_resetStartNs) {
+                    table->selectRow(i);
+                    break;
+                }
+            }
+        });
+    }
     connect(m_search, &QLineEdit::textChanged, this, &Details::filterTables);
     connect(m_showIdle, &QCheckBox::toggled, this, &Details::filterTables);
-    connect(m_viewConnections, &QToolButton::clicked, this, &Details::openConnectionsForCurrentRow);
+    connect(m_viewConnections, &QToolButton::clicked, this,
+            [this] { openConnectionsForCurrentRow(m_processTable); });
     connect(m_processTable, &QTableView::doubleClicked, this,
-            [this] { openConnectionsForCurrentRow(); });
+            [this] { openConnectionsForCurrentRow(m_processTable); });
+    connect(m_overviewProcesses, &QTableView::doubleClicked, this,
+            [this] { openConnectionsForCurrentRow(m_overviewProcesses); });
     connect(m_processTable->selectionModel(), &QItemSelectionModel::selectionChanged, this, [this] {
         const bool hasRow = !m_processTable->selectionModel()->selectedRows().isEmpty() ||
                             m_processTable->currentIndex().isValid();
@@ -393,21 +493,21 @@ Details::Details() : QWidget(nullptr, Qt::Window) {
     connect(m_tabs, &QTabWidget::currentChanged, this, [this](int index) {
         // The process/interface search and idle filter do not apply to the
         // connection page, which owns its own filters; hide the duplicates.
-        m_tools->setVisible(index != 2);
-        m_viewConnections->setVisible(index == 0);
-        // Connection queries need the table space, not unrelated NIC totals.
-        m_totals->setVisible(index != 2);
-        m_ipLabel->setVisible(index != 2);
-        m_selectionLabel->setVisible(index != 2);
-        m_search->setPlaceholderText(index == 0 ? QStringLiteral("搜索进程名或 PID")
+        if (index == 1 || index == 2) {
+            static_cast<QVBoxLayout*>(m_tabs->widget(index)->layout())->insertWidget(0, m_tools);
+        }
+        m_tools->setVisible(index == 1 || index == 2);
+        m_viewConnections->setVisible(index == 1);
+        m_search->setPlaceholderText(index == 1 ? QStringLiteral("搜索进程名或 PID")
                                                 : QStringLiteral("搜索网卡名"));
-        if (index != 2) {
+        if (index == 1 || index == 2) {
             m_search->clear();
         }
         // Switching tabs must not discard the connection page's own query state.
         m_connections->setSnapshot(m_snapshot, m_fresh);
     });
 
+    m_tools->hide();
     m_startedLabel = new QLabel(this);
     m_startedLabel->setObjectName(QStringLiteral("details.started"));
     m_startedLabel->setProperty("role", "muted");
@@ -416,7 +516,10 @@ Details::Details() : QWidget(nullptr, Qt::Window) {
     setSnapshot(std::nullopt, false, {});
 }
 
-void Details::setTheme(Theme theme) { applyTheme(*this, theme); }
+void Details::setTheme(Theme theme) {
+    applyTheme(*this, theme);
+    m_chart->setTheme(theme);
+}
 
 void Details::setStatus(const QString& summary, const QStringList& reasons) {
     m_qualitySummary->setText(summary);
@@ -443,6 +546,9 @@ void Details::setSnapshot(const std::optional<Snapshot>& snapshot, bool fresh,
                             ? sumSelectedInterfaces(snapshot->interfaces, selectedInterfaces)
                             : InterfaceTotals{};
     const bool usable = fresh && totals.valid;
+    m_chart->addSample(snapshot ? snapshot->at : QDateTime{},
+                       snapshot ? snapshot->started : QDateTime{}, selectedInterfaces, totals.rxBps,
+                       totals.txBps, usable && totals.complete);
     m_downLabels[0]->setText(
         QStringLiteral("↓ %1").arg(usable ? formatRate(totals.rxBps).trimmed() : placeholder()));
     m_upLabels[0]->setText(
@@ -522,6 +628,19 @@ void Details::rebuildTables() {
         }
     }
     static_cast<TrafficTableModel*>(m_processTable->model())->setRows(processes);
+    const bool processUsable = m_snapshot && m_fresh && m_snapshot->processStatus.available &&
+                               !m_snapshot->processStatus.stale;
+    processes.removeIf([processUsable](const TableRow& row) { return !processUsable || row.idle; });
+    std::stable_sort(processes.begin(), processes.end(), [](const TableRow& a, const TableRow& b) {
+        return a.keys[3].toDouble() + a.keys[4].toDouble() >
+               b.keys[3].toDouble() + b.keys[4].toDouble();
+    });
+    m_activityLabel->setText(
+        processUsable
+            ? QStringLiteral("活跃进程 %1 · 按 socket 总速率排列（前 5）").arg(processes.size())
+            : QStringLiteral("活跃进程 · 等待可用的进程数据"));
+    processes = processes.first(std::min<qsizetype>(5, processes.size()));
+    static_cast<TrafficTableModel*>(m_overviewProcesses->model())->setRows(processes);
     static_cast<TrafficTableModel*>(m_interfaceTable->model())->setRows(interfaces);
     filterTables();
 }
@@ -533,14 +652,14 @@ void Details::filterTables() {
     }
 }
 
-void Details::openConnectionsForCurrentRow() {
-    auto* model = static_cast<TrafficTableModel*>(m_processTable->model());
+void Details::openConnectionsForCurrentRow(QTableView* table) {
+    auto* model = static_cast<TrafficTableModel*>(table->model());
     // A selected row is authoritative; fall back to the current index for a
     // keyboard-driven cursor. Either way the view index is resolved through the
     // model, so sorting or filtering cannot make the original list position
     // select a different process.
-    QModelIndex index = m_processTable->currentIndex();
-    const auto selected = m_processTable->selectionModel()->selectedRows();
+    QModelIndex index = table->currentIndex();
+    const auto selected = table->selectionModel()->selectedRows();
     if (!selected.isEmpty()) {
         index = selected.first();
     }
@@ -550,7 +669,7 @@ void Details::openConnectionsForCurrentRow() {
     }
     const TableRow& row = model->visibleRow(index.row());
     m_connections->setProcessFilter(row.pid, row.startNs, row.name);
-    m_tabs->setCurrentIndex(2);
+    m_tabs->setCurrentWidget(m_connections);
 }
 
 void Details::keyPressEvent(QKeyEvent* event) {

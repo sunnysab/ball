@@ -5,6 +5,7 @@
 #include <QString>
 
 class QWidget;
+class QTableView;
 
 namespace ball::ui {
 
@@ -26,5 +27,6 @@ struct ThemeColors {
 ThemeColors themeColors(Theme theme);
 QString themeName(Theme theme);
 void applyTheme(QWidget& widget, Theme theme);
+void enableColumnMenu(QTableView& table);
 
 } // namespace ball::ui

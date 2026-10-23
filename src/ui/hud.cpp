@@ -164,8 +164,8 @@ void Hud::updateBarLayout() {
         }
         unit->setFixedWidth(width);
     }
-    m_statusLabel->setFixedWidth(QFontMetrics(font()).horizontalAdvance(QStringLiteral("过期")) +
-                                 4);
+    m_statusLabel->setVisible(!m_statusLabel->text().isEmpty());
+    m_statusLabel->setFixedWidth(QFontMetrics(font()).horizontalAdvance(m_statusLabel->text()) + 4);
     m_bar->removeWidget(m_rxRow);
     m_bar->removeWidget(m_txRow);
     m_bar->removeWidget(m_statusLabel);
@@ -417,7 +417,10 @@ void Hud::applyStatus() {
     if (!summary.isEmpty() && reasons.isEmpty()) {
         reasons.append(summary);
     }
-    m_statusLabel->setText(marker);
+    if (m_statusLabel->text() != marker) {
+        m_statusLabel->setText(marker);
+        updateBarLayout();
+    }
     m_statusLabel->setAccessibleName(summary.isEmpty() ? QStringLiteral("采集正常") : summary);
     m_details->setStatus(summary, reasons);
     // Explanations are shown separately and never turn into a gap marker.

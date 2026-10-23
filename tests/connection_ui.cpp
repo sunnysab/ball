@@ -10,6 +10,7 @@
 #include <QLabel>
 #include <QLineEdit>
 #include <QPlainTextEdit>
+#include <QScrollBar>
 #include <QSpinBox>
 #include <QTableWidget>
 #include <QTest>
@@ -83,6 +84,8 @@ private slots:
     void cumulativeBytesDoNotOverflowOrLosePrecision();
     void pauseFreezesRowsAndStaleHidesRates();
     void selectionIdSurvivesRefresh();
+    void detailsScrollSurvivesRefresh_data();
+    void detailsScrollSurvivesRefresh();
     void copySelectionWritesClipboard();
     void handlesTwoThousandRows();
     void connectionStatusControlsFreshness();
@@ -311,6 +314,78 @@ void ConnectionUiTest::selectionIdSurvivesRefresh() {
     view.setSnapshot(snapshotOf({b, a}), true);
     QCOMPARE(selectedId(table), quint64(2));
     QCOMPARE(table->currentRow(), 0);
+}
+
+void ConnectionUiTest::detailsScrollSurvivesRefresh_data() {
+    QTest::addColumn<bool>("noWrap");
+    QTest::newRow("wrapped") << false;
+    QTest::newRow("unwrapped") << true;
+}
+
+void ConnectionUiTest::detailsScrollSurvivesRefresh() {
+    QFETCH(bool, noWrap);
+    auto first = row(1, QStringLiteral("tcp"), QStringLiteral("a"), QStringLiteral("b"));
+    auto second = row(2, QStringLiteral("tcp"), QStringLiteral("c"), QStringLiteral("d"));
+    first.app = second.app = QStringLiteral("long application name ").repeated(30);
+    first.detail = second.detail = QStringLiteral("long diagnostic line ").repeated(30) +
+                                   QStringLiteral("\nmore diagnostic information").repeated(100);
+    auto snapshot = snapshotOf({first, second});
+    snapshot.started = QDateTime::fromMSecsSinceEpoch(1000);
+    snapshot.connectionStatus.generation = 1;
+    ConnectionsView view;
+    view.resize(1200, 700);
+    view.show();
+    view.setSnapshot(snapshot, true);
+    auto* table = view.findChild<QTableWidget*>(QStringLiteral("connections.table"));
+    auto* details = view.findChild<QPlainTextEdit*>(QStringLiteral("connections.details"));
+    details->setLineWrapMode(noWrap ? QPlainTextEdit::NoWrap : QPlainTextEdit::WidgetWidth);
+    table->selectRow(0);
+    auto* vertical = details->verticalScrollBar();
+    auto* horizontal = details->horizontalScrollBar();
+    QTRY_VERIFY(vertical->maximum() > 20);
+    if (noWrap) {
+        QTRY_VERIFY(horizontal->maximum() > 20);
+    }
+    vertical->setValue(vertical->maximum() / 2);
+    horizontal->setValue(horizontal->maximum() / 2);
+    QCoreApplication::processEvents();
+    const int y = vertical->value();
+    const int x = horizontal->value();
+    const int firstBlock = details->cursorForPosition(QPoint(0, 0)).blockNumber();
+    const int firstTop = details->cursorRect(details->cursorForPosition(QPoint(0, 0))).top();
+
+    view.setSnapshot(snapshot, true);
+    QCoreApplication::processEvents();
+    QCOMPARE(vertical->value(), y);
+    QCOMPARE(horizontal->value(), x);
+
+    snapshot.connections[0].packets = 123;
+    snapshot.connections[1].rxBps = 100; // Reorder rows without changing the selected ID.
+    view.setSnapshot(snapshot, true);
+    QCoreApplication::processEvents();
+    QCOMPARE(table->currentRow(), 1);
+    QVERIFY(details->toPlainText().contains(QStringLiteral("报文: 123")));
+    QCOMPARE(details->cursorForPosition(QPoint(0, 0)).blockNumber(), firstBlock);
+    QCOMPARE(details->cursorRect(details->cursorForPosition(QPoint(0, 0))).top(), firstTop);
+    if (noWrap) {
+        QCOMPARE(vertical->value(), y);
+    }
+    QCOMPARE(horizontal->value(), x);
+
+    table->selectRow(0); // A different connection starts at the top.
+    QCOMPARE(vertical->value(), 0);
+    QCOMPARE(horizontal->value(), 0);
+    vertical->setValue(y);
+    table->selectRow(1);
+    QCOMPARE(vertical->value(), 0);
+    vertical->setValue(y);
+
+    ++snapshot.connectionStatus.generation; // The same ID in a new session is not the same flow.
+    view.setSnapshot(snapshot, true);
+    QVERIFY(details->toPlainText().isEmpty());
+    table->selectRow(1);
+    QVERIFY(!details->toPlainText().isEmpty());
+    QCOMPARE(vertical->value(), 0);
 }
 
 void ConnectionUiTest::copySelectionWritesClipboard() {
