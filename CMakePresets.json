@@ -36,11 +36,13 @@
   "buildPresets": [
     {
       "name": "dev",
-      "configurePreset": "dev"
+      "configurePreset": "dev",
+      "jobs": 4
     },
     {
       "name": "release",
-      "configurePreset": "release"
+      "configurePreset": "release",
+      "jobs": 4
     }
   ],
   "testPresets": [

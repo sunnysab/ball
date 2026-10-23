@@ -394,6 +394,10 @@ ctest --preset dev          # 全部单元测试
 cmake --preset release && cmake --build --preset release
 ```
 
+`dev` 和 `release` 的 build preset 默认使用 **4 路并行编译**（`CMakePresets.json` 中的 `jobs`）。
+可用 `cmake --build --preset release --parallel 8` 临时覆盖。直接指定构建目录时不会读取 preset，
+例如 `cmake --build build/local-deploy --parallel 4`；安装脚本使用 Ninja 的默认并行行为。
+
 测试不依赖桌面会话与 root；GUI 测试在 `QT_QPA_PLATFORM=offscreen` 下运行。
 `ball_install` 用 Python 标准库和临时目录模拟提权命令、安装与 systemctl，不访问真实 `/etc`
 或启停服务；覆盖外部配置、重装、模式切换、卸载保护、路径转义与失败清理。
